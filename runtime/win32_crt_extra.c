@@ -1,16 +1,22 @@
 #include "runtime64.h"
 #include "win64_abi.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <time.h>
@@ -970,6 +976,382 @@ static void w_ret_1(CPU64 *c, void *ud)  { (void)ud; c->rax = 1; }
 static void w_ret_err2(CPU64 *c, void *ud){ (void)ud; c->rax = 2; /* ERROR_FILE_NOT_FOUND */ }
 static void w_ret_inv(CPU64 *c, void *ud) { (void)ud; c->rax = (uint64_t)-1LL; }
 
+/* ---- Engine Kernel32 / Filesystem / Memory / Process extras ---- */
+static void w_GetLongShortPathA(CPU64 *c, void *ud) {
+    (void)ud;
+    const char *src = (const char *)(uintptr_t)c->rcx;
+    char *dst = (char *)(uintptr_t)c->rdx;
+    uint32_t cap = (uint32_t)c->r8;
+    if (!src) { c->rax = 0; return; }
+    size_t n = strlen(src);
+    if (!dst || cap <= n) { c->rax = n + 1; return; }
+    memcpy(dst, src, n + 1);
+    c->rax = n;
+}
+static void w_GetShortPathW(CPU64 *c, void *ud) {
+    (void)ud;
+    const uint16_t *src = (const uint16_t *)(uintptr_t)c->rcx;
+    uint16_t *dst = (uint16_t *)(uintptr_t)c->rdx;
+    uint32_t cap = (uint32_t)c->r8;
+    if (!src) { c->rax = 0; return; }
+    size_t n = 0; while (src[n]) n++;
+    if (!dst || cap <= n) { c->rax = n + 1; return; }
+    memcpy(dst, src, (n + 1) * 2);
+    c->rax = n;
+}
+static void w_GetDiskFreeSpaceExA(CPU64 *c, void *ud) {
+    (void)ud;
+    char p[2048];
+    if (c->rcx) win_path_to_posix((const char *)(uintptr_t)c->rcx, p, sizeof(p));
+    else strcpy(p, ".");
+    struct statvfs st;
+    if (statvfs(p, &st) != 0 && statvfs(".", &st) != 0) { c->rax = 0; return; }
+    uint64_t avail = (uint64_t)st.f_bavail * (uint64_t)st.f_frsize;
+    uint64_t total = (uint64_t)st.f_blocks * (uint64_t)st.f_frsize;
+    uint64_t freeb = (uint64_t)st.f_bfree * (uint64_t)st.f_frsize;
+    if (c->rdx) W64(c->rdx, avail);
+    if (c->r8)  W64(c->r8, total);
+    if (c->r9)  W64(c->r9, freeb);
+    c->rax = 1;
+}
+static void w_GetFileTime(CPU64 *c, void *ud) {
+    (void)ud;
+    int fd = (c->rcx >= 0x20000ULL && c->rcx < 0x30000ULL) ? (int)(c->rcx - 0x20000ULL) : -1;
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) { c->rax = 0; return; }
+    uint64_t ft = ((uint64_t)st.st_mtime + 11644473600ULL) * 10000000ULL;
+    if (c->rdx) W64(c->rdx, ft);
+    if (c->r8)  W64(c->r8, ft);
+    if (c->r9)  W64(c->r9, ft);
+    c->rax = 1;
+}
+static void w_GetProcessTimes(CPU64 *c, void *ud) {
+    (void)ud;
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    getrusage(RUSAGE_SELF, &ru);
+    uint64_t ut = (uint64_t)ru.ru_utime.tv_sec * 10000000ULL + (uint64_t)ru.ru_utime.tv_usec * 10ULL;
+    uint64_t kt = (uint64_t)ru.ru_stime.tv_sec * 10000000ULL + (uint64_t)ru.ru_stime.tv_usec * 10ULL;
+    if (c->rdx) W64(c->rdx, 0);
+    if (c->r8)  W64(c->r8, 0);
+    if (c->r9)  W64(c->r9, kt);
+    uint64_t p_user = win64_arg_i(c, 4);
+    if (p_user) W64(p_user, ut);
+    c->rax = 1;
+}
+static void w_K32GetProcessMemoryInfo(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t out = c->rdx;
+    uint32_t cb = (uint32_t)c->r8;
+    if (!out || cb < 40) { c->rax = 0; return; }
+    memset((void *)(uintptr_t)out, 0, cb);
+    W32(out, cb);
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &cnt) == KERN_SUCCESS) {
+        if (cb >= 24) W64(out + 16, info.resident_size);
+        if (cb >= 64) W64(out + 56, info.virtual_size);
+    }
+    c->rax = 1;
+}
+static void w_VirtualQuery(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t addr = c->rcx & ~0xFFFULL;
+    uint64_t out = c->rdx;
+    size_t len = (size_t)c->r8;
+    if (!out || len < 48) { c->rax = 0; return; }
+    memset((void *)(uintptr_t)out, 0, 48);
+    W64(out + 0, addr);        /* BaseAddress */
+    W64(out + 8, addr);        /* AllocationBase */
+    W32(out + 16, 0x04);       /* PAGE_READWRITE */
+    W64(out + 24, 0x10000ULL); /* RegionSize */
+    W32(out + 32, 0x1000);     /* MEM_COMMIT */
+    W32(out + 36, 0x04);       /* PAGE_READWRITE */
+    W32(out + 40, 0x20000);    /* MEM_PRIVATE */
+    c->rax = 48;
+}
+static void w_RemoveDirectoryW(CPU64 *c, void *ud) {
+    (void)ud;
+    char u8[2048], p[2048];
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, u8, sizeof(u8));
+    win_path_to_posix(u8, p, sizeof(p));
+    c->rax = (rmdir(p) == 0) ? 1 : 0;
+}
+static void w_MoveFileW(CPU64 *c, void *ud) {
+    (void)ud;
+    char a8[2048], b8[2048], pa[2048], pb[2048];
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, a8, sizeof(a8));
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rdx, b8, sizeof(b8));
+    win_path_to_posix(a8, pa, sizeof(pa));
+    win_path_to_posix(b8, pb, sizeof(pb));
+    c->rax = (rename(pa, pb) == 0) ? 1 : 0;
+}
+static void w_CopyFileW(CPU64 *c, void *ud) {
+    (void)ud;
+    char a8[2048], b8[2048], pa[2048], pb[2048];
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, a8, sizeof(a8));
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rdx, b8, sizeof(b8));
+    win_path_to_posix(a8, pa, sizeof(pa));
+    win_path_to_posix(b8, pb, sizeof(pb));
+    int in = open(pa, O_RDONLY);
+    if (in < 0) { c->rax = 0; return; }
+    int out = open(pb, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { close(in); c->rax = 0; return; }
+    char buf[8192]; ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0) { if (write(out, buf, (size_t)n) != n) break; }
+    close(in); close(out);
+    c->rax = 1;
+}
+static void w_CreatePipe(CPU64 *c, void *ud) {
+    (void)ud;
+    int fds[2];
+    if (pipe(fds) != 0) { c->rax = 0; return; }
+    if (c->rcx) W64(c->rcx, 0x20000ULL + (uint64_t)fds[0]);
+    if (c->rdx) W64(c->rdx, 0x20000ULL + (uint64_t)fds[1]);
+    c->rax = 1;
+}
+static void w_GetTempFileNameW(CPU64 *c, void *ud) {
+    (void)ud;
+    static uint32_t seq = 1;
+    char dir8[1024], pfx8[64], out8[1200];
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, dir8, sizeof(dir8));
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rdx, pfx8, sizeof(pfx8));
+    uint32_t id = (uint32_t)c->r8 ? (uint32_t)c->r8 : seq++;
+    snprintf(out8, sizeof(out8), "%s/%s%04x.tmp", dir8[0] ? dir8 : "/tmp", pfx8, id & 0xFFFFU);
+    if (c->r9) u8_to_w16(out8, (uint16_t *)(uintptr_t)c->r9, 260);
+    c->rax = id;
+}
+
+/* ---- RPCRT4 UUIDs ---- */
+static void w_UuidCreate(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) {
+        uint8_t *u = (uint8_t *)(uintptr_t)c->rcx;
+        arc4random_buf(u, 16);
+        u[7] = (uint8_t)((u[7] & 0x0F) | 0x40);
+        u[8] = (uint8_t)((u[8] & 0x3F) | 0x80);
+    }
+    c->rax = 0; /* RPC_S_OK */
+}
+static void w_UuidToStringA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx || !c->rdx) { c->rax = 87; return; }
+    const uint8_t *u = (const uint8_t *)(uintptr_t)c->rcx;
+    uint32_t d1 = R32(c->rcx); uint16_t d2 = R16(c->rcx + 4); uint16_t d3 = R16(c->rcx + 6);
+    char *s = (char *)malloc(40);
+    snprintf(s, 40, "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             d1, d2, d3, u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+    W64(c->rdx, (uint64_t)(uintptr_t)s);
+    c->rax = 0;
+}
+static void w_UuidFromStringA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx || !c->rdx) { c->rax = 1705; return; }
+    unsigned d1, d2, d3, b[8];
+    if (sscanf((const char *)(uintptr_t)c->rcx,
+               "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x",
+               &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11) {
+        c->rax = 1705; return;
+    }
+    W32(c->rdx, d1); W16(c->rdx + 4, (uint16_t)d2); W16(c->rdx + 6, (uint16_t)d3);
+    uint8_t *u = (uint8_t *)(uintptr_t)c->rdx;
+    for (int i = 0; i < 8; i++) u[8 + i] = (uint8_t)b[i];
+    c->rax = 0;
+}
+static void w_UuidEqual(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r8) W32(c->r8, 0);
+    c->rax = (c->rcx && c->rdx && memcmp((void *)(uintptr_t)c->rcx, (void *)(uintptr_t)c->rdx, 16) == 0) ? 1 : 0;
+}
+static void w_RpcStringFreeA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) {
+        uint64_t p = R64(c->rcx);
+        if (p) free((void *)(uintptr_t)p);
+        W64(c->rcx, 0);
+    }
+    c->rax = 0;
+}
+
+/* ---- User32 / GDI32 Window + Display helpers ---- */
+static uint64_t g_wnd_long[64][4]; /* 0:STYLE, 1:EXSTYLE, 2:WNDPROC, 3:USERDATA */
+static int wnd_slot(uint64_t hwnd) { return (hwnd >= 0x1000 && hwnd < 0x1040) ? (int)(hwnd - 0x1000) : 0; }
+static int wnd_idx(int n) {
+    if (n == -16) return 0; if (n == -20) return 1; if (n == -4) return 2; return 3;
+}
+static void w_GetWindowLongPtr(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = g_wnd_long[wnd_slot(c->rcx)][wnd_idx((int)c->rdx)];
+}
+static void w_SetWindowLongPtr(CPU64 *c, void *ud) {
+    (void)ud;
+    int s = wnd_slot(c->rcx), idx = wnd_idx((int)c->rdx);
+    uint64_t prev = g_wnd_long[s][idx];
+    g_wnd_long[s][idx] = c->r8;
+    c->rax = prev;
+}
+static void w_GetWindowRect(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) { W32(c->rdx, 0); W32(c->rdx + 4, 0); W32(c->rdx + 8, 1280); W32(c->rdx + 12, 720); }
+    c->rax = 1;
+}
+static void w_EnumDisplaySettingsA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t mode = (uint32_t)c->rdx;
+    uint64_t dm = c->r8;
+    if (!dm) { c->rax = 0; return; }
+    static const struct { uint32_t w, h; } modes[] = { {1280, 720}, {1920, 1080}, {1600, 900}, {1024, 768} };
+    uint32_t w = 1280, h = 720;
+    if (mode == 0xFFFFFFFFU || mode == 0xFFFFFFFEU) { w = 1920; h = 1080; }
+    else if (mode < 4) { w = modes[mode].w; h = modes[mode].h; }
+    else { c->rax = 0; return; }
+    memset((void *)(uintptr_t)dm, 0, 156);
+    W16(dm + 36, 156);   /* dmSize */
+    W32(dm + 40, 0x001C0000U); /* DM_BITSPERPEL|DM_PELSWIDTH|DM_PELSHEIGHT|DM_DISPLAYFREQUENCY */
+    W32(dm + 104, 32);   /* dmBitsPerPel */
+    W32(dm + 108, w);    /* dmPelsWidth */
+    W32(dm + 112, h);    /* dmPelsHeight */
+    W32(dm + 120, 60);   /* dmDisplayFrequency */
+    c->rax = 1;
+}
+static void w_GetDeviceCaps(CPU64 *c, void *ud) {
+    (void)ud;
+    int idx = (int)c->rdx;
+    if (idx == 8) c->rax = 1920;        /* HORZRES */
+    else if (idx == 10) c->rax = 1080;  /* VERTRES */
+    else if (idx == 12) c->rax = 32;    /* BITSPIXEL */
+    else if (idx == 88 || idx == 90) c->rax = 96; /* LOGPIXELSX/Y */
+    else if (idx == 116) c->rax = 60;   /* VREFRESH */
+    else c->rax = 1;
+}
+static void w_GetWindowThreadProcessId(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t pid = (uint32_t)getpid();
+    if (c->rdx) W32(c->rdx, pid);
+    c->rax = pid;
+}
+
+/* ---- Winsock2 (ws2_32.dll) POSIX socket bridge ---- */
+static _Thread_local int g_wsa_err = 0;
+static void win_to_bsd_sa(const uint8_t *wsa, int len, struct sockaddr_storage *out) {
+    memset(out, 0, sizeof(*out));
+    if (!wsa || len < 2) return;
+    if (len > (int)sizeof(*out)) len = (int)sizeof(*out);
+    memcpy(out, wsa, (size_t)len);
+    uint16_t fam = (uint16_t)wsa[0] | ((uint16_t)wsa[1] << 8);
+    ((struct sockaddr *)out)->sa_len = (uint8_t)len;
+    ((struct sockaddr *)out)->sa_family = (sa_family_t)(fam == 23 ? AF_INET6 : fam);
+}
+static void bsd_to_win_sa(const struct sockaddr_storage *in, socklen_t len, uint8_t *wsa) {
+    if (!wsa || !len) return;
+    memcpy(wsa, in, (size_t)len);
+    sa_family_t fam = ((const struct sockaddr *)in)->sa_family;
+    uint16_t wfam = (fam == AF_INET6) ? 23 : (uint16_t)fam;
+    wsa[0] = (uint8_t)(wfam & 0xFF);
+    wsa[1] = (uint8_t)(wfam >> 8);
+}
+static int posix_to_wsa_err(int e) {
+    if (e == EAGAIN || e == EWOULDBLOCK) return 10035;
+    if (e == EINPROGRESS) return 10036;
+    if (e == EADDRINUSE) return 10048;
+    if (e == ECONNREFUSED) return 10061;
+    return 10000 + e;
+}
+static void w_wsa_socket(CPU64 *c, void *ud) {
+    (void)ud;
+    int af = ((int)c->rcx == 23) ? AF_INET6 : (int)c->rcx;
+    int fd = socket(af, (int)c->rdx, (int)c->r8);
+    if (fd < 0) { g_wsa_err = posix_to_wsa_err(errno); c->rax = (uint64_t)-1LL; return; }
+    c->rax = (uint64_t)fd;
+}
+static void w_wsa_closesocket(CPU64 *c, void *ud) { (void)ud; c->rax = (close((int)c->rcx) == 0) ? 0 : (uint64_t)-1LL; }
+static void w_wsa_bind(CPU64 *c, void *ud) {
+    (void)ud;
+    struct sockaddr_storage ss;
+    int len = (int)c->r8;
+    win_to_bsd_sa((const uint8_t *)(uintptr_t)c->rdx, len, &ss);
+    int r = bind((int)c->rcx, (struct sockaddr *)&ss, (socklen_t)len);
+    if (r < 0) g_wsa_err = posix_to_wsa_err(errno);
+    c->rax = (uint64_t)(int64_t)r;
+}
+static void w_wsa_listen(CPU64 *c, void *ud) { (void)ud; c->rax = (uint64_t)(int64_t)listen((int)c->rcx, (int)c->rdx); }
+static void w_wsa_accept(CPU64 *c, void *ud) {
+    (void)ud;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    int fd = accept((int)c->rcx, c->rdx ? (struct sockaddr *)&ss : NULL, c->r8 ? &sl : NULL);
+    if (fd < 0) { g_wsa_err = posix_to_wsa_err(errno); c->rax = (uint64_t)-1LL; return; }
+    if (c->rdx) bsd_to_win_sa(&ss, sl, (uint8_t *)(uintptr_t)c->rdx);
+    if (c->r8) W32(c->r8, (uint32_t)sl);
+    c->rax = (uint64_t)fd;
+}
+static void w_wsa_recv(CPU64 *c, void *ud) {
+    (void)ud;
+    ssize_t n = recv((int)c->rcx, (void *)(uintptr_t)c->rdx, (size_t)(int)c->r8, (int)c->r9);
+    if (n < 0) g_wsa_err = posix_to_wsa_err(errno);
+    c->rax = (uint64_t)(int64_t)n;
+}
+static void w_wsa_send(CPU64 *c, void *ud) {
+    (void)ud;
+    ssize_t n = send((int)c->rcx, (const void *)(uintptr_t)c->rdx, (size_t)(int)c->r8, (int)c->r9);
+    if (n < 0) g_wsa_err = posix_to_wsa_err(errno);
+    c->rax = (uint64_t)(int64_t)n;
+}
+static void w_wsa_recvfrom(CPU64 *c, void *ud) {
+    (void)ud;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    uint64_t from_p = win64_arg_i(c, 4), fromlen_p = win64_arg_i(c, 5);
+    ssize_t n = recvfrom((int)c->rcx, (void *)(uintptr_t)c->rdx, (size_t)(int)c->r8, (int)c->r9,
+                         from_p ? (struct sockaddr *)&ss : NULL, fromlen_p ? &sl : NULL);
+    if (n < 0) { g_wsa_err = posix_to_wsa_err(errno); c->rax = (uint64_t)-1LL; return; }
+    if (from_p) bsd_to_win_sa(&ss, sl, (uint8_t *)(uintptr_t)from_p);
+    if (fromlen_p) W32(fromlen_p, (uint32_t)sl);
+    c->rax = (uint64_t)(int64_t)n;
+}
+static void w_wsa_sendto(CPU64 *c, void *ud) {
+    (void)ud;
+    struct sockaddr_storage ss;
+    uint64_t to_p = win64_arg_i(c, 4);
+    int tolen = (int)win64_arg_i(c, 5);
+    win_to_bsd_sa((const uint8_t *)(uintptr_t)to_p, tolen, &ss);
+    ssize_t n = sendto((int)c->rcx, (const void *)(uintptr_t)c->rdx, (size_t)(int)c->r8, (int)c->r9,
+                       to_p ? (struct sockaddr *)&ss : NULL, (socklen_t)tolen);
+    if (n < 0) g_wsa_err = posix_to_wsa_err(errno);
+    c->rax = (uint64_t)(int64_t)n;
+}
+static void w_wsa_setsockopt(CPU64 *c, void *ud) {
+    (void)ud;
+    int lvl = ((int)c->rdx == 0xFFFF) ? SOL_SOCKET : (int)c->rdx;
+    int opt = (int)c->r8;
+    if (lvl == SOL_SOCKET && opt == 0x0004) opt = SO_REUSEADDR;
+    else if (lvl == SOL_SOCKET && opt == 0x0020) opt = SO_BROADCAST;
+    else if (lvl == SOL_SOCKET && opt == 0x1001) opt = SO_SNDBUF;
+    else if (lvl == SOL_SOCKET && opt == 0x1002) opt = SO_RCVBUF;
+    int r = setsockopt((int)c->rcx, lvl, opt, (const void *)(uintptr_t)c->r9, (socklen_t)(int)win64_arg_i(c, 4));
+    c->rax = (uint64_t)(int64_t)r;
+}
+static void w_wsa_htons(CPU64 *c, void *ud)     { (void)ud; c->rax = htons((uint16_t)c->rcx); }
+static void w_wsa_ntohs(CPU64 *c, void *ud)     { (void)ud; c->rax = ntohs((uint16_t)c->rcx); }
+static void w_wsa_inet_addr(CPU64 *c, void *ud) { (void)ud; c->rax = c->rcx ? (uint32_t)inet_addr((const char *)(uintptr_t)c->rcx) : 0xFFFFFFFFU; }
+static void w_wsa_gethostname(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (c->rcx && gethostname((char *)(uintptr_t)c->rcx, (size_t)(int)c->rdx) == 0) ? 0 : (uint64_t)-1LL;
+}
+static void w_wsa_GetLastError(CPU64 *c, void *ud) { (void)ud; c->rax = (uint32_t)g_wsa_err; }
+static void w_wsa_inet_pton(CPU64 *c, void *ud) {
+    (void)ud;
+    int af = ((int)c->rcx == 23) ? AF_INET6 : (int)c->rcx;
+    c->rax = (uint64_t)(int64_t)inet_pton(af, (const char *)(uintptr_t)c->rdx, (void *)(uintptr_t)c->r8);
+}
+static void w_wsa_select(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
+static void w_wsa_getaddrinfo(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r9) W64(c->r9, 0);
+    c->rax = 11001; /* WSAHOST_NOT_FOUND - shortcut: offline stub until multiplayer needed */
+}
+static void w_wsa_freeaddrinfo(CPU64 *c, void *ud) { (void)ud; (void)c; }
+
 void rt_register_win32_extra(void) {
     #define REG(name, fn) rt_register_shim(name, fn, NULL)
     /* Time */
@@ -1099,5 +1481,86 @@ void rt_register_win32_extra(void) {
     REG("ws2_32.dll!#115", w_ret_0); REG("WSAStartup", w_ret_0);
     REG("ws2_32.dll!#116", w_ret_0); REG("WSACleanup", w_ret_0);
     REG("SymInitialize", w_ret_0); REG("SymSetOptions", w_ret_0); REG("SymGetOptions", w_ret_0);
+    /* Engine Kernel32 / FS / Memory / Process */
+    REG("GetLongPathNameA", w_GetLongShortPathA); REG("GetShortPathNameA", w_GetLongShortPathA);
+    REG("GetShortPathNameW", w_GetShortPathW); REG("GetDiskFreeSpaceExA", w_GetDiskFreeSpaceExA);
+    REG("GetFileTime", w_GetFileTime); REG("GetProcessTimes", w_GetProcessTimes);
+    REG("K32GetProcessMemoryInfo", w_K32GetProcessMemoryInfo);
+    REG("VirtualQuery", w_VirtualQuery); REG("VirtualUnlock", w_ret_1);
+    REG("RemoveDirectoryW", w_RemoveDirectoryW); REG("MoveFileW", w_MoveFileW);
+    REG("CopyFileW", w_CopyFileW); REG("CreatePipe", w_CreatePipe);
+    REG("GetTempFileNameW", w_GetTempFileNameW); REG("ReplaceFileW", w_ret_0);
+    REG("CreateNamedPipeW", w_ret_inv); REG("DisconnectNamedPipe", w_ret_1);
+    REG("SetNamedPipeHandleState", w_ret_0); REG("TransactNamedPipe", w_ret_0); REG("WaitNamedPipeW", w_ret_0);
+    REG("LockFileEx", w_ret_1); REG("UnlockFileEx", w_ret_1);
+    REG("OpenMutexA", w_ret_0); REG("SetThreadPriorityBoost", w_ret_1);
+    REG("EnumSystemLocalesW", w_ret_1); REG("GetDateFormatW", w_ret_0); REG("GetTimeFormatW", w_ret_0);
+    REG("GetBinaryTypeW", w_ret_0); REG("CreateProcessA", w_ret_0); REG("CreateProcessW", w_ret_0);
+    REG("GetExitCodeProcess", w_ret_0); REG("OpenProcess", w_ret_0); REG("OpenThread", w_ret_0);
+    REG("TerminateThread", w_ret_0); REG("GetThreadContext", w_ret_0); REG("SetThreadContext", w_ret_0);
+    REG("CreateToolhelp32Snapshot", w_ret_inv); REG("Module32FirstW", w_ret_0); REG("Module32NextW", w_ret_0);
+    /* RPCRT4 */
+    REG("UuidCreate", w_UuidCreate); REG("UuidToStringA", w_UuidToStringA);
+    REG("UuidFromStringA", w_UuidFromStringA); REG("UuidEqual", w_UuidEqual);
+    REG("RpcStringFreeA", w_RpcStringFreeA);
+    /* User32 / GDI32 / Imm32 */
+    REG("GetWindowLongA", w_GetWindowLongPtr); REG("GetWindowLongPtrW", w_GetWindowLongPtr);
+    REG("SetWindowLongA", w_SetWindowLongPtr); REG("SetWindowLongPtrW", w_SetWindowLongPtr);
+    REG("GetWindowRect", w_GetWindowRect); REG("EnumDisplaySettingsA", w_EnumDisplaySettingsA);
+    REG("GetDeviceCaps", w_GetDeviceCaps); REG("GetWindowThreadProcessId", w_GetWindowThreadProcessId);
+    REG("AdjustWindowRect", w_ret_1); REG("AdjustWindowRectEx", w_ret_1);
+    REG("ChangeDisplaySettingsA", w_ret_0); REG("ChangeDisplaySettingsExA", w_ret_0);
+    REG("ClientToScreen", w_ret_1); REG("ScreenToClient", w_ret_1);
+    REG("BeginPaint", w_ret_1); REG("EndPaint", w_ret_1); REG("GetDC", w_ret_1); REG("ReleaseDC", w_ret_1);
+    REG("InvalidateRect", w_ret_1); REG("IsIconic", w_ret_0); REG("IsWindowVisible", w_ret_1);
+    REG("MoveWindow", w_ret_1); REG("SetWindowPos", w_ret_1); REG("SetWindowTextA", w_ret_1);
+    REG("SetForegroundWindow", w_ret_1); REG("ShowCursor", w_ret_1); REG("ReleaseCapture", w_ret_1);
+    REG("LoadCursorA", w_ret_1); REG("LoadIconA", w_ret_1); REG("LoadImageA", w_ret_1);
+    REG("RegisterClassW", w_ret_1); REG("UnregisterClassW", w_ret_1);
+    REG("CallWindowProcA", w_ret_0); REG("SendMessageA", w_ret_0); REG("GetKeyState", w_ret_0);
+    REG("EnumWindows", w_ret_1); REG("DialogBoxParamA", w_ret_0); REG("EndDialog", w_ret_1);
+    REG("GetDlgItemInt", w_ret_0); REG("SetDlgItemInt", w_ret_1); REG("SetDlgItemTextA", w_ret_1);
+    REG("ImmIsUIMessageA", w_ret_0);
+    /* Winsock2 (ws2_32.dll ordinals + named) */
+    REG("ws2_32.dll!#1", w_wsa_accept); REG("accept", w_wsa_accept);
+    REG("ws2_32.dll!#2", w_wsa_bind); REG("bind", w_wsa_bind);
+    REG("ws2_32.dll!#3", w_wsa_closesocket); REG("closesocket", w_wsa_closesocket);
+    REG("ws2_32.dll!#9", w_wsa_htons); REG("htons", w_wsa_htons);
+    REG("ws2_32.dll!#10", w_wsa_inet_addr); REG("inet_addr", w_wsa_inet_addr);
+    REG("ws2_32.dll!#13", w_wsa_listen); REG("listen", w_wsa_listen);
+    REG("ws2_32.dll!#15", w_wsa_ntohs); REG("ntohs", w_wsa_ntohs);
+    REG("ws2_32.dll!#16", w_wsa_recv); REG("recv", w_wsa_recv);
+    REG("ws2_32.dll!#17", w_wsa_recvfrom); REG("recvfrom", w_wsa_recvfrom);
+    REG("ws2_32.dll!#18", w_wsa_select); REG("select", w_wsa_select);
+    REG("ws2_32.dll!#19", w_wsa_send); REG("send", w_wsa_send);
+    REG("ws2_32.dll!#20", w_wsa_sendto); REG("sendto", w_wsa_sendto);
+    REG("ws2_32.dll!#21", w_wsa_setsockopt); REG("setsockopt", w_wsa_setsockopt);
+    REG("ws2_32.dll!#23", w_wsa_socket); REG("socket", w_wsa_socket);
+    REG("ws2_32.dll!#57", w_wsa_gethostname); REG("gethostname", w_wsa_gethostname);
+    REG("ws2_32.dll!#111", w_wsa_GetLastError); REG("WSAGetLastError", w_wsa_GetLastError);
+    REG("WSACreateEvent", w_ret_1); REG("WSACloseEvent", w_ret_1); REG("WSASetEvent", w_ret_1);
+    REG("WSAEventSelect", w_ret_0); REG("WSAEnumNetworkEvents", w_ret_0); REG("WSAWaitForMultipleEvents", w_ret_0);
+    REG("getaddrinfo", w_wsa_getaddrinfo); REG("freeaddrinfo", w_wsa_freeaddrinfo); REG("inet_pton", w_wsa_inet_pton);
+    /* Advapi32 / DbgHelp / WinHTTP / WinINet / IPHlpApi / Video64 / SteamAPI */
+    REG("OpenProcessToken", w_ret_0); REG("LookupPrivilegeValueA", w_ret_0); REG("AdjustTokenPrivileges", w_ret_0);
+    REG("BuildExplicitAccessWithNameW", w_ret_0); REG("BuildSecurityDescriptorW", w_ret_err2);
+    REG("ConvertStringSecurityDescriptorToSecurityDescriptorW", w_ret_0); REG("RegDeleteValueA", w_ret_err2);
+    REG("MiniDumpWriteDump", w_ret_0); REG("StackWalk64", w_ret_0); REG("SymFromAddr", w_ret_0);
+    REG("SymFunctionTableAccess64", w_ret_0); REG("SymGetModuleBase64", w_ret_0);
+    REG("GetAdaptersInfo", w_ret_err2);
+    REG("WinHttpOpen", w_ret_0); REG("WinHttpConnect", w_ret_0); REG("WinHttpOpenRequest", w_ret_0);
+    REG("WinHttpSendRequest", w_ret_0); REG("WinHttpReceiveResponse", w_ret_0);
+    REG("WinHttpQueryHeaders", w_ret_0); REG("WinHttpCrackUrl", w_ret_0); REG("WinHttpCloseHandle", w_ret_1);
+    REG("InternetOpenA", w_ret_0); REG("InternetOpenUrlA", w_ret_0); REG("InternetReadFile", w_ret_0);
+    REG("InternetCloseHandle", w_ret_1); REG("InternetCrackUrlA", w_ret_0);
+    REG("HttpQueryInfoA", w_ret_0); REG("InternetSetStatusCallback", w_ret_0);
+    REG("VideoPlaybackInitialize", w_ret_0); REG("VideoPlaybackShutdown", w_ret_0);
+    REG("SteamAPI_RestartAppIfNecessary", w_ret_0); REG("SteamAPI_Shutdown", w_ret_0);
+    REG("SteamAPI_RunCallbacks", w_ret_0); REG("SteamAPI_SetTryCatchCallbacks", w_ret_0);
+    REG("SteamAPI_RegisterCallback", w_ret_0); REG("SteamAPI_UnregisterCallback", w_ret_0);
+    REG("SteamAPI_RegisterCallResult", w_ret_0); REG("SteamAPI_UnregisterCallResult", w_ret_0);
+    REG("SteamInternal_CreateInterface", w_ret_0); REG("SteamInternal_FindOrCreateGameServerInterface", w_ret_0);
+    REG("SteamInternal_GameServer_Init", w_ret_0); REG("SteamGameServer_GetHSteamUser", w_ret_0);
+    REG("SteamGameServer_RunCallbacks", w_ret_0); REG("SteamGameServer_Shutdown", w_ret_0);
     #undef REG
 }

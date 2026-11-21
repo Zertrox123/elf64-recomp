@@ -909,17 +909,72 @@ def lift_sse(insn: Insn) -> Optional[str]:
         d = f"c->{REG_INFO[ops[0]][0]}"
         idx = parse_imm(ops[2]) & mask
         return f"{d}.{fld}[{idx}] = (uint{bits}_t)({read_op(ops[1], bits, nr)});"
-    if m in ("pmovzxbw", "pmovzxbd", "pmovzxwd", "pmovzxbq", "pmovzxwq", "pmovzxdq"):
+    if m in ("pmovzxbw", "pmovzxbd", "pmovzxwd", "pmovzxbq", "pmovzxwq", "pmovzxdq",
+             "pmovsxbw", "pmovsxbd", "pmovsxwd", "pmovsxbq", "pmovsxwq", "pmovsxdq"):
+        is_sx = m.startswith("pmovsx")
+        kind = m[6:]
         spec = {
-            "pmovzxbw": ("b", "w", 8, 8), "pmovzxbd": ("b", "d", 4, 4), "pmovzxwd": ("w", "d", 4, 8),
-            "pmovzxbq": ("b", "q", 2, 2), "pmovzxwq": ("w", "q", 2, 4), "pmovzxdq": ("d", "q", 2, 8),
-        }[m]
-        sf, df, cnt, nbytes = spec
+            "bw": ("sb" if is_sx else "b", "w", "int16_t" if is_sx else "uint16_t", 8, 8),
+            "bd": ("sb" if is_sx else "b", "d", "int32_t" if is_sx else "uint32_t", 4, 4),
+            "wd": ("sw" if is_sx else "w", "d", "int32_t" if is_sx else "uint32_t", 4, 8),
+            "bq": ("sb" if is_sx else "b", "q", "int64_t" if is_sx else "uint64_t", 2, 2),
+            "wq": ("sw" if is_sx else "w", "q", "int64_t" if is_sx else "uint64_t", 2, 4),
+            "dq": ("sd" if is_sx else "d", "q", "int64_t" if is_sx else "uint64_t", 2, 8),
+        }[kind]
+        sf, df, cast_t, cnt, nbytes = spec
         d = f"c->{REG_INFO[ops[0]][0]}"
         mm = parse_mem(ops[1], nr)
         if mm is not None:
-            return f"{{ Xmm128 _s; memset(&_s, 0, 16); memcpy(&_s, (const void *)(uintptr_t)({mm[1]}), {nbytes}); Xmm128 _r; memset(&_r, 0, 16); for (int _i=0; _i<{cnt}; _i++) _r.{df}[_i] = _s.{sf}[_i]; {d} = _r; }}"
-        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; Xmm128 _r; memset(&_r, 0, 16); for (int _i=0; _i<{cnt}; _i++) _r.{df}[_i] = _s.{sf}[_i]; {d} = _r; }}"
+            return f"{{ Xmm128 _s; memset(&_s, 0, 16); memcpy(&_s, (const void *)(uintptr_t)({mm[1]}), {nbytes}); Xmm128 _r; memset(&_r, 0, 16); for (int _i=0; _i<{cnt}; _i++) _r.{df}[_i] = (uint64_t)({cast_t})_s.{sf}[_i]; {d} = _r; }}"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; Xmm128 _r; memset(&_r, 0, 16); for (int _i=0; _i<{cnt}; _i++) _r.{df}[_i] = (uint64_t)({cast_t})_s.{sf}[_i]; {d} = _r; }}"
+    cmp_preds = {
+        "eq": "(_a == _b)", "lt": "(_a < _b)", "le": "(_a <= _b)",
+        "unord": "(isnan(_a) || isnan(_b))", "neq": "!(_a == _b)",
+        "nlt": "!(_a < _b)", "nle": "!(_a <= _b)", "ord": "(!isnan(_a) && !isnan(_b))",
+    }
+    if m.startswith("cmp") and len(m) >= 7 and m[-2:] in ("ps", "pd", "ss", "sd") and m[3:-2] in cmp_preds:
+        pred = cmp_preds[m[3:-2]]
+        suf = m[-2:]
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        if suf == "ps":
+            return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<4; _i++) {{ float _a = {d}.f[_i], _b = _s.f[_i]; {d}.d[_i] = {pred} ? 0xFFFFFFFFU : 0U; }} }}"
+        if suf == "pd":
+            return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<2; _i++) {{ double _a = {d}.df[_i], _b = _s.df[_i]; {d}.q[_i] = {pred} ? ~0ULL : 0ULL; }} }}"
+        if suf == "ss":
+            return f"{{ float _a = {d}.f[0], _b = {read_xmm_float(ops[1], nr)}; {d}.d[0] = {pred} ? 0xFFFFFFFFU : 0U; }}"
+        return f"{{ double _a = {d}.df[0], _b = {read_xmm_double(ops[1], nr)}; {d}.q[0] = {pred} ? ~0ULL : 0ULL; }}"
+    if m == "pblendvb":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        msk = f"c->{REG_INFO[ops[2]][0]}" if len(ops) > 2 else "c->xmm[0]"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<16; _i++) if ({msk}.b[_i] & 0x80) {d}.b[_i] = _s.b[_i]; }}"
+    if m == "blendvpd":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        msk = f"c->{REG_INFO[ops[2]][0]}" if len(ops) > 2 else "c->xmm[0]"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<2; _i++) if ({msk}.q[_i] >> 63) {d}.q[_i] = _s.q[_i]; }}"
+    if m in ("roundps", "roundpd"):
+        imm = parse_imm(ops[2]) & 3
+        fn = {0: "rint", 1: "floor", 2: "ceil", 3: "trunc"}[imm]
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        if m == "roundps":
+            return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<4; _i++) {d}.f[_i] = {fn}f(_s.f[_i]); }}"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<2; _i++) {d}.df[_i] = {fn}(_s.df[_i]); }}"
+    if m == "dpps":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        imm = parse_imm(ops[2])
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; float _sum = 0.0f; for (int _i=0; _i<4; _i++) if (({imm} >> (4 + _i)) & 1) _sum += {d}.f[_i] * _s.f[_i]; for (int _i=0; _i<4; _i++) {d}.f[_i] = (({imm} >> _i) & 1) ? _sum : 0.0f; }}"
+    if m == "insertps":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        imm = parse_imm(ops[2])
+        src_lane = (imm >> 6) & 3
+        dst_lane = (imm >> 4) & 3
+        zmask = imm & 0xF
+        mm = parse_mem(ops[1], nr)
+        src_e = f"({read_xmm_float(ops[1], nr)})" if mm is not None else f"c->{REG_INFO[ops[1]][0]}.f[{src_lane}]"
+        return f"{{ float _v = {src_e}; {d}.f[{dst_lane}] = _v; for (int _i=0; _i<4; _i++) if (({zmask} >> _i) & 1) {d}.f[_i] = 0.0f; }}"
+    if m == "extractps":
+        s = f"c->{REG_INFO[ops[1]][0]}"
+        idx = parse_imm(ops[2]) & 3
+        return f"{write_op(ops[0], 32, f'{s}.d[{idx}]', nr)};"
     if m == "pcmpistri":
         imm = parse_imm(ops[2])
         return f"f_pcmpistri(c, c->{REG_INFO[ops[0]][0]}, {read_xmm128(ops[1], nr)}, 0x{imm & 0xFF:x}U);"
@@ -1345,7 +1400,11 @@ def emit_function_c(func: LiftedFunc, unimpl: List[str]) -> str:
     for ins in func.insns:
         if ins.addr in labels:
             lines.append(f"L_{ins.addr:x}:;")
-        stmt = lift_insn(ins, local_addrs, has_ind_jmp, unimpl)
+        try:
+            stmt = lift_insn(ins, local_addrs, has_ind_jmp, unimpl)
+        except (KeyError, ValueError):
+            unimpl.append(f"0x{ins.addr:x}: {ins.text}")
+            stmt = f'fprintf(stderr, "elf64-recomp: UNIMPLEMENTED x86_64 insn at 0x{ins.addr:x}: {ins.text.replace(chr(34), chr(39))}\\n"); abort();'
         lines.append(f"    {stmt}")
 
     # Fall-through out of function (e.g. tail block aligned into next function).

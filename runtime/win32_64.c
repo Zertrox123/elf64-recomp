@@ -884,6 +884,7 @@ void rt_register_win32_64(void) {
     REG("GetTickCount", w_GetTickCount); REG("GetTickCount64", w_GetTickCount64);
     REG("Sleep", w_Sleep); REG("GetCurrentThreadId", w_GetCurrentThreadId);
     REG("GetCurrentProcessId", w_GetCurrentProcessId); REG("GetSystemInfo", w_GetSystemInfo);
+    REG("GetNativeSystemInfo", w_GetSystemInfo);
     REG("InitializeCriticalSection", w_InitializeCriticalSection);
     REG("InitializeCriticalSectionAndSpinCount", w_InitializeCriticalSectionAndSpinCount);
     REG("EnterCriticalSection", w_EnterCriticalSection);

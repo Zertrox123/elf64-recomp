@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import json
 import os
 import shlex
 import subprocess
@@ -72,6 +73,7 @@ def build_elf64(
     jobs: int = 0,
     opt: str = "-O2",
     strict: bool = False,
+    relink: bool = False,
 ) -> str:
     os.makedirs(work_dir, exist_ok=True)
     prep_dir = os.path.join(work_dir, "prep")
@@ -83,12 +85,19 @@ def build_elf64(
     if not os.path.exists(vk_inc):
         gen_vulkan64.generate(gen_vulkan64.DEFAULT_VK_XML, vk_inc)
 
-    if is_pe_file(elf_paths[0]):
-        peprep64.prepare_pe_modules(elf_paths, prep_dir)
+    shards_meta = os.path.join(lift_dir, "shards.json")
+    if relink and os.path.exists(shards_meta):
+        with open(shards_meta) as f:
+            lifted = json.load(f)
     else:
-        elfprep64.prepare_modules(elf_paths, prep_dir)
-    layout_path = os.path.join(prep_dir, "layout.json")
-    lifted = lift64.lift_layout(layout_path, lift_dir, shards=shards, strict=strict)
+        if is_pe_file(elf_paths[0]):
+            peprep64.prepare_pe_modules(elf_paths, prep_dir)
+        else:
+            elfprep64.prepare_modules(elf_paths, prep_dir)
+        layout_path = os.path.join(prep_dir, "layout.json")
+        lifted = lift64.lift_layout(layout_path, lift_dir, shards=shards, strict=strict)
+        with open(shards_meta, "w") as f:
+            json.dump({"manifest": lifted["manifest"], "shards": lifted["shards"]}, f)
 
     sdl_cflags = pkg_config_flags("sdl2", "--cflags")
     sdl_libs = pkg_config_flags("sdl2", "--libs")
@@ -140,12 +149,16 @@ def main() -> int:
     ap.add_argument("--shards", type=int, default=8, help="Lifted C shard count")
     ap.add_argument("--opt", default="-O2", help="Clang optimization level (default: -O2)")
     ap.add_argument("--strict", action="store_true", help="Fail on any unimplemented x86_64 instruction")
-    ap.add_argument("elfs", nargs="+", help="Main ELF64 binary followed by shared libraries (.so)")
+    ap.add_argument("--relink", action="store_true", help="Skip prep/lift and recompile/relink runtime only")
+    ap.add_argument("elfs", nargs="*", help="Main ELF64/PE64 binary followed by shared libraries")
     args = ap.parse_args()
+    if not args.relink and not args.elfs:
+        ap.error("elfs required unless --relink is set")
 
     out = build_elf64(
         args.elfs, args.work_dir, args.output,
         shards=args.shards, jobs=args.jobs, opt=args.opt, strict=args.strict,
+        relink=args.relink,
     )
     print(f"build64: built native ARM64 binary -> {out}")
     return 0

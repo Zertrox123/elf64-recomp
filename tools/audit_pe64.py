@@ -78,9 +78,12 @@ def audit_target(target: str, main_exe: str | None = None, lift_audit: bool = Fa
         if lift_audit:
             res = lift64.lift_layout(os.path.join(tmp, "layout.json"), os.path.join(tmp, "lift"), shards=4, strict=False)
             total_funcs = res["funcs"]
-            for line in res["unimpl"]:
-                insn_txt = line.split(":", 1)[1].strip() if ":" in line else line
-                mnem = insn_txt.split(None, 1)[0].lower() if insn_txt else "?"
+            for item in res["unimpl"]:
+                if hasattr(item, "mnemonic"):
+                    mnem = item.mnemonic.lower()
+                else:
+                    insn_txt = item.split(":", 1)[1].strip() if ":" in item else item
+                    mnem = insn_txt.split(None, 1)[0].lower() if insn_txt else "?"
                 unimpl_counts[mnem] += 1
 
         return {
