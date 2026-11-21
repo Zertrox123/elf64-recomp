@@ -101,14 +101,14 @@ def build_elf64(
 
     cflags = [
         opt, "-std=gnu11", "-Wall", "-Wextra",
-        "-Wno-unused-label", "-Wno-unused-parameter", "-Wno-unused-variable",
+        "-Wno-unused-label", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-parentheses-equality",
         f"-I{RUNTIME_DIR}",
         "-I/opt/homebrew/include",
     ] + sdl_cflags + extra_cflags
 
     rt_sources = [
         os.path.join(RUNTIME_DIR, name)
-        for name in ("runtime64.c", "libc64.c", "sdl2_64.c", "vulkan64.c", "main64.c")
+        for name in ("runtime64.c", "libc64.c", "sdl2_64.c", "vulkan64.c", "win32_64.c", "main64.c")
     ]
     all_sources = rt_sources + [lifted["manifest"]] + lifted["shards"]
 

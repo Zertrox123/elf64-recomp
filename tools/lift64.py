@@ -220,12 +220,24 @@ def disassemble_module(
         if r in addr_to_idx:
             root_set.add(r)
 
-    # Also add direct `call <imm>` targets inside the module so static/unlisted helpers get functions.
+    # Also add direct `call <imm>` and RIP-relative `lea reg, [rip + disp]` code targets
+    # (discovers static leaf callbacks such as qsort comparators that lack .pdata entries).
     for insn in all_insns:
         if insn.mnemonic == "call" and len(insn.ops) == 1:
             t = parse_imm(insn.ops[0])
             if t is not None and t in addr_to_idx:
                 root_set.add(t)
+        elif insn.mnemonic == "lea" and len(insn.ops) == 2 and "[rip" in insn.ops[1]:
+            m_rip = re.search(r"\[rip\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)\]", insn.ops[1])
+            if m_rip:
+                disp = int(m_rip.group(2), 0)
+                if m_rip.group(1) == "-":
+                    disp = -disp
+                t = insn.next_addr + disp
+                if t in addr_to_idx:
+                    prev_idx = addr_to_idx[t] - 1
+                    if prev_idx < 0 or all_insns[prev_idx].mnemonic in ("ret", "jmp", "int3", "nop", "ud2"):
+                        root_set.add(t)
 
     sorted_roots = sorted(r for r in root_set if r in addr_to_idx)
     funcs: List[LiftedFunc] = []

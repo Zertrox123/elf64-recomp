@@ -101,11 +101,13 @@ class TestPePrep64(unittest.TestCase):
             exe_o = os.path.join(d, "app.obj")
             exe_p = os.path.join(d, "app.exe")
 
-            open(dll_c, "w").write("__declspec(dllexport) int helper_add(int a, int b) { return a + b + 5; }\n")
-            open(exe_c, "w").write(
-                "__declspec(dllimport) int helper_add(int a, int b);\n"
-                "int main(void) { return helper_add(10, 20); }\n"
-            )
+            with open(dll_c, "w") as f:
+                f.write("__declspec(dllexport) int helper_add(int a, int b) { return a + b + 5; }\n")
+            with open(exe_c, "w") as f:
+                f.write(
+                    "__declspec(dllimport) int helper_add(int a, int b);\n"
+                    "int main(void) { return helper_add(10, 20); }\n"
+                )
             subprocess.check_call(["clang", "-target", "x86_64-pc-windows-msvc", "-O2", "-c", dll_c, "-o", dll_o])
             subprocess.check_call([lld_link, "/dll", "/noentry", f"/implib:{dll_lib}", dll_o, f"/out:{dll_p}"])
             subprocess.check_call(["clang", "-target", "x86_64-pc-windows-msvc", "-O2", "-c", exe_c, "-o", exe_o])

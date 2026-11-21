@@ -123,7 +123,8 @@ class PeModule:
 
 
 def parse_pe64(path: str, base_cursor: int, is_main: bool) -> Tuple[PeModule, int]:
-    raw = open(path, "rb").read()
+    with open(path, "rb") as f:
+        raw = f.read()
     if len(raw) < 0x100 or raw[:2] != b"MZ":
         raise ValueError(f"{path}: not a PE file (missing MZ)")
 
