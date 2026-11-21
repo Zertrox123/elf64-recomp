@@ -172,6 +172,34 @@ def test_win_smoke64(tmp: str) -> None:
     assert "threads=8000/1600" in res.stdout, f"thread mismatch: {res.stdout!r}"
 
 
+def test_d3d11_smoke64(tmp: str) -> None:
+    lld_link = find_lld_link()
+    k32_lib = make_import_lib(tmp, "kernel32.dll", ["ExitProcess"])
+    ucrt_lib = make_import_lib(tmp, "ucrtbase.dll", ["printf", "puts", "memset"])
+    dxgi_lib = make_import_lib(tmp, "dxgi.dll", ["CreateDXGIFactory"])
+    d3d11_lib = make_import_lib(tmp, "d3d11.dll", ["D3D11CreateDeviceAndSwapChain"])
+
+    exe_o = os.path.join(tmp, "d3d11_smoke64.obj")
+    exe_p = os.path.join(tmp, "d3d11_smoke64.exe")
+
+    compile_win64_obj(os.path.join(FIX_DIR, "d3d11_smoke64.c"), exe_o)
+    subprocess.check_call([
+        lld_link, "/entry:main", "/subsystem:console",
+        exe_o, k32_lib, ucrt_lib, dxgi_lib, d3d11_lib, f"/out:{exe_p}",
+    ])
+
+    work = os.path.join(tmp, "build_d3d11_smoke64")
+    out_bin = os.path.join(tmp, "d3d11_smoke64_arm64")
+    build64.build_elf64([exe_p], work, out_bin, shards=4, strict=True)
+
+    res = subprocess.run([out_bin], capture_output=True, text=True, check=False)
+    print(res.stdout, end="")
+    if res.stderr:
+        print(res.stderr, end="", file=sys.stderr)
+    assert res.returncode == 0, f"d3d11_smoke64 exited with {res.returncode}"
+    assert "D3D11_SMOKE64 PASS" in res.stdout, f"unexpected stdout: {res.stdout!r}"
+
+
 def main() -> int:
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     with tempfile.TemporaryDirectory(prefix="elf64_recomp_e2e_") as tmp:
@@ -181,6 +209,8 @@ def main() -> int:
             test_vk_smoke64(tmp)
         if which in ("all", "win64"):
             test_win_smoke64(tmp)
+        if which in ("all", "d3d11"):
+            test_d3d11_smoke64(tmp)
     print("E2E OK")
     return 0
 

@@ -1,14 +1,22 @@
 # elf64-recomp
 
-Static x86_64 ELF64 (Linux System V AMD64) -> C -> ARM64 macOS recompiler with a native Vulkan (MoltenVK) + SDL2 bridge.
+Static **x86_64 -> C -> ARM64 macOS** recompiler supporting both:
+- **Linux ELF64 (System V AMD64)** + **SDL2** + **Vulkan -> MoltenVK**
+- **Windows PE32+ (Win64 ABI)** + **Win32/UCRT/User32** + **Direct3D 11 & DXGI -> Apple Metal** (with live DXBC SM4/SM5 -> MSL shader translation)
 
 ## Architecture
 
-1. **`tools/elfprep64.py`** — Loads one or more ELF64 x86_64 modules (`ET_DYN` PIE executables & `.so` libraries) into a unified 64-bit virtual address space above macOS ARM64's GPU carveout (`0x7000000000+`), aligns images to 16 KiB ARM64 pages, applies `DT_RELA` / `DT_JMPREL` / Variant II TLS (`TPOFF64`, `DTPMOD64`, `DTPOFF64`) / `COPY` / `IRELATIVE` relocations, resolves multi-module `ld.so` exports, allocates external import thunks (`0x7070000000+`), and writes relocated `.img` files + `layout.json`.
-2. **`tools/lift64.py`** — Disassembles prepared ELF64 binaries via `objdump -d -M intel --adjust-vma=...`, splits functions into sharded C units, and lifts x86_64 instructions (8/16/32/64-bit GPRs with mandatory 32->64 zero-extension, RIP-relative addressing, `fs:` TLS & stack canary, intra-function switch tables, `lock` atomics, `rep` string ops, 128-bit `imul`/`idiv`, and SSE/SSE2/SSE4.1) into portable C.
-3. **`tools/gen_vulkan64.py` + `runtime/vulkan64.c`** — Parses Khronos `vk.xml` to generate System V AMD64 -> Darwin ARM64 trampolines for 865+ Vulkan commands (exact for Darwin ARM64's packed stack-argument ABI). Because both Linux x86_64 and macOS ARM64 are LP64 little-endian and `elf64-recomp` uses a unified 64-bit address space, Vulkan structs and handles pass directly to `libMoltenVK.dylib`.
-4. **`runtime/`** — `cpu64.h`, `runtime64.c` (exact-VA `mmap` loader, O(1) dispatch table, `rt_invoke64` host->guest callbacks, Variant II TLS + `%fs:0x28` stack canary), `libc64.c` (System V variadic `printf`, Linux 144-byte `struct stat`, Linux-sized `pthread_mutex_t`/`pthread_cond_t` side-table, `qsort`, `dlopen`/`dlsym`, `libgcc` 128-bit helpers), and `sdl2_64.c` (native SDL2 + `SDL_Vulkan_*`).
-5. **`tools/build64.py`** — Orchestrates `elfprep64` -> `lift64` -> content-hash cached parallel `clang` -> native ARM64 Mach-O binary.
+1. **Frontends (`tools/elfprep64.py`, `tools/peprep64.py`)**
+   - Unified 64-bit virtual address space above macOS ARM64's GPU carveout (`0x7000000000+`, 16 KiB aligned, 16 MiB module stride) so guest pointers equal native ARM64 pointers.
+   - `elfprep64.py`: `ET_DYN`/`ET_EXEC`, `DT_RELA`/`DT_JMPREL`, Variant II TLS (`TPOFF64`/`DTPMOD64`/`DTPOFF64`), `COPY`, `IRELATIVE`, multi-`.so` `ld.so` lookup, `init_array`/`fini_array`.
+   - `peprep64.py`: PE32+ `.exe`/`.dll`, `.reloc` (`DIR64`/`HIGHLOW`), cross-DLL imports/exports (including ordinals, forwarders, delay-load IATs), `.pdata` `RUNTIME_FUNCTION` roots, PE TLS callbacks, `DllMain`.
+2. **Shared x86_64 -> C Static Lifter (`tools/lift64.py`, `tools/build64.py`)**
+   - Disassembles via `objdump -d -M intel`, discovers `call` + RIP-relative `lea` leaf callbacks + `.pdata`/symbol/`data_ptrs` roots, shards across N C files compiled in parallel with SHA-256 object caching.
+   - Lifts 8/16/32/64-bit GPRs (with mandatory 32->64 zero-extension), `[rip + disp]`, `fs:`/`gs:` TLS/canary/TEB, PIC switch tables, `lock` atomics, `rep` string ops, 128-bit `imul`/`idiv`, and SSE/SSE2/SSE4.1.
+3. **Runtime & Graphics Bridges (`runtime/`)**
+   - Core: `cpu64.h`, `runtime64.c` (exact-VA `mmap`, O(1) dispatch, `rt_invoke64` + `rt_invoke_win64`, TLS + `%fs:0x28` canary + `%gs:0x30` Windows TEB/PEB).
+   - Linux/Vulkan: `libc64.c`, `sdl2_64.c`, `tools/gen_vulkan64.py` + `vulkan64.c` (865+ Vulkan commands from Khronos `vk.xml` -> `libMoltenVK.dylib`).
+   - Windows/Direct3D 11: `win64_abi.h`, `win32_64.c` (`kernel32`/`ucrtbase`/`user32` -> SDL2), `dxbc_msl.c` (DXBC SM4/SM5 -> MSL translator), `d3d11_metal.m` (Windows x64 COM vtables for `IDXGIFactory`/`IDXGIAdapter`/`IDXGISwapChain`/`ID3D11Device`/`ID3D11DeviceContext` -> native Apple Metal).
 
 ## Requirements (macOS Apple Silicon)
 
@@ -16,7 +24,7 @@ Static x86_64 ELF64 (Linux System V AMD64) -> C -> ARM64 macOS recompiler with a
 brew install sdl2 molten-vk vulkan-headers lld
 ```
 
-## Quick Verification
+## Verification
 
 ```sh
 make check
@@ -24,10 +32,8 @@ make check
 CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all" LDFLAGS="-fsanitize=undefined" make check
 ```
 
-## Roadmap toward Portal: Revolution & 64-bit Source Games
-
-- **Phase 1 (done):** Core ELF64 loader/relocator, x86_64 -> C static lifter, System V AMD64 runtime, SDL2 + full MoltenVK bridge (verified end-to-end on compiled `x86_64-linux-gnu` multi-module + Vulkan binaries).
-- **Phase 2 (next):** Bring up a real 64-bit Linux Source/Strata module graph (`launcher.so`, `tier0.so`, `vstdlib.so`, `engine.so`, `shaderapivk.so` / DXVK-native): expand glibc/C++ ABI shims (`libstdc++` / `cxa_throw` / `futex` / `epoll` / sockets / FreeType / OpenAL / 64-bit Steamworks), add AVX/FMA lifting if present, and add DXVK/MoltenVK swapchain + presentation shims.
-- **Note on Portal: Revolution (`601360`):** Since August 2025, Portal: Revolution's public Steam branch ships Windows x64 (`bin\win64\revolution.exe`, DX11) and dropped the native Linux depot (`601362`) from active `appinfo.vdf`. Two paths forward share the same `lift64.py` core:
-  1. Target a Linux x86_64 64-bit Source game first (e.g., Team Fortress 2 64-bit, CS:S 64-bit, or historical Portal: Revolution Linux depot `601362` if available via Steam console `download_depot`).
-  2. Add a PE64/Win64 frontend (`peprep64.py` + Win64 ABI + DX11 -> DXMT/Metal bridge) reusing `lift64.py` for the current Windows 64-bit Portal: Revolution build.
+`make check` compiles and executes four real x86_64 end-to-end test suites (plus 9 unit tests):
+- `test-smoke`: Linux ELF64 PIE + `libcalc.so` (128-bit math, switch table, SSE2, stack canary, `qsort` callback, Linux 144-byte `stat`, 4 pthreads + `lock inc`).
+- `test-vulkan`: Linux ELF64 -> SDL2 -> MoltenVK on Apple Silicon GPU.
+- `test-win64`: Windows PE32+ `.exe` + `.dll` (`DllMain`, 6-arg Win64 shadow space, `gs:[0x30]` TEB, `HeapAlloc`, `VirtualAlloc`, `QPC`, `GetProcAddress`, `qsort`, 4 Win32 `CreateThread` + `CRITICAL_SECTION` + `TlsAlloc`).
+- `test-d3d11`: Windows PE32+ Direct3D 11 + DXGI -> Apple Metal GPU (DXBC SM4.0 shaders -> MSL, clear + triangle `Draw` + staging `CopyResource`/`Map` pixel readback).

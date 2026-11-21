@@ -49,7 +49,7 @@ def compile_one(src: str, obj_dir: str, cflags: List[str]) -> str:
     h.update(" ".join(cflags).encode())
     h.update(open(src, "rb").read())
     # Hash runtime headers so header edits invalidate cached objects.
-    for hdr in ("cpu64.h", "runtime64.h", "vulkan64_gen.inc"):
+    for hdr in ("cpu64.h", "runtime64.h", "win64_abi.h", "dxbc_msl.h", "vulkan64_gen.inc"):
         hp = os.path.join(RUNTIME_DIR, hdr)
         if os.path.exists(hp):
             h.update(open(hp, "rb").read())
@@ -58,7 +58,8 @@ def compile_one(src: str, obj_dir: str, cflags: List[str]) -> str:
     obj = os.path.join(obj_dir, f"{base}_{digest}.o")
     if os.path.exists(obj):
         return obj
-    cmd = ["clang", "-c", src, "-o", obj] + cflags
+    per_file = ["-fobjc-arc"] if src.endswith(".m") else []
+    cmd = ["clang", "-c", src, "-o", obj] + cflags + per_file
     subprocess.check_call(cmd)
     return obj
 
@@ -108,7 +109,10 @@ def build_elf64(
 
     rt_sources = [
         os.path.join(RUNTIME_DIR, name)
-        for name in ("runtime64.c", "libc64.c", "sdl2_64.c", "vulkan64.c", "win32_64.c", "main64.c")
+        for name in (
+            "runtime64.c", "libc64.c", "sdl2_64.c", "vulkan64.c",
+            "win32_64.c", "dxbc_msl.c", "d3d11_metal.m", "main64.c",
+        )
     ]
     all_sources = rt_sources + [lifted["manifest"]] + lifted["shards"]
 
@@ -119,7 +123,10 @@ def build_elf64(
 
     os.makedirs(os.path.dirname(os.path.abspath(out_bin)), exist_ok=True)
     link_cmd = (
-        ["clang", "-o", out_bin] + objs + sdl_libs + ["-lm", "-lpthread", "-ldl"] + extra_ldflags
+        ["clang", "-o", out_bin] + objs + sdl_libs + [
+            "-framework", "Metal", "-framework", "QuartzCore", "-framework", "Foundation",
+            "-lm", "-lpthread", "-ldl",
+        ] + extra_ldflags
     )
     subprocess.check_call(link_cmd)
     return os.path.abspath(out_bin)
