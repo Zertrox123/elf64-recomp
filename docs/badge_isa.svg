@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="136" height="22" role="img" aria-label="x86_64 ISA: 87.5%">
+<svg xmlns="http://www.w3.org/2000/svg" width="136" height="22" role="img" aria-label="x86_64 ISA: 88.5%">
   <rect width="84" height="22" fill="#555"/>
   <rect x="84" width="52" height="22" fill="#4c1"/>
   <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11.5">
     <text x="42.0" y="15">x86_64 ISA</text>
-    <text x="110.0" y="15" font-weight="bold">87.5%</text>
+    <text x="110.0" y="15" font-weight="bold">88.5%</text>
   </g>
 </svg>

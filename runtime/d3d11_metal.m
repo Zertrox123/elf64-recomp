@@ -1086,7 +1086,16 @@ static void factory_CreateSwapChain(CPU64 *c, void *ud) {
     sc->dev = dev; sc->width = w; sc->height = h;
     sc->backbuffer = create_tex2d_internal(dev, w, h, fmt, 0, NULL, 0);
     SDL_Window *win = win32_hwnd_to_sdl(hwnd);
+    if (!win && !getenv("ELF64_HEADLESS")) {
+        if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
+        win = SDL_CreateWindow("elf64-recomp (Metal)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               (int)w, (int)h, SDL_WINDOW_METAL | SDL_WINDOW_SHOWN);
+    }
     if (win) {
+        if (!getenv("ELF64_HEADLESS")) {
+            SDL_ShowWindow(win);
+            SDL_RaiseWindow(win);
+        }
         sc->metal_view = SDL_Metal_CreateView(win);
         if (sc->metal_view) {
             sc->metal_layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(sc->metal_view);
@@ -1297,7 +1306,16 @@ static void w_D3D11CreateDeviceAndSwapChain(CPU64 *c, void *ud) {
     sc->backbuffer = create_tex2d_internal(dev, w, h, fmt, 0, NULL, 0);
 
     SDL_Window *win = win32_hwnd_to_sdl(hwnd);
+    if (!win && !getenv("ELF64_HEADLESS")) {
+        if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
+        win = SDL_CreateWindow("elf64-recomp (Metal)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               (int)w, (int)h, SDL_WINDOW_METAL | SDL_WINDOW_SHOWN);
+    }
     if (win) {
+        if (!getenv("ELF64_HEADLESS")) {
+            SDL_ShowWindow(win);
+            SDL_RaiseWindow(win);
+        }
         sc->metal_view = SDL_Metal_CreateView(win);
         if (sc->metal_view) {
             sc->metal_layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(sc->metal_view);

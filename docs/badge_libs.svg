@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="143" height="22" role="img" aria-label="libraries*: 90.66%">
+<svg xmlns="http://www.w3.org/2000/svg" width="150" height="22" role="img" aria-label="libraries*: 100.00%">
   <rect width="84" height="22" fill="#555"/>
-  <rect x="84" width="59" height="22" fill="#4c1"/>
+  <rect x="84" width="66" height="22" fill="#4c1"/>
   <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11.5">
     <text x="42.0" y="15">libraries*</text>
-    <text x="113.5" y="15" font-weight="bold">90.66%</text>
+    <text x="117.0" y="15" font-weight="bold">100.00%</text>
   </g>
 </svg>

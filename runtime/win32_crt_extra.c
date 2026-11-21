@@ -1784,9 +1784,87 @@ static void w_CoCreateInstance(CPU64 *c, void *ud) {
     if (ppv) W64(ppv, 0);
     c->rax = 0x80004002ULL; /* E_NOINTERFACE */
 }
+static void w_CoTaskMemAlloc(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)(uintptr_t)malloc(c->rcx ? (size_t)c->rcx : 1);
+}
+static void w_CoTaskMemRealloc(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)(uintptr_t)realloc((void *)(uintptr_t)c->rcx, c->rdx ? (size_t)c->rdx : 1);
+}
 static void w_CoTaskMemFree(CPU64 *c, void *ud) {
     (void)ud;
     if (c->rcx) free((void *)(uintptr_t)c->rcx);
+}
+static void w_VariantInit(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) memset((void *)(uintptr_t)c->rcx, 0, 24);
+}
+static void w_VariantClear(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) memset((void *)(uintptr_t)c->rcx, 0, 24);
+    c->rax = 0;
+}
+static void w_VariantCopy(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx && c->rdx) memcpy((void *)(uintptr_t)c->rcx, (const void *)(uintptr_t)c->rdx, 24);
+    c->rax = 0;
+}
+static uint64_t bstr_alloc_bytes(const void *src, uint32_t byte_len) {
+    uint8_t *raw = (uint8_t *)calloc(1, 4 + byte_len + 2);
+    if (!raw) return 0;
+    memcpy(raw, &byte_len, 4);
+    if (src && byte_len) memcpy(raw + 4, src, byte_len);
+    return (uint64_t)(uintptr_t)(raw + 4);
+}
+static void w_SysAllocStringLen(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = bstr_alloc_bytes((const void *)(uintptr_t)c->rcx, (uint32_t)c->rdx * 2u);
+}
+static void w_SysAllocStringByteLen(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = bstr_alloc_bytes((const void *)(uintptr_t)c->rcx, (uint32_t)c->rdx);
+}
+static void w_SysAllocString(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) { c->rax = 0; return; }
+    const uint16_t *s = (const uint16_t *)(uintptr_t)c->rcx;
+    uint32_t n = 0; while (s[n]) n++;
+    c->rax = bstr_alloc_bytes(s, n * 2u);
+}
+static void w_SysFreeString(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) free((uint8_t *)(uintptr_t)c->rcx - 4);
+}
+static void w_SysStringByteLen(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) { c->rax = 0; return; }
+    uint32_t n = 0; memcpy(&n, (const uint8_t *)(uintptr_t)c->rcx - 4, 4);
+    c->rax = n;
+}
+static void w_SysStringLen(CPU64 *c, void *ud) {
+    w_SysStringByteLen(c, ud);
+    c->rax /= 2;
+}
+static void w_SysReAllocStringLen(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) { c->rax = 0; return; }
+    uint64_t old = R64(c->rcx);
+    uint64_t nb = bstr_alloc_bytes((const void *)(uintptr_t)c->rdx, (uint32_t)c->r8 * 2u);
+    if (old) free((uint8_t *)(uintptr_t)old - 4);
+    W64(c->rcx, nb);
+    c->rax = nb ? 1 : 0;
+}
+static void w_SysReAllocString(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) { c->rax = 0; return; }
+    uint32_t n = 0;
+    if (c->rdx) { const uint16_t *s = (const uint16_t *)(uintptr_t)c->rdx; while (s[n]) n++; }
+    uint64_t old = R64(c->rcx);
+    uint64_t nb = c->rdx ? bstr_alloc_bytes((const void *)(uintptr_t)c->rdx, n * 2u) : 0;
+    if (old) free((uint8_t *)(uintptr_t)old - 4);
+    W64(c->rcx, nb);
+    c->rax = 1;
 }
 static void w_SHGetSpecialFolderPathA(CPU64 *c, void *ud) {
     (void)ud;
@@ -2141,7 +2219,14 @@ void rt_register_win32_extra(void) {
     REG("joyGetNumDevs", w_ret_0); REG("joyGetDevCapsA", w_ret_err2); REG("joyGetPosEx", w_ret_err2);
     REG("dsound.dll!#2", w_ret_0); REG("dsound.dll!#9", w_ret_0);
     REG("CoInitializeEx", w_ret_0); REG("OleInitialize", w_ret_0);
-    REG("CoCreateInstance", w_CoCreateInstance); REG("CoTaskMemFree", w_CoTaskMemFree);
+    REG("CoCreateInstance", w_CoCreateInstance);
+    REG("CoTaskMemAlloc", w_CoTaskMemAlloc); REG("CoTaskMemRealloc", w_CoTaskMemRealloc);
+    REG("CoTaskMemFree", w_CoTaskMemFree);
+    REG("VariantInit", w_VariantInit); REG("VariantClear", w_VariantClear); REG("VariantCopy", w_VariantCopy);
+    REG("SysAllocString", w_SysAllocString); REG("SysAllocStringByteLen", w_SysAllocStringByteLen);
+    REG("SysAllocStringLen", w_SysAllocStringLen); REG("SysFreeString", w_SysFreeString);
+    REG("SysReAllocString", w_SysReAllocString); REG("SysReAllocStringLen", w_SysReAllocStringLen);
+    REG("SysStringByteLen", w_SysStringByteLen); REG("SysStringLen", w_SysStringLen);
     REG("PropVariantClear", w_ret_0); REG("RegisterDragDrop", w_ret_0);
     REG("RevokeDragDrop", w_ret_0); REG("ReleaseStgMedium", w_ret_0);
     REG("oleaut32.dll!#9", w_ret_0);

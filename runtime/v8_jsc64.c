@@ -313,6 +313,24 @@ static uint64_t v8_call_win64(CPU64 *c, uint64_t fn, uint64_t a0, uint64_t a1, u
 /* ---- Record JSC exception into active TryCatch ---- */
 static void v8_record_exception(V8Isolate *iso, JSContextRef ctx, JSValueRef exc) {
     if (!iso || !exc) return;
+    if (getenv("ELF64_V8_TRACE")) {
+        char *emsg = jsc_val_to_cstr(ctx, exc, NULL);
+        fprintf(stderr, "[v8] exception: %s\n", emsg);
+        free(emsg);
+        if (ctx && JSValueIsObject(ctx, exc)) {
+            JSObjectRef eo = JSValueToObject(ctx, exc, NULL);
+            if (eo) {
+                JSStringRef sk = JSStringCreateWithUTF8CString("stack");
+                JSValueRef sv = JSObjectGetProperty(ctx, eo, sk, NULL);
+                JSStringRelease(sk);
+                if (sv && !JSValueIsUndefined(ctx, sv)) {
+                    char *st = jsc_val_to_cstr(ctx, sv, NULL);
+                    fprintf(stderr, "[v8] stack:\n%s\n", st);
+                    free(st);
+                }
+            }
+        }
+    }
     uint64_t exc_addr = v8_wrap_jsv(iso, ctx, exc);
     if (iso->tc_top) {
         iso->tc_top->exc_addr = exc_addr;
@@ -660,6 +678,21 @@ static void v8_apply_tmpl_props(V8Isolate *iso, JSContextRef ctx, JSObjectRef ta
     }
 }
 
+static void v8_set_function_proto(JSContextRef ctx, JSObjectRef jo) {
+    if (!ctx || !jo) return;
+    JSObjectRef g = JSContextGetGlobalObject(ctx);
+    JSStringRef fk = JSStringCreateWithUTF8CString("Function");
+    JSValueRef fv = JSObjectGetProperty(ctx, g, fk, NULL);
+    JSStringRelease(fk);
+    if (fv && JSValueIsObject(ctx, fv)) {
+        JSObjectRef fo = JSValueToObject(ctx, fv, NULL);
+        JSStringRef pk = JSStringCreateWithUTF8CString("prototype");
+        JSValueRef pv = JSObjectGetProperty(ctx, fo, pk, NULL);
+        JSStringRelease(pk);
+        if (pv && JSValueIsObject(ctx, pv)) JSObjectSetPrototype(ctx, jo, pv);
+    }
+}
+
 static JSObjectRef v8_instantiate_tmpl(V8Isolate *iso, JSContextRef ctx, V8Tmpl *tmpl) {
     v8_init_jsc_classes();
     V8InstData *d = (V8InstData *)calloc(1, sizeof(V8InstData));
@@ -670,8 +703,9 @@ static JSObjectRef v8_instantiate_tmpl(V8Isolate *iso, JSContextRef ctx, V8Tmpl 
         d->fn_data = tmpl->fn_data;
         d->internal_field_count = tmpl->internal_field_count;
     }
-    JSClassRef cls = (tmpl && (tmpl->is_func || tmpl->fn_cb)) ? g_v8_fn_class : g_v8_obj_class;
-    JSObjectRef jo = JSObjectMake(ctx, cls, d);
+    bool is_fn = (tmpl && (tmpl->is_func || tmpl->fn_cb));
+    JSObjectRef jo = JSObjectMake(ctx, is_fn ? g_v8_fn_class : g_v8_obj_class, d);
+    if (is_fn) v8_set_function_proto(ctx, jo);
     d->js_obj = jo;
     if (tmpl) v8_apply_tmpl_props(d->iso, ctx, jo, tmpl);
     return jo;
@@ -1593,6 +1627,7 @@ static void v8_Function_New(CPU64 *c, void *ud) {
     d->fn_cb = fn_cb;
     d->fn_data = data_h ? R64(data_h) : (g_cur_iso ? g_cur_iso->root_undef : 0);
     JSObjectRef jo = JSObjectMake(jsc, g_v8_fn_class, d);
+    v8_set_function_proto(jsc, jo);
     d->js_obj = jo;
     ret_sret64(c, sret, v8_alloc_handle(g_cur_iso, v8_wrap_jsv(g_cur_iso, jsc, jo)));
 }

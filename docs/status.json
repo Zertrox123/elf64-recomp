@@ -1,44 +1,52 @@
 {
   "libraries": {
     "kernel32": [
-      264,
-      264
-    ],
-    "user32": [
-      104,
-      104
+      275,
+      275
     ],
     "v8": [
-      0,
-      61
+      137,
+      137
+    ],
+    "user32": [
+      112,
+      112
+    ],
+    "pango-1.0-0": [
+      77,
+      77
+    ],
+    "cairo": [
+      46,
+      46
     ],
     "gdi32": [
       38,
       38
     ],
     "ws2_32": [
-      27,
-      27
+      37,
+      37
     ],
     "advapi32": [
-      22,
-      22
+      25,
+      25
     ],
     "steam_api64": [
       21,
       21
     ],
     "winmm": [
-      20,
-      20
+      21,
+      21
+    ],
+    "imm32": [
+      19,
+      19
     ],
     "wsock32": [
       13,
       13
-    ],
-    "imm32": [
-      11,
-      11
     ],
     "ole32": [
       10,
@@ -64,21 +72,49 @@
       7,
       7
     ],
+    "pangoft2-1.0-0": [
+      6,
+      6
+    ],
     "rpcrt4": [
       5,
       5
     ],
     "video64": [
+      5,
+      5
+    ],
+    "dsound": [
       4,
       4
     ],
-    "dsound": [
+    "freetype": [
       4,
       4
     ],
     "version": [
       3,
       3
+    ],
+    "fontconfig": [
+      3,
+      3
+    ],
+    "shlwapi": [
+      2,
+      2
+    ],
+    "v8_libplatform": [
+      2,
+      2
+    ],
+    "mswsock": [
+      2,
+      2
+    ],
+    "gobject-2.0-0": [
+      2,
+      2
     ],
     "bcrypt": [
       1,
@@ -96,15 +132,19 @@
       1,
       1
     ],
-    "shlwapi": [
-      1,
-      1
-    ],
     "oleaut32": [
       1,
       1
     ],
     "xaudio2_9redist": [
+      1,
+      1
+    ],
+    "discord_game_sdk": [
+      1,
+      1
+    ],
+    "glib-2.0-0": [
       1,
       1
     ]
@@ -119,8 +159,8 @@
       39
     ],
     "SSE / SSE2": [
-      118,
-      118
+      144,
+      144
     ],
     "SSE4 / BIT": [
       28,
@@ -140,12 +180,12 @@
     ]
   },
   "summary": {
-    "libraries_pct": 90.66,
-    "libraries_done": 592,
-    "libraries_total": 653,
-    "isa_pct": 87.5,
-    "isa_done": 252,
-    "isa_total": 288,
+    "libraries_pct": 100.0,
+    "libraries_done": 916,
+    "libraries_total": 916,
+    "isa_pct": 88.54,
+    "isa_done": 278,
+    "isa_total": 314,
     "dxbc_pct": 72.22,
     "dxbc_done": 39,
     "dxbc_total": 54

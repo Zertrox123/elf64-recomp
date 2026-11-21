@@ -59,6 +59,15 @@ REVOLUTION_CORE_DLLS = [
     "scenefilecache.dll",
     "localize.dll",
     "vscript.dll",
+    "video_services.dll",
+    "imemanager.dll",
+    "soundemittersystem.dll",
+    "richpresence.dll",
+    "devui.dll",
+    "toolframework.dll",
+    "panorama.dll",
+    "panoramauiclient.dll",
+    "panorama_text_pango.dll",
 ]
 
 # Reference x86_64 + DXBC SM4/SM5 instruction catalog grouped by ISA category.
@@ -83,15 +92,18 @@ ISA_CATALOG: Dict[str, List[str]] = {
         "movddup", "addss", "subss", "mulss", "divss", "sqrtss", "minss", "maxss",
         "addsd", "subsd", "mulsd", "divsd", "sqrtsd", "minsd", "maxsd",
         "ucomiss", "ucomisd", "comiss", "comisd",
-        "addps", "subps", "mulps", "divps", "sqrtps", "minps", "maxps",
+        "addps", "subps", "mulps", "divps", "sqrtps", "rcpps", "rsqrtps", "rcpss", "rsqrtss", "minps", "maxps",
         "addpd", "subpd", "mulpd", "divpd", "sqrtpd", "minpd", "maxpd",
         "xorps", "xorpd", "pxor", "orps", "orpd", "por", "andps", "andpd", "pand", "andnps", "pandn",
         "cvtsi2ss", "cvtsi2sd", "cvtss2si", "cvttss2si", "cvtsd2si", "cvttsd2si",
         "cvtss2sd", "cvtsd2ss", "cvtdq2ps", "cvtps2dq", "cvttps2dq", "cvtdq2pd", "cvtpd2dq", "cvtps2pd", "cvtpd2ps",
         "paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd", "psubq", "pmullw", "pmulld",
+        "pmaddwd", "pmuludq", "pmulhw", "pmulhuw", "packuswb", "packsswb", "packssdw", "packusdw",
+        "pminub", "pmaxub", "pminsw", "pmaxsw", "pminsd", "pmaxsd", "pminud", "pmaxud", "pabsb", "pabsw", "pabsd",
         "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpeqq", "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq",
         "pshufd", "pshuflw", "pshufhw", "shufps", "shufpd",
-        "unpcklps", "unpckhps", "unpcklpd", "unpckhpd", "punpcklbw", "punpcklwd", "punpckldq",
+        "unpcklps", "unpckhps", "unpcklpd", "unpckhpd",
+        "punpcklbw", "punpckhbw", "punpcklwd", "punpckhwd", "punpckldq", "punpckhdq",
         "pslldq", "psrldq", "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad",
         "pmovmskb", "movmskps", "movmskpd", "stmxcsr", "ldmxcsr",
     ],
@@ -208,14 +220,54 @@ def collect_game_imports(game_bin_dir: str) -> Dict[str, Tuple[int, int]]:
     if not pes:
         raise FileNotFoundError(f"No Portal: Revolution PE64 binaries found in {game_bin_dir}")
 
-    with tempfile.TemporaryDirectory(prefix="status_pe64_") as tmp:
-        layout = peprep64.prepare_pe_modules(pes, tmp)
-        by_dll: Dict[str, List[str]] = collections.defaultdict(list)
-        for imp in layout["imports"]:
-            dll = (imp.get("dll") or "other").lower()
-            if dll.endswith(".dll"):
-                dll = dll[:-4]
-            by_dll[dll].append(imp["name"])
+    import struct as _st
+
+    lifted_names = {os.path.basename(p).lower() for p in pes}
+    by_dll: Dict[str, List[str]] = collections.defaultdict(list)
+    for path in pes:
+        data = open(path, "rb").read()
+        pe = _st.unpack_from("<I", data, 0x3C)[0]
+        nsec = _st.unpack_from("<H", data, pe + 6)[0]
+        opt_sz = _st.unpack_from("<H", data, pe + 20)[0]
+        opt = pe + 24
+        imp_rva = _st.unpack_from("<I", data, opt + 112 + 8)[0]
+        if not imp_rva:
+            continue
+        secs = []
+        for i in range(nsec):
+            o = opt + opt_sz + i * 40
+            vsz, vrva, rsz, rptr = _st.unpack_from("<IIII", data, o + 8)
+            secs.append((vrva, max(vsz, rsz), rptr))
+
+        def _rva(r: int) -> int | None:
+            for vrva, sz, rptr in secs:
+                if vrva <= r < vrva + sz:
+                    return rptr + (r - vrva)
+            return None
+
+        def _cstr(r: int) -> str:
+            o = _rva(r)
+            return "" if o is None else data[o:data.index(b"\x00", o)].decode("latin1", errors="ignore")
+
+        off = _rva(imp_rva)
+        while off is not None:
+            ilt, _ts, _fwd, name_rva, ft = _st.unpack_from("<IIIII", data, off)
+            if not name_rva:
+                break
+            dll_full = _cstr(name_rva).lower()
+            off += 20
+            if dll_full in lifted_names:
+                continue
+            dll = dll_full[:-4] if dll_full.endswith(".dll") else dll_full
+            io = _rva(ilt or ft)
+            idx = 0
+            while io is not None:
+                ent = _st.unpack_from("<Q", data, io + idx * 8)[0]
+                if not ent:
+                    break
+                sym = f"#{ent & 0xFFFF}" if (ent >> 63) else _cstr((ent & 0xFFFFFFFF) + 2)
+                by_dll[dll].append(sym)
+                idx += 1
 
     result: Dict[str, Tuple[int, int]] = {}
     for dll, syms in by_dll.items():

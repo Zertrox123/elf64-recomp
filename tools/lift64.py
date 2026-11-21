@@ -552,7 +552,7 @@ def read_xmm128(op: str, next_rip: int) -> str:
 
 def lift_sse(insn: Insn) -> Optional[str]:
     m, ops, nr = insn.mnemonic, insn.ops, insn.next_addr
-    if m in ("movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "lddqu", "movntdq", "movntps", "movntpd"):
+    if m in ("movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "lddqu", "movntdq", "movntdqa", "movntps", "movntpd"):
         dst, src = ops
         if dst in REG_INFO and REG_INFO[dst][2] == "xmm":
             return f"c->{REG_INFO[dst][0]} = {read_xmm128(src, nr)};"
@@ -640,6 +640,10 @@ def lift_sse(insn: Insn) -> Optional[str]:
         return f"c->{REG_INFO[ops[0]][0]}.f[0] = sqrtf({read_xmm_float(ops[1], nr)});"
     if m == "sqrtsd":
         return f"c->{REG_INFO[ops[0]][0]}.df[0] = sqrt({read_xmm_double(ops[1], nr)});"
+    if m == "rcpss":
+        return f"c->{REG_INFO[ops[0]][0]}.f[0] = 1.0f / ({read_xmm_float(ops[1], nr)});"
+    if m == "rsqrtss":
+        return f"c->{REG_INFO[ops[0]][0]}.f[0] = 1.0f / sqrtf({read_xmm_float(ops[1], nr)});"
     if m == "minss":
         d = f"c->{REG_INFO[ops[0]][0]}.f[0]"
         return f"{{ float _b = {read_xmm_float(ops[1], nr)}; {d} = ({d} < _b) ? {d} : _b; }}"
@@ -672,6 +676,12 @@ def lift_sse(insn: Insn) -> Optional[str]:
     if m == "sqrtpd":
         d = f"c->{REG_INFO[ops[0]][0]}"
         return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<2; _i++) {d}.df[_i] = sqrt(_s.df[_i]); }}"
+    if m == "rcpps":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<4; _i++) {d}.f[_i] = 1.0f / _s.f[_i]; }}"
+    if m == "rsqrtps":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<4; _i++) {d}.f[_i] = 1.0f / sqrtf(_s.f[_i]); }}"
     if m in ("minps", "maxps"):
         cmp = "<" if m == "minps" else ">"
         d = f"c->{REG_INFO[ops[0]][0]}"
@@ -844,12 +854,81 @@ def lift_sse(insn: Insn) -> Optional[str]:
     if m == "punpcklbw":
         d = f"c->{REG_INFO[ops[0]][0]}"
         return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; for (int _i=0;_i<8;_i++){{ {d}.b[_i*2]=_a.b[_i]; {d}.b[_i*2+1]=_b.b[_i]; }} }}"
+    if m == "punpckhbw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; for (int _i=0;_i<8;_i++){{ {d}.b[_i*2]=_a.b[8+_i]; {d}.b[_i*2+1]=_b.b[8+_i]; }} }}"
     if m == "punpcklwd":
         d = f"c->{REG_INFO[ops[0]][0]}"
         return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; for (int _i=0;_i<4;_i++){{ {d}.w[_i*2]=_a.w[_i]; {d}.w[_i*2+1]=_b.w[_i]; }} }}"
+    if m == "punpckhwd":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; for (int _i=0;_i<4;_i++){{ {d}.w[_i*2]=_a.w[4+_i]; {d}.w[_i*2+1]=_b.w[4+_i]; }} }}"
     if m == "punpckldq":
         d = f"c->{REG_INFO[ops[0]][0]}"
         return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; {d}.d[0]=_a.d[0]; {d}.d[1]=_b.d[0]; {d}.d[2]=_a.d[1]; {d}.d[3]=_b.d[1]; }}"
+    if m == "punpckhdq":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; {d}.d[0]=_a.d[2]; {d}.d[1]=_b.d[2]; {d}.d[2]=_a.d[3]; {d}.d[3]=_b.d[3]; }}"
+    if m == "packuswb":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}, _r; "
+                f"for (int _i=0;_i<8;_i++){{ int _v=_a.sw[_i]; _r.b[_i]=(uint8_t)(_v<0?0:(_v>255?255:_v)); "
+                f"_v=_b.sw[_i]; _r.b[8+_i]=(uint8_t)(_v<0?0:(_v>255?255:_v)); }} {d}=_r; }}")
+    if m == "packsswb":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}, _r; "
+                f"for (int _i=0;_i<8;_i++){{ int _v=_a.sw[_i]; _r.sb[_i]=(int8_t)(_v<-128?-128:(_v>127?127:_v)); "
+                f"_v=_b.sw[_i]; _r.sb[8+_i]=(int8_t)(_v<-128?-128:(_v>127?127:_v)); }} {d}=_r; }}")
+    if m == "packssdw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}, _r; "
+                f"for (int _i=0;_i<4;_i++){{ int32_t _v=_a.sd[_i]; _r.sw[_i]=(int16_t)(_v<-32768?-32768:(_v>32767?32767:_v)); "
+                f"_v=_b.sd[_i]; _r.sw[4+_i]=(int16_t)(_v<-32768?-32768:(_v>32767?32767:_v)); }} {d}=_r; }}")
+    if m == "packusdw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}, _r; "
+                f"for (int _i=0;_i<4;_i++){{ int32_t _v=_a.sd[_i]; _r.w[_i]=(uint16_t)(_v<0?0:(_v>65535?65535:_v)); "
+                f"_v=_b.sd[_i]; _r.w[4+_i]=(uint16_t)(_v<0?0:(_v>65535?65535:_v)); }} {d}=_r; }}")
+    if m == "pmaddwd":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}, _r; "
+                f"for (int _i=0;_i<4;_i++) _r.sd[_i]=(int32_t)_a.sw[_i*2]*_b.sw[_i*2]+(int32_t)_a.sw[_i*2+1]*_b.sw[_i*2+1]; {d}=_r; }}")
+    if m == "pmuludq":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; {d}.q[0]=(uint64_t)_a.d[0]*_b.d[0]; {d}.q[1]=(uint64_t)_a.d[2]*_b.d[2]; }}"
+    if m == "pmulhw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; for (int _i=0;_i<8;_i++) {d}.sw[_i]=(int16_t)(((int32_t)_a.sw[_i]*_b.sw[_i])>>16); }}"
+    if m == "pmulhuw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _a={d}, _b={read_xmm128(ops[1], nr)}; for (int _i=0;_i<8;_i++) {d}.w[_i]=(uint16_t)(((uint32_t)_a.w[_i]*_b.w[_i])>>16); }}"
+    pminmax = {
+        "pminub": ("b", 16, "<"), "pmaxub": ("b", 16, ">"),
+        "pminsb": ("sb", 16, "<"), "pmaxsb": ("sb", 16, ">"),
+        "pminuw": ("w", 8, "<"), "pmaxuw": ("w", 8, ">"),
+        "pminsw": ("sw", 8, "<"), "pmaxsw": ("sw", 8, ">"),
+        "pminud": ("d", 4, "<"), "pmaxud": ("d", 4, ">"),
+        "pminsd": ("sd", 4, "<"), "pmaxsd": ("sd", 4, ">"),
+    }
+    if m in pminmax:
+        fld, cnt, cmp = pminmax[m]
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _s={read_xmm128(ops[1], nr)}; for (int _i=0;_i<{cnt};_i++) {d}.{fld}[_i]=({d}.{fld}[_i] {cmp} _s.{fld}[_i])?{d}.{fld}[_i]:_s.{fld}[_i]; }}"
+    if m in ("pabsb", "pabsw", "pabsd"):
+        sf, uf, cnt = {"pabsb": ("sb", "b", 16), "pabsw": ("sw", "w", 8), "pabsd": ("sd", "d", 4)}[m]
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _s={read_xmm128(ops[1], nr)}; for (int _i=0;_i<{cnt};_i++){{ int64_t _v=_s.{sf}[_i]; {d}.{uf}[_i]=(_v<0)?-_v:_v; }} }}"
+    psat = {
+        "paddusb": ("b", 16, 1, 0, 255), "psubusb": ("b", 16, -1, 0, 255),
+        "paddusw": ("w", 8, 1, 0, 65535), "psubusw": ("w", 8, -1, 0, 65535),
+        "paddsb": ("sb", 16, 1, -128, 127), "psubsb": ("sb", 16, -1, -128, 127),
+        "paddsw": ("sw", 8, 1, -32768, 32767), "psubsw": ("sw", 8, -1, -32768, 32767),
+    }
+    if m in psat:
+        fld, cnt, sgn, lo, hi = psat[m]
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        op_c = "+" if sgn > 0 else "-"
+        return f"{{ Xmm128 _s={read_xmm128(ops[1], nr)}; for (int _i=0;_i<{cnt};_i++){{ int32_t _v=(int32_t){d}.{fld}[_i] {op_c} (int32_t)_s.{fld}[_i]; {d}.{fld}[_i]=_v<{lo}?{lo}:(_v>{hi}?{hi}:_v); }} }}"
     if m in ("pslldq", "psrldq"):
         d = f"c->{REG_INFO[ops[0]][0]}"
         cnt = parse_imm(ops[1])
@@ -1000,8 +1079,14 @@ def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List
     m, ops, pfx, nr = insn.mnemonic, insn.ops, insn.prefix, insn.next_addr
 
     if m in ("nop", "endbr64", "endbr32", "pause", "mfence", "lfence", "sfence",
-             "prefetcht0", "prefetcht1", "prefetcht2", "prefetchnta", "prefetchw", "vzeroupper"):
+             "prefetcht0", "prefetcht1", "prefetcht2", "prefetchnta", "prefetchw",
+             "prefetchit0", "prefetchit1", "vzeroupper",
+             "fldcw", "fnclex", "fclex", "fninit", "finit", "fwait", "wait", "emms"):
         return "/* nop */"
+    if m in ("fnstcw", "fstcw"):
+        return f"{write_op(ops[0], 16, '0x037FU', nr)};"
+    if m in ("fnstsw", "fstsw"):
+        return f"{write_op(ops[0], 16, '0U', nr)};"
     if m == "xgetbv":
         return "SET32(c->rax, 0x3U); SET32(c->rdx, 0U);"
     if m == "int":
@@ -1080,7 +1165,7 @@ def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List
         return f"if ({CC_EXPR[m[4:]]}) {{ {write_op(ops[0], w, src, nr)}; }}"
 
     # Data movement
-    if m in ("mov", "movabs"):
+    if m in ("mov", "movabs", "movnti"):
         w = infer_width(ops, nr, 64)
         return f"{write_op(ops[0], w, read_op(ops[1], w, nr), nr)};"
     if m == "movzx":
@@ -1279,6 +1364,36 @@ def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List
         fn = "f_shl" if m in ("shl", "sal") else f"f_{m}"
         cnt = read_op(ops[1], 8, nr) if len(ops) > 1 else "1ULL"
         return f"{{ uint64_t _r = {fn}(c, {read_op(ops[0], w, nr)}, {cnt}, {w}); {write_op(ops[0], w, '_r', nr)}; }}"
+
+    if m in ("rcl", "rcr"):
+        w = op_width(ops[0], nr) or 64
+        cnt = read_op(ops[1], 8, nr) if len(ops) > 1 else "1ULL"
+        cmask = 63 if w == 64 else 31
+        wmask = "~0ULL" if w == 64 else f"((1ULL << {w}) - 1ULL)"
+        if m == "rcr":
+            return (
+                f"{{ uint64_t _v = ({read_op(ops[0], w, nr)}) & {wmask}; "
+                f"unsigned _c = (unsigned)(({cnt}) & {cmask}U) % {w + 1}U; uint8_t _cf = c->cf & 1; "
+                f"for (unsigned _i = 0; _i < _c; _i++) {{ uint8_t _nc = (uint8_t)(_v & 1); _v = (_v >> 1) | ((uint64_t)_cf << {w - 1}); _cf = _nc; }} "
+                f"c->cf = _cf; if ((({cnt}) & {cmask}U) == 1) c->of = (uint8_t)(((_v >> {w - 1}) ^ (_v >> {w - 2})) & 1); "
+                f"{write_op(ops[0], w, '_v', nr)}; }}"
+            )
+        return (
+            f"{{ uint64_t _v = ({read_op(ops[0], w, nr)}) & {wmask}; "
+            f"unsigned _c = (unsigned)(({cnt}) & {cmask}U) % {w + 1}U; uint8_t _cf = c->cf & 1; "
+            f"for (unsigned _i = 0; _i < _c; _i++) {{ uint8_t _nc = (uint8_t)((_v >> {w - 1}) & 1); _v = ((_v << 1) | _cf) & {wmask}; _cf = _nc; }} "
+            f"c->cf = _cf; if ((({cnt}) & {cmask}U) == 1) c->of = (uint8_t)(((_v >> {w - 1}) ^ _cf) & 1); "
+            f"{write_op(ops[0], w, '_v', nr)}; }}"
+        )
+
+    if m == "lahf":
+        return "SET8H(c->rax, (uint8_t)((c->cf&1) | 2 | ((c->pf&1)<<2) | ((c->af&1)<<4) | ((c->zf&1)<<6) | ((c->sf&1)<<7)));"
+    if m == "sahf":
+        return "{ uint8_t _f = GET8H(c->rax); c->cf=_f&1; c->pf=(_f>>2)&1; c->af=(_f>>4)&1; c->zf=(_f>>6)&1; c->sf=(_f>>7)&1; }"
+    if m in ("pushfq", "pushf"):
+        return "push64(c, (uint64_t)((c->cf&1) | 2 | ((c->pf&1)<<2) | ((c->af&1)<<4) | ((c->zf&1)<<6) | ((c->sf&1)<<7) | ((c->df&1)<<10) | ((c->of&1)<<11)));"
+    if m in ("popfq", "popf"):
+        return "{ uint64_t _f = pop64(c); c->cf=_f&1; c->pf=(_f>>2)&1; c->af=(_f>>4)&1; c->zf=(_f>>6)&1; c->sf=(_f>>7)&1; c->df=(_f>>10)&1; c->of=(_f>>11)&1; }"
 
     if m in ("shld", "shrd"):
         w = op_width(ops[0], nr) or 64
