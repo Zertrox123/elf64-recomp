@@ -10,6 +10,7 @@ switch tables, atomics, string ops, and SSE/SSE2/SSE4.1 instructions to C.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -214,9 +215,17 @@ def disassemble_module(
     if not all_insns:
         return []
 
-    # Resync disassembly for any known code_root whose entry byte was swallowed by
-    # inline jump-table data in .text (e.g., MSVC switch tables right before a function).
-    missing_roots = sorted(r for r in code_roots if r not in addr_to_idx)
+    # Resync disassembly for any known code_root or direct call target whose entry byte
+    # was swallowed by inline jump-table data in .text.
+    lo_code = all_insns[0].addr
+    hi_code = all_insns[-1].next_addr
+    want_roots = {r for r in code_roots if lo_code <= r < hi_code}
+    for insn in all_insns:
+        if insn.mnemonic == "call" and len(insn.ops) == 1:
+            t = parse_imm(insn.ops[0])
+            if t is not None and lo_code <= t < hi_code:
+                want_roots.add(t)
+    missing_roots = sorted(r for r in want_roots if r not in addr_to_idx)
     if missing_roots:
         resynced_ranges: List[Tuple[int, int]] = []
         resynced_insns: List[Insn] = []
@@ -1394,7 +1403,9 @@ def emit_function_c(func: LiftedFunc, unimpl: List[str]) -> str:
                 if t is not None and t in local_addrs:
                     labels.add(t)
 
-    lines = [f"/* {func.name} @ 0x{func.addr:x} */", f"void fn_{func.addr:x}(CPU64 *c) {{"]
+    # Avoid O(N^2) LLVM optimizer blowup on huge intra-function switch tables.
+    opt_attr = "__attribute__((optnone)) " if (has_ind_jmp and len(labels) > 250) else ""
+    lines = [f"/* {func.name} @ 0x{func.addr:x} */", f"{opt_attr}void fn_{func.addr:x}(CPU64 *c) {{"]
     if has_ind_jmp:
         lines.append("    uint64_t _ind_target = 0;")
     for ins in func.insns:
@@ -1437,14 +1448,24 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
     unimpl: List[str] = []
     shard_files: List[str] = []
     header = '#include "runtime64.h"\n#include <stdio.h>\n#include <stdlib.h>\n#include <math.h>\n\n'
-    for mi, mod in enumerate(layout["modules"]):
-        raw_funcs = disassemble_module(
+
+    def _dis_mod(mod: dict) -> List[LiftedFunc]:
+        return disassemble_module(
             mod["elf_path"],
             mod["base"],
             mod["code_roots"],
             is_pe=is_pe,
             vma_delta=mod.get("vma_delta", 0),
         )
+
+    mods = layout["modules"]
+    if len(mods) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(mods), os.cpu_count() or 4)) as pool:
+            per_mod_funcs = list(pool.map(_dis_mod, mods))
+    else:
+        per_mod_funcs = [_dis_mod(m) for m in mods]
+
+    for mi, (mod, raw_funcs) in enumerate(zip(mods, per_mod_funcs)):
         mfuncs: List[LiftedFunc] = []
         for fn in raw_funcs:
             if fn.addr not in seen_addrs:

@@ -339,6 +339,7 @@ static void w_GetModuleHandleA(CPU64 *c, void *ud) {
     (void)ud;
     const char *name = (const char *)(uintptr_t)c->rcx;
     uint64_t base = rt_find_module_base(name);
+    if (!base && name && strstr(name, "client_legacyui")) base = rt_find_module_base("client.dll");
     if (!base && name && is_host_system_dll(name)) base = 0x7090000000ULL;
     if (!base && name && getenv("ELF64_TRACE")) {
         fprintf(stderr, "[win32] LoadLibrary/GetModuleHandle('%s') -> NULL (not loaded)\n", name);
@@ -814,17 +815,17 @@ SDL_Window *win32_hwnd_to_sdl(uint64_t hwnd) {
 }
 
 static void w_RegisterClassExA(CPU64 *c, void *ud) { (void)ud; c->rax = 0xC001; }
-static void w_CreateWindowExA(CPU64 *c, void *ud) {
-    (void)ud;
-    const char *title = (const char *)(uintptr_t)c->r8;
+static void create_window_common(CPU64 *c, const char *title) {
+    uint32_t style = (uint32_t)c->r9;
     int w = (int)win64_arg_i(c, 6);
     int h = (int)win64_arg_i(c, 7);
-    if (w <= 0 || w > 8192) w = 800;
-    if (h <= 0 || h > 8192) h = 600;
+    if (w <= 0 || w > 8192) w = 1280;
+    if (h <= 0 || h > 8192) h = 720;
     if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
-    SDL_Window *win = SDL_CreateWindow(title ? title : "elf64-recomp",
+    uint32_t flags = SDL_WINDOW_METAL | ((style & 0x10000000U) ? 0 : SDL_WINDOW_HIDDEN);
+    SDL_Window *win = SDL_CreateWindow((title && *title) ? title : "elf64-recomp",
                                        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                       w, h, SDL_WINDOW_METAL | SDL_WINDOW_HIDDEN);
+                                       w, h, flags);
     if (!win) { c->rax = 0; return; }
     WinHwndObj *o = (WinHwndObj *)calloc(1, sizeof(WinHwndObj));
     o->sdl = win; o->w = w; o->h = h;
@@ -832,6 +833,16 @@ static void w_CreateWindowExA(CPU64 *c, void *ud) {
         if (!g_hwnds[i]) { g_hwnds[i] = o; c->rax = (uint64_t)(0x1000 + i); return; }
     }
     SDL_DestroyWindow(win); free(o); c->rax = 0;
+}
+static void w_CreateWindowExA(CPU64 *c, void *ud) {
+    (void)ud;
+    create_window_common(c, (const char *)(uintptr_t)c->r8);
+}
+static void w_CreateWindowExW(CPU64 *c, void *ud) {
+    (void)ud;
+    char title[256] = {0};
+    if (c->r8) utf16_to_utf8((const uint16_t *)(uintptr_t)c->r8, title, sizeof(title));
+    create_window_common(c, title);
 }
 static void w_ShowWindow(CPU64 *c, void *ud) {
     (void)ud;
@@ -921,7 +932,7 @@ void rt_register_win32_64(void) {
 
     /* User32 */
     REG("RegisterClassExA", w_RegisterClassExA); REG("RegisterClassExW", w_RegisterClassExA);
-    REG("CreateWindowExA", w_CreateWindowExA); REG("CreateWindowExW", w_CreateWindowExA);
+    REG("CreateWindowExA", w_CreateWindowExA); REG("CreateWindowExW", w_CreateWindowExW);
     REG("ShowWindow", w_ShowWindow); REG("DestroyWindow", w_DestroyWindow);
     REG("GetClientRect", w_GetClientRect); REG("PeekMessageA", w_PeekMessageA); REG("PeekMessageW", w_PeekMessageA);
     REG("TranslateMessage", w_TranslateMessage); REG("DispatchMessageA", w_DispatchMessageA);

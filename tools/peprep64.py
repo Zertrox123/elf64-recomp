@@ -224,6 +224,8 @@ def parse_pe64(path: str, base_cursor: int, is_main: bool) -> Tuple[PeModule, in
                 elif rtype == REL_BASED_DIR64:
                     nv = (mod.r64(rva) + delta) & 0xFFFFFFFFFFFFFFFF
                     mod.w64(rva, nv)
+                    if any(lo <= nv < hi for lo, hi in mod.exec_ranges):
+                        mod.pdata_funcs.append(nv)
                     raw_off = mod.rva_to_raw(rva)
                     if raw_off is not None and raw_off + 8 <= len(mod.reloc_raw):
                         struct.pack_into("<Q", mod.reloc_raw, raw_off, nv)
@@ -237,13 +239,16 @@ def parse_pe64(path: str, base_cursor: int, is_main: bool) -> Tuple[PeModule, in
                     raise ValueError(f"{mod.name}: unsupported PE reloc type {rtype} at RVA 0x{rva:x}")
             pos += blk_sz
 
-    # Parse .pdata RUNTIME_FUNCTION table (exact non-leaf function boundaries!).
+    # Parse .pdata RUNTIME_FUNCTION table (primary function starts; skip UNW_FLAG_CHAININFO
+    # continuations so shrink-wrapped MSVC functions & switch tables stay contiguous).
     exc_rva, exc_sz = data_dirs[DIR_EXCEPTION]
     if exc_rva and exc_sz:
         for off in range(exc_rva, exc_rva + exc_sz - 11, 12):
-            begin_rva, end_rva, _unwind = struct.unpack_from("<III", mod.mem, off)
+            begin_rva, end_rva, unwind_rva = struct.unpack_from("<III", mod.mem, off)
             if begin_rva and end_rva > begin_rva:
-                mod.pdata_funcs.append(base + begin_rva)
+                is_chained = unwind_rva < len(mod.mem) and bool((mod.mem[unwind_rva] >> 3) & 4)
+                if not is_chained:
+                    mod.pdata_funcs.append(base + begin_rva)
 
     # Parse Export Directory
     exp_rva, exp_sz = data_dirs[DIR_EXPORT]
