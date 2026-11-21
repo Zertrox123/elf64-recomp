@@ -1797,6 +1797,51 @@ static void w_SHGetSpecialFolderPathA(CPU64 *c, void *ud) {
     c->rax = 1;
 }
 static void w_wsa_htonl(CPU64 *c, void *ud) { (void)ud; c->rax = htonl((uint32_t)c->rcx); }
+static void w_wsa_ntohl(CPU64 *c, void *ud) { (void)ud; c->rax = ntohl((uint32_t)c->rcx); }
+static void w_wsa_SetLastError(CPU64 *c, void *ud) { (void)ud; g_wsa_err = (int)c->rcx; }
+static void w_wsa_shutdown(CPU64 *c, void *ud) { (void)ud; c->rax = (uint64_t)(int64_t)shutdown((int)c->rcx, (int)c->rdx); }
+static void w_wsa_getpeername(CPU64 *c, void *ud) {
+    (void)ud;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    int r = getpeername((int)c->rcx, (struct sockaddr *)&ss, &sl);
+    if (r == 0) {
+        if (c->rdx) bsd_to_win_sa(&ss, sl, (uint8_t *)(uintptr_t)c->rdx);
+        if (c->r8) W32(c->r8, (uint32_t)sl);
+    }
+    c->rax = (uint64_t)(int64_t)r;
+}
+static void w_wsa_getsockopt(CPU64 *c, void *ud) {
+    (void)ud;
+    int lvl = ((int)c->rdx == 0xFFFF) ? SOL_SOCKET : (int)c->rdx;
+    socklen_t sl = (socklen_t)(win64_arg_i(c, 4) ? R32(win64_arg_i(c, 4)) : 4);
+    int r = getsockopt((int)c->rcx, lvl, (int)c->r8, (void *)(uintptr_t)c->r9, &sl);
+    if (r == 0 && win64_arg_i(c, 4)) W32(win64_arg_i(c, 4), (uint32_t)sl);
+    c->rax = (uint64_t)(int64_t)r;
+}
+static void w_GetComputerNameExW(CPU64 *c, void *ud) {
+    (void)ud;
+    char host[256] = "macOS";
+    gethostname(host, sizeof(host) - 1);
+    size_t n = strlen(host);
+    uint32_t cap = c->r8 ? R32(c->r8) : 0;
+    if (c->rdx && cap > n) {
+        u8_to_w16(host, (uint16_t *)(uintptr_t)c->rdx, cap);
+        if (c->r8) W32(c->r8, (uint32_t)n);
+        c->rax = 1;
+    } else {
+        if (c->r8) W32(c->r8, (uint32_t)(n + 1));
+        c->rax = 0;
+    }
+}
+static void w_CreateIoCompletionPort(CPU64 *c, void *ud) { (void)ud; c->rax = 0x30050ULL; }
+static void w_GetQueuedCompletionStatus(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t ms = (uint32_t)win64_arg_i(c, 4);
+    if (ms > 0 && ms < 5000) usleep(ms * 1000U);
+    else if (ms != 0) usleep(50000);
+    c->rax = 0; /* WAIT_TIMEOUT */
+}
 static void w_CompareStringEx(CPU64 *c, void *ud) {
     (void)ud;
     const uint16_t *a = (const uint16_t *)(uintptr_t)c->r8;
@@ -2133,5 +2178,22 @@ void rt_register_win32_extra(void) {
     REG("iplBinauralEffectRelease", w_ret_0); REG("iplDirectEffectCreate", w_ret_err2);
     REG("iplDirectEffectApply", w_ret_0); REG("iplAudioBufferInterleave", w_ret_0);
     REG("DiscordCreate", w_ret_err2);
+    /* Panorama Win32 / IOCP / Winsock2 / MSWSock / Shlwapi */
+    REG("CreateIoCompletionPort", w_CreateIoCompletionPort);
+    REG("GetQueuedCompletionStatus", w_GetQueuedCompletionStatus);
+    REG("PostQueuedCompletionStatus", w_ret_1);
+    REG("CreateWaitableTimerA", w_CreateMutexA); REG("SetWaitableTimer", w_ret_1);
+    REG("CancelIo", w_ret_1); REG("QueueUserAPC", w_ret_1);
+    REG("ReadDirectoryChangesW", w_ret_0);
+    REG("GetComputerNameExW", w_GetComputerNameExW);
+    REG("VerSetConditionMask", w_ret_0); REG("VerifyVersionInfoA", w_ret_1);
+    REG("ws2_32.dll!#5", w_wsa_getpeername); REG("ws2_32.dll!#7", w_wsa_getsockopt);
+    REG("ws2_32.dll!#8", w_wsa_htonl); REG("ws2_32.dll!#14", w_wsa_ntohl);
+    REG("ws2_32.dll!#22", w_wsa_shutdown); REG("ws2_32.dll!#112", w_wsa_SetLastError);
+    REG("WSASocketW", w_wsa_socket); REG("WSARecv", w_ret_inv); REG("WSASend", w_ret_inv);
+    REG("WSAAddressToStringW", w_ret_inv);
+    REG("AcceptEx", w_ret_0); REG("GetAcceptExSockaddrs", w_ret_0);
+    REG("timeEndPeriod", w_ret_0); REG("VideoPlaybackRunFrame", w_ret_0);
+    REG("GetDlgItem", w_ret_0); REG("AssocQueryStringA", w_ret_err2);
     #undef REG
 }

@@ -376,6 +376,7 @@ void rt_init(int argc, char **argv, char **envp) {
         rt_register_win32_64();
         rt_register_win32_extra();
         rt_register_d3d11_64();
+        rt_register_cairo_pango_64();
     } else {
         rt_register_libc64();
         rt_register_sdl2_64();

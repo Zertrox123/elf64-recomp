@@ -28,10 +28,13 @@ import peprep64  # noqa: E402
 def collect_implemented_shims() -> Set[str]:
     shims: Set[str] = set()
     pat = re.compile(r'(?:REG|rt_register_shim)\(\s*"([^"]+)"')
+    pat_tbl = re.compile(r'\{\s*LIB_[A-Z0-9_]+\s*,\s*"([^"]+)"')
     for fn in os.listdir(RUNTIME_DIR):
         if fn.endswith((".c", ".m")):
             with open(os.path.join(RUNTIME_DIR, fn)) as f:
-                shims.update(pat.findall(f.read()))
+                txt = f.read()
+                shims.update(pat.findall(txt))
+                shims.update(pat_tbl.findall(txt))
     return shims
 
 
