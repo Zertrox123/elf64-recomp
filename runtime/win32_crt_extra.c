@@ -761,8 +761,12 @@ static void w_BCryptGenRandom(CPU64 *c, void *ud) {
 }
 static void w_SteamAPI_GetSteamInstallPath(CPU64 *c, void *ud) {
     (void)ud;
-    static const char *p = "/Users/omarjoudi/Library/Application Support/Steam";
-    c->rax = (uint64_t)(uintptr_t)p;
+    static char path[1024];
+    if (!path[0]) {
+        const char *home = getenv("HOME");
+        snprintf(path, sizeof(path), "%s/Library/Application Support/Steam", home ? home : "");
+    }
+    c->rax = (uint64_t)(uintptr_t)path;
 }
 static void w_CreateMutexA(CPU64 *c, void *ud)     { (void)ud; c->rax = 0x30001ULL; }
 static void w_CreateSemaphoreA(CPU64 *c, void *ud) { (void)ud; c->rax = 0x30002ULL; }
