@@ -339,7 +339,8 @@ def prepare_pe_modules(pe_paths: List[str], out_dir: str) -> dict:
             next_thunk += THUNK_STRIDE
         return imports[key][2]
 
-    # Patch standard and delay-load IATs
+    # Patch standard and delay-load IATs, recording guest DLL import dependencies.
+    guest_deps: Dict[str, List[str]] = {m.dll_key: [] for m in modules}
     for mod in modules:
         imp_rva, imp_sz = mod.data_dirs[DIR_IMPORT]
         if imp_rva and imp_sz:
@@ -349,6 +350,9 @@ def prepare_pe_modules(pe_paths: List[str], out_dir: str) -> dict:
                 if ilt_rva == 0 and name_rva == 0 and iat_rva == 0:
                     break
                 dll_name = read_cstr(mod.mem, name_rva)
+                dep_key = dll_name.lower()
+                if dep_key in mod_by_dll and dep_key not in guest_deps[mod.dll_key]:
+                    guest_deps[mod.dll_key].append(mod_by_dll[dep_key].dll_key)
                 src_rva = ilt_rva or iat_rva
                 idx = 0
                 while True:
@@ -398,7 +402,16 @@ def prepare_pe_modules(pe_paths: List[str], out_dir: str) -> dict:
     mod_layouts = []
     dll_inits = []
     tls_callbacks_all: List[int] = []
+    pe_tls_idx = 0
     for mod in modules:
+        # Assign Windows implicit TLS index (_tls_index) and patch AddressOfIndex.
+        tls_mod_id = 0
+        if mod.tls_size > 0 or mod.tls_index_va:
+            tls_mod_id = pe_tls_idx
+            if mod.tls_index_va and mod.base <= mod.tls_index_va < mod.base + mod.size_of_image:
+                mod.w32(mod.tls_index_va - mod.base, tls_mod_id)
+            pe_tls_idx += 1
+
         img_path = os.path.join(out_dir, f"{mod.name}.img")
         with open(img_path, "wb") as f:
             f.write(mod.mem)
@@ -453,16 +466,33 @@ def prepare_pe_modules(pe_paths: List[str], out_dir: str) -> dict:
             "fini_array": [],
             "needed": [],
             "tls": {
-                "mod_id": 0,
+                "mod_id": tls_mod_id,
                 "vaddr": mod.tls_vaddr,
                 "filesz": mod.tls_size,
                 "memsz": mod.tls_size,
                 "align": 16,
-                "tpoff": 0,
+                "tpoff": tls_mod_id,
             },
             "exports": mod.exports,
             "code_roots": sorted(code_roots),
         })
+
+    # Order DLL initializers topologically (imported guest DLLs run DllMain first).
+    dll_by_key = {d["name"].lower(): d for d in dll_inits}
+    ordered_dll_inits: List[dict] = []
+    visited: Set[str] = set()
+
+    def visit_dll(key: str) -> None:
+        if key in visited:
+            return
+        visited.add(key)
+        for dep in guest_deps.get(key, []):
+            visit_dll(dep)
+        if key in dll_by_key:
+            ordered_dll_inits.append(dll_by_key[key])
+
+    for m in modules:
+        visit_dll(m.dll_key)
 
     main_mod = mod_layouts[0]
     layout = {
@@ -475,7 +505,7 @@ def prepare_pe_modules(pe_paths: List[str], out_dir: str) -> dict:
         "entry": main_mod["entry"],
         "main_symbol": main_mod["exports"].get("main", 0),
         "init_order": tls_callbacks_all,
-        "dll_inits": list(reversed(dll_inits)),
+        "dll_inits": ordered_dll_inits,
         "modules": mod_layouts,
         "imports": [
             {"name": sym, "dll": dll, "addr": addr}

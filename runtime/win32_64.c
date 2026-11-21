@@ -241,11 +241,33 @@ static void w_VirtualProtect(CPU64 *c, void *ud) {
 static void w_GetLastError(CPU64 *c, void *ud) { (void)ud; c->rax = g_last_error; }
 static void w_SetLastError(CPU64 *c, void *ud) { (void)ud; g_last_error = (uint32_t)c->rcx; }
 
+static int is_host_system_dll(const char *name) {
+    if (!name) return 0;
+    const char *base = name;
+    for (const char *p = name; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+    static const char *const sys[] = {
+        "kernel32", "kernelbase", "ntdll", "user32", "gdi32", "advapi32",
+        "ole32", "oleaut32", "shell32", "shlwapi", "version", "winmm",
+        "bcrypt", "ws2_32", "dbghelp", "winhttp", "d3d11", "dxgi",
+        "ucrtbase", "msvcrt", "vcruntime140", "steam_api64", NULL
+    };
+    if (strncasecmp(base, "api-ms-win-", 11) == 0) return 1;
+    for (int i = 0; sys[i]; i++) {
+        size_t n = strlen(sys[i]);
+        if (strncasecmp(base, sys[i], n) == 0 && (base[n] == '\0' || strcasecmp(base + n, ".dll") == 0))
+            return 1;
+    }
+    return 0;
+}
+
 static void w_GetModuleHandleA(CPU64 *c, void *ud) {
     (void)ud;
     const char *name = (const char *)(uintptr_t)c->rcx;
     uint64_t base = rt_find_module_base(name);
-    if (!base && name) base = 0x7090000000ULL; /* synthetic host DLL handle */
+    if (!base && name && is_host_system_dll(name)) base = 0x7090000000ULL;
+    if (!base && name && getenv("ELF64_TRACE")) {
+        fprintf(stderr, "[win32] LoadLibrary/GetModuleHandle('%s') -> NULL (not loaded)\n", name);
+    }
     c->rax = base;
 }
 static void w_GetModuleHandleW(CPU64 *c, void *ud) {
@@ -253,7 +275,10 @@ static void w_GetModuleHandleW(CPU64 *c, void *ud) {
     char buf[260];
     utf16_to_utf8((const uint16_t *)(uintptr_t)c->rcx, buf, sizeof(buf));
     uint64_t base = rt_find_module_base(c->rcx ? buf : NULL);
-    if (!base && c->rcx) base = 0x7090000000ULL;
+    if (!base && c->rcx && is_host_system_dll(buf)) base = 0x7090000000ULL;
+    if (!base && c->rcx && getenv("ELF64_TRACE")) {
+        fprintf(stderr, "[win32] LoadLibraryW/GetModuleHandleW('%s') -> NULL (not loaded)\n", buf);
+    }
     c->rax = base;
 }
 static void w_LoadLibraryA(CPU64 *c, void *ud) { w_GetModuleHandleA(c, ud); }
@@ -271,11 +296,36 @@ static void w_GetProcAddress(CPU64 *c, void *ud) {
     c->rax = fn ? rt_alloc_dynamic_thunk(sym, fn, sud) : 0;
 }
 
+static void format_win_module_path(uint64_t hmod, char *out, size_t cap) {
+    const char *mname = (g_rt_module_count > 0) ? g_rt_modules[0].name : "guest.exe";
+    for (size_t i = 0; i < g_rt_module_count; i++) {
+        if (hmod && g_rt_modules[i].map_addr == hmod) {
+            mname = g_rt_modules[i].name;
+            break;
+        }
+    }
+    const char *root = getenv("ELF64_WIN_ROOT");
+    char raw[1024];
+    if (root && *root) {
+        snprintf(raw, sizeof(raw), "C:%s\\bin\\win64\\%s", root, mname);
+    } else {
+        char cwd[512];
+        if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "/tmp");
+        snprintf(raw, sizeof(raw), "C:%s\\bin\\win64\\%s", cwd, mname);
+    }
+    size_t j = 0;
+    for (size_t i = 0; raw[i] && j + 1 < cap; i++) {
+        out[j++] = (raw[i] == '/') ? '\\' : raw[i];
+    }
+    out[j] = '\0';
+}
+
 static void w_GetModuleFileNameA(CPU64 *c, void *ud) {
     (void)ud;
     char *buf = (char *)(uintptr_t)c->rdx;
     uint32_t sz = (uint32_t)c->r8;
-    const char *path = (g_rt_module_count > 0) ? g_rt_modules[0].name : "guest.exe";
+    char path[1024];
+    format_win_module_path(c->rcx, path, sizeof(path));
     size_t n = strlen(path);
     if (n >= sz) n = sz ? sz - 1 : 0;
     if (buf && sz) { memcpy(buf, path, n); buf[n] = '\0'; }
@@ -283,7 +333,8 @@ static void w_GetModuleFileNameA(CPU64 *c, void *ud) {
 }
 static void w_GetModuleFileNameW(CPU64 *c, void *ud) {
     (void)ud;
-    const char *path = (g_rt_module_count > 0) ? g_rt_modules[0].name : "guest.exe";
+    char path[1024];
+    format_win_module_path(c->rcx, path, sizeof(path));
     c->rax = utf8_to_utf16(path, (uint16_t *)(uintptr_t)c->rdx, (size_t)c->r8);
 }
 
@@ -392,6 +443,7 @@ static void w_ResetEvent(CPU64 *c, void *ud) {
 }
 static void w_WaitForSingleObject(CPU64 *c, void *ud) {
     (void)ud;
+    if (c->rcx >= 0x30000ULL && c->rcx < 0x40000ULL) { c->rax = 0; return; } /* mutex/semaphore */
     WinHandleObj *ho = wh_get(c->rcx);
     if (!ho) { c->rax = 0xFFFFFFFFU; return; }
     if (ho->kind == WH_THREAD) {

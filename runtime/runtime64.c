@@ -1,8 +1,10 @@
 #include "runtime64.h"
 
 #include <errno.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,9 @@
 #define RT_STACK_CANARY    0x00A1B2C3D4E5F600ULL /* low byte 0 like glibc canary */
 
 _Thread_local CPU64 *g_tls_cpu = NULL;
+int    g_rt_argc = 0;
+char **g_rt_argv = NULL;
+char **g_rt_envp = NULL;
 
 typedef enum {
     SLOT_EMPTY = 0,
@@ -158,13 +163,17 @@ uint64_t rt_find_module_base(const char *name) {
     if (!name || !*name) {
         return g_rt_module_count > 0 ? g_rt_modules[0].map_addr : 0;
     }
+    /* Match by basename so "bin\\win64\\launcher.dll" matches "launcher.dll". */
+    const char *base = name;
+    for (const char *p = name; *p; p++) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
     for (size_t i = 0; i < g_rt_module_count; i++) {
-        if (strcasecmp(g_rt_modules[i].name, name) == 0) {
+        if (strcasecmp(g_rt_modules[i].name, base) == 0) {
             return g_rt_modules[i].map_addr;
         }
-        /* Also match without .dll suffix (e.g., "calc64" vs "calc64.dll"). */
-        size_t nlen = strlen(name);
-        if (strncasecmp(g_rt_modules[i].name, name, nlen) == 0 &&
+        size_t nlen = strlen(base);
+        if (strncasecmp(g_rt_modules[i].name, base, nlen) == 0 &&
             strcasecmp(g_rt_modules[i].name + nlen, ".dll") == 0) {
             return g_rt_modules[i].map_addr;
         }
@@ -259,10 +268,12 @@ void rt_init_thread_cpu(CPU64 *c, size_t stack_size) {
     if (!tls_mem) abort();
     uint8_t *tcb = tls_mem + tls_sz;
 
-    for (size_t i = 0; i < g_rt_module_count; i++) {
-        const RTModuleSpec *m = &g_rt_modules[i];
-        if (m->tls_memsz > 0 && m->tls_filesz > 0) {
-            memcpy(tcb + m->tls_tpoff, (const void *)(uintptr_t)m->tls_vaddr, (size_t)m->tls_filesz);
+    if (!g_rt_is_win64) {
+        for (size_t i = 0; i < g_rt_module_count; i++) {
+            const RTModuleSpec *m = &g_rt_modules[i];
+            if (m->tls_memsz > 0 && m->tls_filesz > 0) {
+                memcpy(tcb + m->tls_tpoff, (const void *)(uintptr_t)m->tls_vaddr, (size_t)m->tls_filesz);
+            }
         }
     }
 
@@ -271,19 +282,32 @@ void rt_init_thread_cpu(CPU64 *c, size_t stack_size) {
     W64(fs + 0x28, RT_STACK_CANARY); /* %fs:0x28 glibc stack guard */
     c->fs_base = fs;
 
-    /* Allocate Windows x64 TEB + PEB on %gs_base when running PE64/Win64. */
+    /* Allocate Windows x64 TEB + PEB + implicit TLS array on %gs_base when running PE64/Win64. */
     if (g_rt_is_win64) {
         uint8_t *teb = (uint8_t *)calloc(1, 0x2000);
         uint8_t *peb = (uint8_t *)calloc(1, 0x1000);
-        if (!teb || !peb) abort();
+        uint64_t *tls_arr = (uint64_t *)calloc(g_rt_module_count + 16, sizeof(uint64_t));
+        if (!teb || !peb || !tls_arr) abort();
+        for (size_t i = 0; i < g_rt_module_count; i++) {
+            const RTModuleSpec *m = &g_rt_modules[i];
+            size_t bsz = (m->tls_memsz > 0) ? (size_t)m->tls_memsz : 64;
+            uint8_t *blk = (uint8_t *)calloc(1, (bsz + 63) & ~63ULL);
+            if (!blk) abort();
+            if (m->tls_vaddr && m->tls_filesz > 0) {
+                memcpy(blk, (const void *)(uintptr_t)m->tls_vaddr, (size_t)m->tls_filesz);
+            }
+            size_t slot = (size_t)m->tls_tpoff;
+            if (slot < g_rt_module_count + 16) tls_arr[slot] = (uint64_t)(uintptr_t)blk;
+        }
         uint64_t teb_va = (uint64_t)(uintptr_t)teb;
         uint64_t peb_va = (uint64_t)(uintptr_t)peb;
         uint64_t stk_lo = (uint64_t)(uintptr_t)stk;
         uint64_t stk_hi = stk_lo + stack_size;
-        W64(teb_va + 0x08, stk_hi); /* NT_TIB.StackBase */
-        W64(teb_va + 0x10, stk_lo); /* NT_TIB.StackLimit */
-        W64(teb_va + 0x30, teb_va); /* TEB.Self (NtCurrentTeb) */
-        W64(teb_va + 0x60, peb_va); /* TEB.ProcessEnvironmentBlock */
+        W64(teb_va + 0x08, stk_hi);                        /* NT_TIB.StackBase */
+        W64(teb_va + 0x10, stk_lo);                        /* NT_TIB.StackLimit */
+        W64(teb_va + 0x30, teb_va);                        /* TEB.Self (NtCurrentTeb) */
+        W64(teb_va + 0x58, (uint64_t)(uintptr_t)tls_arr);  /* TEB.ThreadLocalStoragePointer */
+        W64(teb_va + 0x60, peb_va);                        /* TEB.ProcessEnvironmentBlock */
         W64(peb_va + 0x10, g_rt_module_count > 0 ? g_rt_modules[0].map_addr : 0); /* PEB.ImageBaseAddress */
         c->gs_base = teb_va;
     }
@@ -296,12 +320,49 @@ void rt_destroy_thread_cpu(CPU64 *c) {
 }
 
 __attribute__((weak)) void rt_register_win32_64(void) {}
+__attribute__((weak)) void rt_register_win32_extra(void) {}
 __attribute__((weak)) void rt_register_d3d11_64(void) {}
 
+static int g_trace = 0;
+
+static void rt_crash_handler(int sig, siginfo_t *info, void *uctx) {
+    (void)uctx;
+    fprintf(stderr, "\n=== elf64-recomp CRASH sig=%d fault_addr=%p ===\n",
+            sig, info ? info->si_addr : NULL);
+    CPU64 *c = g_tls_cpu;
+    if (c) {
+        fprintf(stderr, "  guest rip=0x%llx rsp=0x%llx rbp=0x%llx\n",
+                (unsigned long long)c->rip, (unsigned long long)c->rsp, (unsigned long long)c->rbp);
+        fprintf(stderr, "  rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n",
+                (unsigned long long)c->rax, (unsigned long long)c->rbx,
+                (unsigned long long)c->rcx, (unsigned long long)c->rdx);
+        fprintf(stderr, "  rsi=0x%llx rdi=0x%llx r8=0x%llx r9=0x%llx\n",
+                (unsigned long long)c->rsi, (unsigned long long)c->rdi,
+                (unsigned long long)c->r8,  (unsigned long long)c->r9);
+    }
+    void *bt[24];
+    int n = backtrace(bt, 24);
+    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+    _exit(128 + sig);
+}
+
 void rt_init(int argc, char **argv, char **envp) {
-    (void)argc;
+    g_rt_argc = argc;
+    g_rt_argv = argv;
+    g_rt_envp = envp;
+    g_trace = (getenv("ELF64_TRACE") != NULL);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = rt_crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+
     if (g_rt_is_win64) {
         rt_register_win32_64();
+        rt_register_win32_extra();
         rt_register_d3d11_64();
     } else {
         rt_register_libc64();
@@ -347,6 +408,12 @@ void rt_call(CPU64 *c, uint64_t target) {
         c->rip = target;
         s->lifted(c);
     } else if (s->kind == SLOT_SHIM) {
+        if (g_trace) {
+            fprintf(stderr, "[shim] %s(rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx)\n",
+                    s->name ? s->name : "?",
+                    (unsigned long long)c->rcx, (unsigned long long)c->rdx,
+                    (unsigned long long)c->r8,  (unsigned long long)c->r9);
+        }
         s->shim(c, s->userdata);
         if (!c->halted) {
             c->rip = pop64(c);

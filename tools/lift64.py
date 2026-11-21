@@ -239,24 +239,41 @@ def disassemble_module(
                     if prev_idx < 0 or all_insns[prev_idx].mnemonic in ("ret", "jmp", "int3", "nop", "ud2"):
                         root_set.add(t)
 
-    sorted_roots = sorted(r for r in root_set if r in addr_to_idx)
-    funcs: List[LiftedFunc] = []
-    for i, start_addr in enumerate(sorted_roots):
-        start_idx = addr_to_idx[start_addr]
-        if i + 1 < len(sorted_roots):
-            end_idx = addr_to_idx[sorted_roots[i + 1]]
-        else:
-            end_idx = len(all_insns)
-        # Split on non-contiguous section gap as well (e.g. .text -> .plt).
-        insns = []
-        for idx in range(start_idx, end_idx):
-            ins = all_insns[idx]
-            if insns and ins.addr > insns[-1].next_addr + 0x100:
-                break
-            insns.append(ins)
-        if insns:
-            name = sym_starts.get(start_addr, f"sub_{start_addr:x}")
-            funcs.append(LiftedFunc(start_addr, name, insns))
+    def build_funcs(roots: Set[int]) -> List[LiftedFunc]:
+        sorted_roots = sorted(r for r in roots if r in addr_to_idx)
+        out_funcs: List[LiftedFunc] = []
+        for i, start_addr in enumerate(sorted_roots):
+            start_idx = addr_to_idx[start_addr]
+            end_idx = addr_to_idx[sorted_roots[i + 1]] if i + 1 < len(sorted_roots) else len(all_insns)
+            insns = []
+            for idx in range(start_idx, end_idx):
+                ins = all_insns[idx]
+                if insns and ins.addr > insns[-1].next_addr + 0x100:
+                    break
+                insns.append(ins)
+            if insns:
+                name = sym_starts.get(start_addr, f"sub_{start_addr:x}")
+                out_funcs.append(LiftedFunc(start_addr, name, insns))
+        return out_funcs
+
+    # Close over cross-chunk direct jmp/jcc targets so split MSVC .pdata blocks never miss a root.
+    funcs = build_funcs(root_set)
+    for _ in range(4):
+        added = False
+        for fn in funcs:
+            local = {ins.addr for ins in fn.insns}
+            for ins in fn.insns:
+                if ins.ops and (
+                    ins.mnemonic in ("jmp", "jecxz", "jrcxz")
+                    or (ins.mnemonic.startswith("j") and ins.mnemonic[1:] in CC_EXPR)
+                ):
+                    t = parse_imm(ins.ops[0])
+                    if t is not None and t in addr_to_idx and t not in local and t not in root_set:
+                        root_set.add(t)
+                        added = True
+        if not added:
+            break
+        funcs = build_funcs(root_set)
     return funcs
 
 
@@ -308,7 +325,9 @@ def parse_mem(op: str, next_rip: int) -> Optional[Tuple[Optional[int], str]]:
             continue
         if "*" in tok:
             lhs, rhs = tok.split("*", 1)
-            if lhs in REG_INFO:
+            if lhs in ("riz", "eiz") or rhs in ("riz", "eiz"):
+                term = "0ULL"
+            elif lhs in REG_INFO:
                 r = reg_read_expr(lhs)
                 scale = int(rhs, 0)
                 term = f"((uint64_t)({r}) * {scale}ULL)"
@@ -316,6 +335,8 @@ def parse_mem(op: str, next_rip: int) -> Optional[Tuple[Optional[int], str]]:
                 r = reg_read_expr(rhs)
                 scale = int(lhs, 0)
                 term = f"((uint64_t)({r}) * {scale}ULL)"
+        elif tok in ("riz", "eiz"):
+            term = "0ULL"
         elif tok == "rip":
             term = f"0x{next_rip:x}ULL"
         elif tok == "eip":
@@ -382,9 +403,14 @@ def infer_width(ops: List[str], next_rip: int, default: int = 64) -> int:
     return default
 
 
+SEG_REGS = {"cs": "0x33ULL", "ds": "0x2bULL", "es": "0x2bULL", "ss": "0x2bULL", "fs": "0x53ULL", "gs": "0x2bULL"}
+
+
 def read_op(op: str, width: int, next_rip: int) -> str:
     if op in REG_INFO:
         return reg_read_expr(op)
+    if op in SEG_REGS:
+        return SEG_REGS[op]
     m = parse_mem(op, next_rip)
     if m is not None:
         w = m[0] or width
@@ -402,6 +428,8 @@ def read_op(op: str, width: int, next_rip: int) -> str:
 def write_op(op: str, width: int, val_expr: str, next_rip: int) -> str:
     if op in REG_INFO:
         return reg_write_stmt(op, val_expr)
+    if op in SEG_REGS:
+        return f"(void)({val_expr})"
     m = parse_mem(op, next_rip)
     if m is not None:
         w = m[0] or width
@@ -624,9 +652,16 @@ def lift_sse(insn: Insn) -> Optional[str]:
     if m == "cvtps2pd":
         d = f"c->{REG_INFO[ops[0]][0]}"
         return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; {d}.df[0] = (double)_s.f[0]; {d}.df[1] = (double)_s.f[1]; }}"
+    if m == "cvtdq2pd":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; {d}.df[0] = (double)_s.sd[0]; {d}.df[1] = (double)_s.sd[1]; }}"
     if m == "cvtpd2ps":
         d = f"c->{REG_INFO[ops[0]][0]}"
         return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; {d}.f[0] = (float)_s.df[0]; {d}.f[1] = (float)_s.df[1]; {d}.q[1] = 0; }}"
+    if m in ("cvttpd2dq", "cvtpd2dq"):
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        fn = "(int32_t)" if m == "cvttpd2dq" else "(int32_t)lrint"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; {d}.sd[0] = {fn}(_s.df[0]); {d}.sd[1] = {fn}(_s.df[1]); {d}.q[1] = 0; }}"
 
     # Packed integer ALU + shuffles + masks
     padd_map = {"paddb": ("b", 16, "+"), "paddw": ("w", 8, "+"), "paddd": ("d", 4, "+"), "paddq": ("q", 2, "+"),
@@ -680,6 +715,22 @@ def lift_sse(insn: Insn) -> Optional[str]:
             f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; Xmm128 _r; "
             f"_r.d[0]=_s.d[{(imm>>0)&3}]; _r.d[1]=_s.d[{(imm>>2)&3}]; "
             f"_r.d[2]=_s.d[{(imm>>4)&3}]; _r.d[3]=_s.d[{(imm>>6)&3}]; {d}=_r; }}"
+        )
+    if m == "pshuflw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        imm = parse_imm(ops[2])
+        return (
+            f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; Xmm128 _r = _s; "
+            f"_r.w[0]=_s.w[{(imm>>0)&3}]; _r.w[1]=_s.w[{(imm>>2)&3}]; "
+            f"_r.w[2]=_s.w[{(imm>>4)&3}]; _r.w[3]=_s.w[{(imm>>6)&3}]; {d}=_r; }}"
+        )
+    if m == "pshufhw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        imm = parse_imm(ops[2])
+        return (
+            f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; Xmm128 _r = _s; "
+            f"_r.w[4]=_s.w[{4+((imm>>0)&3)}]; _r.w[5]=_s.w[{4+((imm>>2)&3)}]; "
+            f"_r.w[6]=_s.w[{4+((imm>>4)&3)}]; _r.w[7]=_s.w[{4+((imm>>6)&3)}]; {d}=_r; }}"
         )
     if m == "shufps":
         d = f"c->{REG_INFO[ops[0]][0]}"
@@ -744,6 +795,9 @@ def lift_sse(insn: Insn) -> Optional[str]:
         d = f"c->{REG_INFO[ops[0]][0]}"
         sh = f"{parse_imm(ops[1])}U" if parse_imm(ops[1]) is not None else f"(unsigned)({read_xmm128(ops[1], nr)}.q[0])"
         return f"{{ unsigned _sh = {sh}; if (_sh >= {bits}) _sh = {bits - 1}; for (int _i=0; _i<{lanes}; _i++) {d}.{sf}[_i] >>= _sh; }}"
+    if m == "pcmpistri":
+        imm = parse_imm(ops[2])
+        return f"f_pcmpistri(c, c->{REG_INFO[ops[0]][0]}, {read_xmm128(ops[1], nr)}, 0x{imm & 0xFF:x}U);"
     if m == "stmxcsr":
         mm = parse_mem(ops[0], nr)
         return f"W32({mm[1]}, c->mxcsr);"
@@ -756,8 +810,13 @@ def lift_sse(insn: Insn) -> Optional[str]:
 def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List[str]) -> str:
     m, ops, pfx, nr = insn.mnemonic, insn.ops, insn.prefix, insn.next_addr
 
-    if m in ("nop", "endbr64", "endbr32", "pause", "mfence", "lfence", "sfence", "prefetcht0", "prefetcht1", "prefetcht2", "prefetchnta"):
+    if m in ("nop", "endbr64", "endbr32", "pause", "mfence", "lfence", "sfence",
+             "prefetcht0", "prefetcht1", "prefetcht2", "prefetchnta", "prefetchw", "vzeroupper"):
         return "/* nop */"
+    if m == "xgetbv":
+        return "SET32(c->rax, 0x3U); SET32(c->rdx, 0U);"
+    if m == "int":
+        return f'fprintf(stderr, "elf64-recomp: guest int {ops[0] if ops else 0} (__fastfail rcx=%llu) at 0x{insn.addr:x}\\n", (unsigned long long)c->rcx); abort();'
     if m == "cld":
         return "c->df = 0;"
     if m == "std":
@@ -1051,9 +1110,9 @@ def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List
     if m in ("bsf", "tzcnt"):
         w = op_width(ops[0], nr) or 64
         s = read_op(ops[1], w, nr)
+        zero_stmt = f"{write_op(ops[0], w, str(w) + 'ULL', nr)};" if m == "tzcnt" else ""
         return (
-            f"{{ uint64_t _s = {s}; if (_s == 0) {{ c->zf = 1; c->cf = 1; "
-            f"{write_op(ops[0], w, str(w) + 'ULL', nr) if m == 'tzcnt' else ''} }} "
+            f"{{ uint64_t _s = {s}; if (_s == 0) {{ c->zf = 1; c->cf = 1; {zero_stmt} }} "
             f"else {{ c->zf = 0; c->cf = 0; {write_op(ops[0], w, '__builtin_ctzll(_s)', nr)}; }} }}"
         )
     if m in ("bsr", "lzcnt"):

@@ -277,4 +277,77 @@ static inline void f_ucomi_d(CPU64 *c, double a, double b) {
     else                      { c->zf = 1; c->pf = 0; c->cf = 0; }
 }
 
+/* SSE4.2 PCMPISTRI (implicit-length string compare -> index in ECX + CF/ZF/SF/OF). */
+static inline void f_pcmpistri(CPU64 *c, Xmm128 a, Xmm128 b, uint8_t imm) {
+    int is_word = (imm & 1) != 0;
+    int is_signed = (imm & 2) != 0;
+    int agg = (imm >> 2) & 3;
+    int pol = (imm >> 4) & 3;
+    int msb = (imm >> 6) & 1;
+    int nlanes = is_word ? 8 : 16;
+
+    int alen = 0, blen = 0;
+    while (alen < nlanes && (is_word ? a.w[alen] : a.b[alen]) != 0) alen++;
+    while (blen < nlanes && (is_word ? b.w[blen] : b.b[blen]) != 0) blen++;
+
+    int32_t av[16], bv[16];
+    for (int i = 0; i < nlanes; i++) {
+        av[i] = is_word ? (is_signed ? (int32_t)a.sw[i] : (int32_t)a.w[i])
+                        : (is_signed ? (int32_t)a.sb[i] : (int32_t)a.b[i]);
+        bv[i] = is_word ? (is_signed ? (int32_t)b.sw[i] : (int32_t)b.w[i])
+                        : (is_signed ? (int32_t)b.sb[i] : (int32_t)b.b[i]);
+    }
+
+    uint32_t res = 0;
+    if (agg == 0) { /* Equal any */
+        for (int j = 0; j < blen; j++) {
+            for (int i = 0; i < alen; i++) {
+                if (av[i] == bv[j]) { res |= (1U << j); break; }
+            }
+        }
+    } else if (agg == 1) { /* Ranges */
+        for (int j = 0; j < blen; j++) {
+            for (int i = 0; i + 1 < alen; i += 2) {
+                if (bv[j] >= av[i] && bv[j] <= av[i + 1]) { res |= (1U << j); break; }
+            }
+        }
+    } else if (agg == 2) { /* Equal each */
+        for (int j = 0; j < nlanes; j++) {
+            int in_a = j < alen, in_b = j < blen;
+            if ((!in_a && !in_b) || (in_a && in_b && av[j] == bv[j])) res |= (1U << j);
+        }
+    } else { /* Equal ordered (substring match, imm=0x0c) */
+        for (int j = 0; j < nlanes; j++) {
+            int ok = 1;
+            for (int i = 0; i < alen; i++) {
+                int k = i + j;
+                if (k >= nlanes) break;
+                if (k >= blen || av[i] != bv[k]) { ok = 0; break; }
+            }
+            if (ok && (alen == 0 || j < blen)) res |= (1U << j);
+        }
+    }
+
+    uint32_t full_mask = (1U << nlanes) - 1U;
+    if (pol == 1) res = (~res) & full_mask;
+    else if (pol == 3) {
+        uint32_t valid_b = blen ? ((1U << blen) - 1U) : 0U;
+        res = ((~res) & valid_b) | (res & ~valid_b);
+    }
+
+    c->cf = (res != 0);
+    c->zf = (blen < nlanes);
+    c->sf = (alen < nlanes);
+    c->of = (uint8_t)(res & 1U);
+    c->af = 0; c->pf = 0;
+
+    if (res == 0) {
+        SET32(c->rcx, (uint32_t)nlanes);
+    } else if (msb) {
+        SET32(c->rcx, (uint32_t)(31 - __builtin_clz(res)));
+    } else {
+        SET32(c->rcx, (uint32_t)__builtin_ctz(res));
+    }
+}
+
 #endif /* ELF64_RECOMP_CPU64_H */

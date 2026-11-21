@@ -98,6 +98,11 @@ uint64_t rt_invoke_win64(CPU64 *c, uint64_t target,
                          uint64_t a0, uint64_t a1, uint64_t a2,
                          uint64_t a3, uint64_t a4, uint64_t a5);
 
+/* Process startup arguments (saved by rt_init). */
+extern int    g_rt_argc;
+extern char **g_rt_argv;
+extern char **g_rt_envp;
+
 /* Current thread CPU64 (for callbacks such as qsort comparators). */
 extern _Thread_local CPU64 *g_tls_cpu;
 
@@ -106,6 +111,7 @@ void rt_register_libc64(void);
 void rt_register_sdl2_64(void);
 void rt_register_vulkan64(void);
 void rt_register_win32_64(void);
+void rt_register_win32_extra(void);
 void rt_register_d3d11_64(void);
 
 #endif /* ELF64_RECOMP_RUNTIME64_H */

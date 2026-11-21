@@ -111,7 +111,7 @@ def build_elf64(
         os.path.join(RUNTIME_DIR, name)
         for name in (
             "runtime64.c", "libc64.c", "sdl2_64.c", "vulkan64.c",
-            "win32_64.c", "dxbc_msl.c", "d3d11_metal.m", "main64.c",
+            "win32_64.c", "win32_crt_extra.c", "dxbc_msl.c", "d3d11_metal.m", "main64.c",
         )
     ]
     all_sources = rt_sources + [lifted["manifest"]] + lifted["shards"]
