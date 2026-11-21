@@ -1,0 +1,5 @@
+build/
+__pycache__/
+*.pyc
+runtime/vulkan64_gen.inc
+.DS_Store
