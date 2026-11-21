@@ -185,6 +185,13 @@ static void fmt_src(const DxbcOp *op, uint32_t dst_mask, char *out, size_t cap) 
                      op->imm_u[0], op->imm_u[1], op->imm_u[2], op->imm_u[3]);
         }
     } else {
+        if (getenv("ELF64_D3D11_TRACE")) {
+            static uint64_t seen_rt = 0;
+            if (op->reg_type < 64 && !(seen_rt & (1ULL << op->reg_type))) {
+                seen_rt |= (1ULL << op->reg_type);
+                fprintf(stderr, "[dxbc] unhandled src reg_type=%u idx0=%u idx1=%u\n", op->reg_type, op->idx[0], op->idx[1]);
+            }
+        }
         snprintf(base, sizeof(base), "float4(0.0)");
     }
 
@@ -252,13 +259,15 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
     uint32_t stype = (toks[0] >> 16) & 0xFFFFU;
     out->is_pixel = (stype == 0) ? 1 : 0;
 
-    /* Pre-scan for DCL_TEMPS, constant buffers, textures, and samplers */
+    /* Pre-scan for DCL_TEMPS, constant buffers, textures (with dim), and samplers */
     uint32_t num_temps = 4;
     uint32_t cb_mask = 0, tex_mask = 0, samp_mask = 0;
+    uint8_t  tex_dim[16] = {0}; /* 2=2D, 3=3D, 4=Cube */
     for (size_t p = 2; p < ntoks; ) {
-        uint32_t tok = toks[p];
-        uint32_t op = tok & 0x7FFU;
-        uint32_t len = (tok >> 24) & 0x7FU;
+        uint32_t tok0 = toks[p];
+        uint32_t tok = tok0;
+        uint32_t op = tok0 & 0x7FFU;
+        uint32_t len = (tok0 >> 24) & 0x7FU;
         if (len == 0 || p + len > ntoks) break;
         size_t end = p + len, cur = p + 1;
         while ((tok & 0x80000000U) && cur < end) tok = toks[cur++];
@@ -271,7 +280,12 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
         } else if (op == 88 && cur < end) {
             DxbcOp tx;
             decode_operand(toks, cur, end, &tx);
-            if (tx.idx[0] < 16) tex_mask |= (1U << tx.idx[0]);
+            if (tx.idx[0] < 16) {
+                tex_mask |= (1U << tx.idx[0]);
+                /* D3D10_SB_RESOURCE_DIMENSION: 3=TEX2D, 5=TEX3D, 6=TEXCUBE */
+                uint32_t dim = (tok0 >> 11) & 0x1FU;
+                tex_dim[tx.idx[0]] = (dim == 6) ? 4 : ((dim == 5) ? 3 : 2);
+            }
         } else if (op == 90 && cur < end) {
             DxbcOp sm;
             decode_operand(toks, cur, end, &sm);
@@ -332,7 +346,11 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             if (cb_mask & (1U << k)) { sb_appendf(&sb, "%sconstant float4 *cb%u [[buffer(%u)]]", first_arg ? "" : ", ", k, 16 + k); first_arg = 0; }
         }
         for (uint32_t k = 0; k < 16; k++) {
-            if (tex_mask & (1U << k)) { sb_appendf(&sb, "%stexture2d<float> t%u [[texture(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
+            if (tex_mask & (1U << k)) {
+                const char *tt = (tex_dim[k] == 4) ? "texturecube<float>" : (tex_dim[k] == 3 ? "texture3d<float>" : "texture2d<float>");
+                sb_appendf(&sb, "%s%s t%u [[texture(%u)]]", first_arg ? "" : ", ", tt, k, k);
+                first_arg = 0;
+            }
         }
         for (uint32_t k = 0; k < 16; k++) {
             if (samp_mask & (1U << k)) { sb_appendf(&sb, "%ssampler s%u [[sampler(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
@@ -387,7 +405,11 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             if (cb_mask & (1U << k)) { sb_appendf(&sb, "%sconstant float4 *cb%u [[buffer(%u)]]", first_arg ? "" : ", ", k, 16 + k); first_arg = 0; }
         }
         for (uint32_t k = 0; k < 16; k++) {
-            if (tex_mask & (1U << k)) { sb_appendf(&sb, "%stexture2d<float> t%u [[texture(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
+            if (tex_mask & (1U << k)) {
+                const char *tt = (tex_dim[k] == 4) ? "texturecube<float>" : (tex_dim[k] == 3 ? "texture3d<float>" : "texture2d<float>");
+                sb_appendf(&sb, "%s%s t%u [[texture(%u)]]", first_arg ? "" : ", ", tt, k, k);
+                first_arg = 0;
+            }
         }
         for (uint32_t k = 0; k < 16; k++) {
             if (samp_mask & (1U << k)) { sb_appendf(&sb, "%ssampler s%u [[sampler(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
@@ -505,11 +527,11 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             fmt_src(&s1, m, a1, sizeof(a1));
             sb_appendf(&sb, "    %s = %s(%s, %s);\n", ds, fn, a0, a1);
             wrote_dst = 1;
-        } else if (opc == 68 || opc == 76 || opc == 26 || opc == 25 || opc == 47 ||
+        } else if (opc == 68 || opc == 75 || opc == 26 || opc == 25 || opc == 47 ||
                    opc == 64 || opc == 65 || opc == 66 || opc == 67 ||
                    opc == 11 || opc == 12 || opc == 168 || opc == 169) { /* RSQ/SQRT/FRC/EXP/LOG/ROUND/DERIV */
             const char *fn =
-                (opc == 68) ? "rsqrt" : (opc == 76 ? "sqrt" : (opc == 26 ? "fract" :
+                (opc == 68) ? "rsqrt" : (opc == 75 ? "sqrt" : (opc == 26 ? "fract" :
                 (opc == 25 ? "exp2" : (opc == 47 ? "log2" :
                 (opc == 64 ? "rint" : (opc == 65 ? "floor" : (opc == 66 ? "ceil" :
                 (opc == 67 ? "trunc" : ((opc == 11 || opc == 168) ? "dfdx" : "dfdy")))))))));
@@ -571,9 +593,9 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             fmt_src(&s1, m, a1, sizeof(a1));
             if (nc == 1) sb_appendf(&sb, "    %s = as_type<float>(((%s) %s (%s)) ? 0xFFFFFFFFu : 0u);\n", ds, a0, cmp, a1);
             else         sb_appendf(&sb, "    %s = as_type<float%d>(select(uint%d(0u), uint%d(0xFFFFFFFFu), (%s) %s (%s)));\n", ds, nc, nc, nc, a0, cmp, a1);
-        } else if (opc == 32 || opc == 33 || opc == 34 || opc == 39 || opc == 80 || opc == 82) { /* IEQ/IGE/ILT/INE/UGE/ULT */
-            const char *cmp = (opc == 32) ? "==" : (opc == 39 ? "!=" : ((opc == 34 || opc == 82) ? "<" : ">="));
-            const char *it  = (opc == 80 || opc == 82) ? "uint" : "int";
+        } else if (opc == 32 || opc == 33 || opc == 34 || opc == 39 || opc == 79 || opc == 80) { /* IEQ/IGE/ILT/INE/ULT/UGE */
+            const char *cmp = (opc == 32) ? "==" : (opc == 39 ? "!=" : ((opc == 34 || opc == 79) ? "<" : ">="));
+            const char *it  = (opc == 79 || opc == 80) ? "uint" : "int";
             cur = decode_operand(toks, cur, end, &d);
             cur = decode_operand(toks, cur, end, &s0);
             cur = decode_operand(toks, cur, end, &s1);
@@ -613,7 +635,7 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
                 if (nc == 1) sb_appendf(&sb, "    %s = as_type<float>(as_type<%s>(%s) * as_type<%s>(%s));\n", ds, it, a0, it, a1);
                 else         sb_appendf(&sb, "    %s = as_type<float%d>(as_type<%s%d>(%s) * as_type<%s%d>(%s));\n", ds, nc, it, nc, a0, it, nc, a1);
             }
-        } else if (opc == 35 || opc == 79) { /* IMAD / UMAD */
+        } else if (opc == 35 || opc == 82) { /* IMAD / UMAD */
             const char *it = (opc == 35) ? "int" : "uint";
             cur = decode_operand(toks, cur, end, &d);
             cur = decode_operand(toks, cur, end, &s0);
@@ -627,8 +649,8 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             fmt_src(&s2, m, a2, sizeof(a2));
             if (nc == 1) sb_appendf(&sb, "    %s = as_type<float>(as_type<%s>(%s) * as_type<%s>(%s) + as_type<%s>(%s));\n", ds, it, a0, it, a1, it, a2);
             else         sb_appendf(&sb, "    %s = as_type<float%d>(as_type<%s%d>(%s) * as_type<%s%d>(%s) + as_type<%s%d>(%s));\n", ds, nc, it, nc, a0, it, nc, a1, it, nc, a2);
-        } else if (opc == 36 || opc == 37 || opc == 83 || opc == 84) { /* IMIN/IMAX/UMIN/UMAX */
-            const char *fn = (opc == 36 || opc == 83) ? "min" : "max";
+        } else if (opc == 36 || opc == 37 || opc == 83 || opc == 84) { /* IMIN/IMAX/UMAX/UMIN */
+            const char *fn = (opc == 37 || opc == 84) ? "min" : "max";
             const char *it = (opc == 83 || opc == 84) ? "uint" : "int";
             cur = decode_operand(toks, cur, end, &d);
             cur = decode_operand(toks, cur, end, &s0);
@@ -675,7 +697,8 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             else if (opc == 73) { cur = decode_operand(toks, cur, end, &s1); cur = decode_operand(toks, cur, end, &s2); }
             uint32_t m = d.mask ? d.mask : 0xF;
             fmt_dst(&d, ds, sizeof(ds), dm);
-            fmt_src(&s0, 0x3, a0, sizeof(a0));
+            uint32_t coord_mask = (stex.idx[0] < 16 && (tex_dim[stex.idx[0]] == 3 || tex_dim[stex.idx[0]] == 4)) ? 0x7 : 0x3;
+            fmt_src(&s0, coord_mask, a0, sizeof(a0));
             /* Project stex swizzle onto destination write mask */
             char tsw[8], proj[8];
             fmt_swizzle(&stex, tsw);
@@ -732,6 +755,12 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             fmt_src(&s0, 0x1, a0, sizeof(a0));
             int nz = (tok0 >> 18) & 1;
             sb_appendf(&sb, "    if (as_type<uint>(%s) %s 0u) break;\n", a0, nz ? "!=" : "==");
+        } else if (getenv("ELF64_D3D11_TRACE")) {
+            static uint8_t seen_op[256];
+            if (opc < 256 && !seen_op[opc]) {
+                seen_op[opc] = 1;
+                fprintf(stderr, "[dxbc] skipped opcode %u (pixel=%d)\n", opc, out->is_pixel);
+            }
         }
         if (sat && wrote_dst) {
             sb_appendf(&sb, "    %s = saturate(%s);\n", ds, ds);

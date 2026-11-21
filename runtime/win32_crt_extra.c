@@ -1,5 +1,6 @@
 #include "runtime64.h"
 #include "win64_abi.h"
+#include <SDL.h>
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -1410,10 +1411,12 @@ static int wnd_idx(int n) {
 }
 static void w_GetWindowLongPtr(CPU64 *c, void *ud) {
     (void)ud;
+    if ((int)c->rdx == -4) { c->rax = win32_get_wndproc(c->rcx); return; }
     c->rax = g_wnd_long[wnd_slot(c->rcx)][wnd_idx((int)c->rdx)];
 }
 static void w_SetWindowLongPtr(CPU64 *c, void *ud) {
     (void)ud;
+    if ((int)c->rdx == -4) { c->rax = win32_set_wndproc(c->rcx, c->r8); return; }
     int s = wnd_slot(c->rcx), idx = wnd_idx((int)c->rdx);
     uint64_t prev = g_wnd_long[s][idx];
     g_wnd_long[s][idx] = c->r8;
@@ -1753,13 +1756,41 @@ static void w_RegisterWindowMessageA(CPU64 *c, void *ud) {
 }
 static void w_GetCursorPos(CPU64 *c, void *ud) {
     (void)ud;
-    if (c->rcx) { W32(c->rcx, 640); W32(c->rcx + 4, 360); }
+    int x = 640, y = 360;
+    win32_get_mouse_xy(&x, &y);
+    if (c->rcx) { W32(c->rcx, (uint32_t)x); W32(c->rcx + 4, (uint32_t)y); }
     c->rax = 1;
 }
+static void w_SetCursorPos(CPU64 *c, void *ud) {
+    (void)ud;
+    SDL_Window *w = win32_hwnd_to_sdl(0x1000ULL);
+    if (w && !getenv("ELF64_HEADLESS")) SDL_WarpMouseInWindow(w, (int)c->rcx, (int)c->rdx);
+    c->rax = 1;
+}
+static void w_GetKeyState(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = win32_vk_is_down((int)c->rcx) ? 0x8000ULL : 0ULL;
+}
 static void w_GetForegroundWindow(CPU64 *c, void *ud) { (void)ud; c->rax = 0x1000ULL; }
+
+static SDL_AudioDeviceID g_sdl_audio_dev = 0;
 static void w_waveOutOpen(CPU64 *c, void *ud) {
     (void)ud;
     if (c->rcx) W64(c->rcx, 0x60001ULL);
+    if (!g_sdl_audio_dev && !getenv("ELF64_HEADLESS") && c->r8) {
+        if (!SDL_WasInit(SDL_INIT_AUDIO)) SDL_InitSubSystem(SDL_INIT_AUDIO);
+        SDL_AudioSpec want;
+        SDL_zero(want);
+        uint16_t ch = R16(c->r8 + 2);
+        uint32_t hz = R32(c->r8 + 4);
+        uint16_t bits = R16(c->r8 + 14);
+        want.freq = (hz >= 8000 && hz <= 96000) ? (int)hz : 44100;
+        want.channels = (ch >= 1 && ch <= 2) ? (Uint8)ch : 2;
+        want.format = (bits == 8) ? AUDIO_U8 : AUDIO_S16LSB;
+        want.samples = 1024;
+        g_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+        if (g_sdl_audio_dev) SDL_PauseAudioDevice(g_sdl_audio_dev, 0);
+    }
     c->rax = 0; /* MMSYSERR_NOERROR */
 }
 static void w_waveOutPrepareHeader(CPU64 *c, void *ud) {
@@ -1769,8 +1800,16 @@ static void w_waveOutPrepareHeader(CPU64 *c, void *ud) {
 }
 static void w_waveOutWrite(CPU64 *c, void *ud) {
     (void)ud;
-    /* Mark buffer immediately done so sound mixer never stalls waiting for playback */
-    if (c->rdx) W32(c->rdx + 24, R32(c->rdx + 24) | 0x00000001U /* WHDR_DONE */);
+    if (c->rdx) {
+        if (g_sdl_audio_dev) {
+            uint64_t data_va = R64(c->rdx + 0);
+            uint32_t len     = R32(c->rdx + 8);
+            if (data_va && len > 0 && SDL_GetQueuedAudioSize(g_sdl_audio_dev) < 65536U) {
+                SDL_QueueAudio(g_sdl_audio_dev, (const void *)(uintptr_t)data_va, len);
+            }
+        }
+        W32(c->rdx + 24, R32(c->rdx + 24) | 0x00000001U /* WHDR_DONE */);
+    }
     c->rax = 0;
 }
 static void w_waveOutGetPosition(CPU64 *c, void *ud) {
@@ -2120,7 +2159,7 @@ void rt_register_win32_extra(void) {
     REG("SetForegroundWindow", w_ret_1); REG("ShowCursor", w_ret_1); REG("ReleaseCapture", w_ret_1);
     REG("LoadCursorA", w_ret_1); REG("LoadIconA", w_ret_1); REG("LoadImageA", w_ret_1);
     REG("RegisterClassW", w_ret_1); REG("UnregisterClassW", w_ret_1);
-    REG("CallWindowProcA", w_ret_0); REG("SendMessageA", w_ret_0); REG("GetKeyState", w_ret_0);
+    REG("CallWindowProcA", w_ret_0); REG("SendMessageA", w_ret_0); REG("GetKeyState", w_GetKeyState);
     REG("EnumWindows", w_ret_1); REG("DialogBoxParamA", w_ret_0); REG("EndDialog", w_ret_1);
     REG("GetDlgItemInt", w_ret_0); REG("SetDlgItemInt", w_ret_1); REG("SetDlgItemTextA", w_ret_1);
     REG("ImmIsUIMessageA", w_ret_0);
@@ -2194,7 +2233,7 @@ void rt_register_win32_extra(void) {
     REG("UnloadKeyboardLayout", w_ret_1); REG("MapVirtualKeyExA", w_ret_0);
     REG("RegisterClassA", w_ret_1); REG("UnregisterClassA", w_ret_1);
     REG("RegisterWindowMessageA", w_RegisterWindowMessageA);
-    REG("GetCursorPos", w_GetCursorPos); REG("SetCursorPos", w_ret_1);
+    REG("GetCursorPos", w_GetCursorPos); REG("SetCursorPos", w_SetCursorPos);
     REG("GetFocus", w_GetForegroundWindow); REG("SetFocus", w_GetForegroundWindow);
     REG("GetForegroundWindow", w_GetForegroundWindow); REG("SetActiveWindow", w_GetForegroundWindow);
     REG("GetParent", w_ret_0); REG("WindowFromPoint", w_GetForegroundWindow);
@@ -2235,7 +2274,7 @@ void rt_register_win32_extra(void) {
     /* Remaining 24-module game shims: wsock32 ordinals, IMM32, User32, Advapi32 W, Video64, SteamPipe, CompareStringEx */
     REG("CompareStringEx", w_CompareStringEx);
     REG("RegOpenKeyExW", w_ret_err2); REG("RegQueryInfoKeyW", w_ret_err2); REG("RegQueryValueExW", w_ret_err2);
-    REG("GetAsyncKeyState", w_ret_0); REG("GetKeyboardState", w_GetKeyboardState);
+    REG("GetAsyncKeyState", w_GetKeyState); REG("GetKeyboardState", w_GetKeyboardState);
     REG("GetWindowInfo", w_GetWindowInfo); REG("MapVirtualKeyW", w_ret_0);
     REG("PostQuitMessage", w_ret_0); REG("SendInput", w_ret_0); REG("ToUnicodeEx", w_ret_0);
     REG("ImmAssociateContextEx", w_ret_1); REG("ImmGetIMEFileNameA", w_ret_0);

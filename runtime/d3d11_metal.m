@@ -59,6 +59,8 @@ typedef struct {
     uint32_t         width;
     uint32_t         height;
     uint32_t         mip_levels;
+    uint32_t         array_size;
+    int              is_cube;
     uint32_t         dxgi_fmt;
     MTLPixelFormat   mtl_fmt;
     uint32_t         usage;
@@ -268,10 +270,11 @@ static uint32_t dxgi_num_rows(uint32_t fmt, uint32_t h) {
 
 static MTLPixelFormat dxgi_to_mtl_pixel(uint32_t fmt) {
     switch (fmt) {
-        case 87: case 88: case 90: return MTLPixelFormatBGRA8Unorm;
+        case 87: case 88: case 90: case 92: return MTLPixelFormatBGRA8Unorm;
         case 91: case 93:          return MTLPixelFormatBGRA8Unorm_sRGB;
         case 27: case 28:          return MTLPixelFormatRGBA8Unorm;
         case 29:                   return MTLPixelFormatRGBA8Unorm_sRGB;
+        case 31:                   return MTLPixelFormatRGBA8Snorm;
         case 60: case 61:          return MTLPixelFormatR8Unorm;
         case 65:                   return MTLPixelFormatA8Unorm;
         case 48: case 49:          return MTLPixelFormatRG8Unorm;
@@ -290,6 +293,8 @@ static MTLPixelFormat dxgi_to_mtl_pixel(uint32_t fmt) {
         case 81:                   return MTLPixelFormatBC4_RSnorm;
         case 82: case 83:          return MTLPixelFormatBC5_RGUnorm;
         case 84:                   return MTLPixelFormatBC5_RGSnorm;
+        case 94: case 95:          return MTLPixelFormatBC6H_RGBUfloat;
+        case 96:                   return MTLPixelFormatBC6H_RGBFloat;
         case 97: case 98:          return MTLPixelFormatBC7_RGBAUnorm;
         case 99:                   return MTLPixelFormatBC7_RGBAUnorm_sRGB;
         case 20: case 44: case 45: return MTLPixelFormatDepth32Float_Stencil8;
@@ -398,27 +403,35 @@ static void com_Release(CPU64 *c, void *ud) {
 static void com_stub_ok(CPU64 *c, void *ud) { (void)ud; c->rax = S_OK_HR; }
 static void com_stub_void(CPU64 *c, void *ud) { (void)c; (void)ud; }
 
-static D3D11Texture2DObj *create_tex2d_internal(D3D11DeviceObj *dev, uint32_t w, uint32_t h,
-                                                uint32_t dxgi_fmt, uint32_t usage,
-                                                uint32_t mip_levels, uint64_t init_arr_va) {
+static D3D11Texture2DObj *create_tex2d_ex(D3D11DeviceObj *dev, uint32_t w, uint32_t h,
+                                          uint32_t dxgi_fmt, uint32_t usage,
+                                          uint32_t mip_levels, uint32_t array_size, int is_cube,
+                                          uint64_t init_arr_va) {
     if (w == 0) w = 1;
     if (h == 0) h = 1;
     if (w > 16384) w = 16384;
     if (h > 16384) h = 16384;
+    if (array_size == 0) array_size = 1;
+    if (is_cube && (array_size != 6 || w != h)) is_cube = 0;
     int is_depth = dxgi_is_depth(dxgi_fmt);
     int is_bc = dxgi_is_bc(dxgi_fmt);
-    /* Compute valid mip count (0 means full chain in D3D11) */
     uint32_t max_dim = w > h ? w : h;
     uint32_t max_mips = 1;
     while ((1U << max_mips) <= max_dim) max_mips++;
-    if (mip_levels == 0 || mip_levels > max_mips) mip_levels = (mip_levels == 0) ? max_mips : max_mips;
+    if (mip_levels == 0 || mip_levels > max_mips) mip_levels = max_mips;
     if (is_depth) mip_levels = 1;
 
     MTLPixelFormat mfmt = dxgi_to_mtl_pixel(dxgi_fmt);
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mfmt
-                                                                                  width:w
-                                                                                 height:h
-                                                                              mipmapped:(mip_levels > 1)];
+    MTLTextureDescriptor *td;
+    if (is_cube) {
+        td = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:mfmt size:w mipmapped:(mip_levels > 1)];
+    } else {
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mfmt width:w height:h mipmapped:(mip_levels > 1)];
+        if (array_size > 1) {
+            td.textureType = MTLTextureType2DArray;
+            td.arrayLength = array_size;
+        }
+    }
     td.mipmapLevelCount = mip_levels;
     td.storageMode = is_depth ? MTLStorageModePrivate : MTLStorageModeShared;
     td.usage = is_depth
@@ -429,16 +442,20 @@ static D3D11Texture2DObj *create_tex2d_internal(D3D11DeviceObj *dev, uint32_t w,
     id<MTLTexture> tex = [dev->mtl_dev newTextureWithDescriptor:td];
     if (!tex) return NULL;
     if (init_arr_va && !is_depth) {
-        for (uint32_t m = 0; m < mip_levels; m++) {
-            uint64_t src_va = R64(init_arr_va + (uint64_t)m * 16ULL);
-            uint32_t pitch  = R32(init_arr_va + (uint64_t)m * 16ULL + 8ULL);
-            if (!src_va) continue;
-            uint32_t mw = w >> m; if (mw == 0) mw = 1;
-            uint32_t mh = h >> m; if (mh == 0) mh = 1;
-            uint32_t min_pitch = dxgi_row_pitch(dxgi_fmt, mw);
-            if (pitch < min_pitch) pitch = min_pitch;
-            [tex replaceRegion:MTLRegionMake2D(0, 0, mw, mh) mipmapLevel:m
-                     withBytes:(const void *)(uintptr_t)src_va bytesPerRow:pitch];
+        uint32_t nslices = is_cube ? 6 : array_size;
+        for (uint32_t sl = 0; sl < nslices; sl++) {
+            for (uint32_t m = 0; m < mip_levels; m++) {
+                uint32_t sub = sl * mip_levels + m;
+                uint64_t src_va = R64(init_arr_va + (uint64_t)sub * 16ULL);
+                uint32_t pitch  = R32(init_arr_va + (uint64_t)sub * 16ULL + 8ULL);
+                if (!src_va) continue;
+                uint32_t mw = w >> m; if (mw == 0) mw = 1;
+                uint32_t mh = h >> m; if (mh == 0) mh = 1;
+                uint32_t min_pitch = dxgi_row_pitch(dxgi_fmt, mw);
+                if (pitch < min_pitch) pitch = min_pitch;
+                [tex replaceRegion:MTLRegionMake2D(0, 0, mw, mh) mipmapLevel:m slice:sl
+                         withBytes:(const void *)(uintptr_t)src_va bytesPerRow:pitch bytesPerImage:0];
+            }
         }
     }
     D3D11Texture2DObj *obj = (D3D11Texture2DObj *)calloc(1, sizeof(D3D11Texture2DObj));
@@ -449,10 +466,18 @@ static D3D11Texture2DObj *create_tex2d_internal(D3D11DeviceObj *dev, uint32_t w,
     obj->width = w;
     obj->height = h;
     obj->mip_levels = mip_levels;
+    obj->array_size = is_cube ? 6 : array_size;
+    obj->is_cube = is_cube;
     obj->dxgi_fmt = dxgi_fmt;
     obj->mtl_fmt = mfmt;
     obj->usage = usage;
     return obj;
+}
+
+static D3D11Texture2DObj *create_tex2d_internal(D3D11DeviceObj *dev, uint32_t w, uint32_t h,
+                                                uint32_t dxgi_fmt, uint32_t usage,
+                                                uint32_t mip_levels, uint64_t init_arr_va) {
+    return create_tex2d_ex(dev, w, h, dxgi_fmt, usage, mip_levels, 1, 0, init_arr_va);
 }
 
 static void tex2d_GetType(CPU64 *c, void *ud) {
@@ -533,10 +558,17 @@ static void dev_CreateTexture2D(CPU64 *c, void *ud) {
     uint32_t w = R32(desc_va + 0);
     uint32_t h = R32(desc_va + 4);
     uint32_t mips = R32(desc_va + 8);
+    uint32_t arr = R32(desc_va + 12);
     uint32_t fmt = R32(desc_va + 16);
+    uint32_t samples = R32(desc_va + 20);
     uint32_t usage = R32(desc_va + 28);
+    uint32_t misc = R32(desc_va + 40);
+    if (getenv("ELF64_D3D11_TRACE") && (arr > 1 || samples > 1 || (misc & 4))) {
+        static int cnt = 0;
+        if (cnt++ < 25) fprintf(stderr, "[d3d11] CreateTexture2D %ux%u fmt=%u arr=%u samples=%u misc=0x%x\n", w, h, fmt, arr, samples, misc);
+    }
 
-    D3D11Texture2DObj *obj = create_tex2d_internal(dev, w, h, fmt, usage, mips, init_va);
+    D3D11Texture2DObj *obj = create_tex2d_ex(dev, w, h, fmt, usage, mips, arr, (misc & 4) != 0, init_va);
     if (!obj) { c->rax = E_FAIL_HR; return; }
     W64(out_va, (uint64_t)(uintptr_t)obj);
     c->rax = S_OK_HR;
@@ -687,10 +719,20 @@ static void dev_CreateDepthStencilView(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
+static MTLSamplerAddressMode d3d_to_mtl_addr(uint32_t a) {
+    switch (a) {
+        case 2: return MTLSamplerAddressModeMirrorRepeat;
+        case 3: return MTLSamplerAddressModeClampToEdge;
+        case 4: return MTLSamplerAddressModeClampToBorderColor;
+        case 1: default: return MTLSamplerAddressModeRepeat;
+    }
+}
+
 static void dev_CreateSamplerState(CPU64 *c, void *ud) {
     (void)ud;
     D3D11DeviceObj *dev = (D3D11DeviceObj *)(uintptr_t)c->rcx;
-    uint64_t out_va = c->r8;
+    uint64_t desc_va = c->rdx;
+    uint64_t out_va  = c->r8;
     if (!dev || !out_va) { c->rax = E_INVALIDARG_H; return; }
     D3D11SamplerObj *smp = (D3D11SamplerObj *)calloc(1, sizeof(D3D11SamplerObj));
     smp->base.lpVtbl = g_vt_generic;
@@ -698,10 +740,23 @@ static void dev_CreateSamplerState(CPU64 *c, void *ud) {
     smp->base.refcount = 1;
     @autoreleasepool {
         MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
-        sd.minFilter = MTLSamplerMinMagFilterLinear;
-        sd.magFilter = MTLSamplerMinMagFilterLinear;
-        sd.sAddressMode = MTLSamplerAddressModeRepeat;
-        sd.tAddressMode = MTLSamplerAddressModeRepeat;
+        if (desc_va) {
+            uint32_t filt = R32(desc_va + 0);
+            uint32_t au = R32(desc_va + 4), av = R32(desc_va + 8), aw = R32(desc_va + 12);
+            int point_min = ((filt & 0x10) == 0 && filt != 0x55 && filt != 0x15);
+            int point_mag = ((filt & 0x04) == 0 && filt != 0x55 && filt != 0x15);
+            sd.minFilter = point_min ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+            sd.magFilter = point_mag ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+            sd.mipFilter = MTLSamplerMipFilterNotMipmapped; /* shortcut: avoid sampling unpopulated mip levels; switch to linear once all subresource mips are tracked */
+            sd.sAddressMode = d3d_to_mtl_addr(au);
+            sd.tAddressMode = d3d_to_mtl_addr(av);
+            sd.rAddressMode = d3d_to_mtl_addr(aw);
+        } else {
+            sd.minFilter = MTLSamplerMinMagFilterLinear;
+            sd.magFilter = MTLSamplerMinMagFilterLinear;
+            sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+            sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        }
         smp->mtl_sampler = [dev->mtl_dev newSamplerStateWithDescriptor:sd];
     }
     W64(out_va, (uint64_t)(uintptr_t)smp);
@@ -959,24 +1014,30 @@ static void ctx_ClearDepthStencilView(CPU64 *c, void *ud) {
     if (!ctx || !b || b->kind != COM_DSV) return;
     D3D11DSVObj *dsv = (D3D11DSVObj *)b;
     if (!dsv->tex || !dsv->tex->mtl_tex) return;
+    uint32_t flags = (uint32_t)c->r8;
     float depth = c->xmm[3].f[0];
+    uint8_t stencil = (uint8_t)win64_arg_i(c, 4);
     if (depth < 0.0f || depth > 1.0f) depth = 1.0f;
     @autoreleasepool {
         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.depthAttachment.texture = dsv->tex->mtl_tex;
-        rpd.depthAttachment.loadAction = MTLLoadActionClear;
-        rpd.depthAttachment.storeAction = MTLStoreActionStore;
-        rpd.depthAttachment.clearDepth = depth;
-        if (dsv->tex->mtl_fmt == MTLPixelFormatDepth32Float_Stencil8) {
+        if (flags & 1) {
+            rpd.depthAttachment.texture = dsv->tex->mtl_tex;
+            rpd.depthAttachment.loadAction = MTLLoadActionClear;
+            rpd.depthAttachment.storeAction = MTLStoreActionStore;
+            rpd.depthAttachment.clearDepth = depth;
+        }
+        if ((flags & 2) && dsv->tex->mtl_fmt == MTLPixelFormatDepth32Float_Stencil8) {
             rpd.stencilAttachment.texture = dsv->tex->mtl_tex;
             rpd.stencilAttachment.loadAction = MTLLoadActionClear;
             rpd.stencilAttachment.storeAction = MTLStoreActionStore;
-            rpd.stencilAttachment.clearStencil = 0;
+            rpd.stencilAttachment.clearStencil = stencil;
         }
-        id<MTLCommandBuffer> cb = [ctx->dev->mtl_queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-        [enc endEncoding];
-        [cb commit];
+        if (flags & 3) {
+            id<MTLCommandBuffer> cb = [ctx->dev->mtl_queue commandBuffer];
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+            [enc endEncoding];
+            [cb commit];
+        }
     }
 }
 
@@ -1185,6 +1246,22 @@ static void ctx_DrawIndexed(CPU64 *c, void *ud) {
     ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 1, (uint32_t)c->rdx, (uint32_t)c->r8, (int32_t)c->r9);
 }
 
+static void ctx_DrawIndexedInstanced(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t idx_cnt = (uint32_t)c->rdx;
+    uint32_t inst_cnt = (uint32_t)c->r8;
+    uint32_t start_idx = (uint32_t)c->r9;
+    int32_t  base_vtx = (int32_t)win64_arg_i(c, 4);
+    if (inst_cnt > 0) ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 1, idx_cnt, start_idx, base_vtx);
+}
+static void ctx_DrawInstanced(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t vtx_cnt = (uint32_t)c->rdx;
+    uint32_t inst_cnt = (uint32_t)c->r8;
+    uint32_t start_vtx = (uint32_t)c->r9;
+    if (inst_cnt > 0) ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 0, vtx_cnt, start_vtx, 0);
+}
+
 static void ctx_CopyResource(CPU64 *c, void *ud) {
     (void)ud;
     D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
@@ -1350,7 +1427,11 @@ static void ctx_UpdateSubresource(CPU64 *c, void *ud) {
     } else if (res->kind == COM_TEXTURE2D) {
         D3D11Texture2DObj *t = (D3D11Texture2DObj *)res;
         if (!t->mtl_tex || dxgi_is_depth(t->dxgi_fmt)) return;
-        uint32_t mip = subres < t->mip_levels ? subres : 0;
+        uint32_t mips = t->mip_levels ? t->mip_levels : 1;
+        uint32_t arr  = t->array_size ? t->array_size : 1;
+        uint32_t mip  = subres % mips;
+        uint32_t sl   = subres / mips;
+        if (sl >= arr) sl = 0;
         uint32_t mw = t->width >> mip; if (mw == 0) mw = 1;
         uint32_t mh = t->height >> mip; if (mh == 0) mh = 1;
         uint32_t x = 0, y = 0, rw = mw, rh = mh;
@@ -1365,8 +1446,8 @@ static void ctx_UpdateSubresource(CPU64 *c, void *ud) {
         if (y + rh > mh) rh = mh - y;
         uint32_t min_pitch = dxgi_row_pitch(t->dxgi_fmt, rw);
         uint32_t pitch = (src_pitch >= min_pitch) ? src_pitch : min_pitch;
-        [t->mtl_tex replaceRegion:MTLRegionMake2D(x, y, rw, rh) mipmapLevel:mip
-                        withBytes:(const void *)(uintptr_t)src_va bytesPerRow:pitch];
+        [t->mtl_tex replaceRegion:MTLRegionMake2D(x, y, rw, rh) mipmapLevel:mip slice:sl
+                        withBytes:(const void *)(uintptr_t)src_va bytesPerRow:pitch bytesPerImage:0];
     }
 }
 
@@ -1395,6 +1476,24 @@ static void sc_GetDesc(CPU64 *c, void *ud) {
     W32(d + 40, 1);  /* BufferCount */
     W64(d + 48, 0x1000ULL);
     W32(d + 56, 1);  /* Windowed */
+    c->rax = S_OK_HR;
+}
+
+static void sc_ResizeBuffers(CPU64 *c, void *ud) {
+    (void)ud;
+    DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
+    uint32_t w = (uint32_t)c->r8;
+    uint32_t h = (uint32_t)c->r9;
+    uint32_t fmt = (uint32_t)win64_arg_i(c, 4);
+    if (!sc) { c->rax = E_INVALIDARG_H; return; }
+    if (w == 0) w = sc->width;
+    if (h == 0) h = sc->height;
+    if (fmt == 0 && sc->backbuffer) fmt = sc->backbuffer->dxgi_fmt;
+    if (w != sc->width || h != sc->height) {
+        sc->width = w; sc->height = h;
+        sc->backbuffer = create_tex2d_internal(sc->dev, w, h, fmt ? fmt : 28, 0, 1, 0);
+        if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(w, h);
+    }
     c->rax = S_OK_HR;
 }
 
@@ -1658,6 +1757,8 @@ static void init_d3d11_vtables(void) {
     g_vt_context[17] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::IASetInputLayout", ctx_IASetInputLayout, NULL);
     g_vt_context[18] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::IASetVertexBuffers", ctx_IASetVertexBuffers, NULL);
     g_vt_context[19] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::IASetIndexBuffer", ctx_IASetIndexBuffer, NULL);
+    g_vt_context[20] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::DrawIndexedInstanced", ctx_DrawIndexedInstanced, NULL);
+    g_vt_context[21] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::DrawInstanced", ctx_DrawInstanced, NULL);
     g_vt_context[24] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::IASetPrimitiveTopology", ctx_IASetPrimitiveTopology, NULL);
     g_vt_context[25] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::VSSetShaderResources", ctx_VSSetShaderResources, NULL);
     g_vt_context[26] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::VSSetSamplers", ctx_VSSetSamplers, NULL);
@@ -1679,6 +1780,7 @@ static void init_d3d11_vtables(void) {
     g_vt_swapchain[8] = rt_alloc_dynamic_thunk("IDXGISwapChain::Present", sc_Present, NULL);
     g_vt_swapchain[9] = rt_alloc_dynamic_thunk("IDXGISwapChain::GetBuffer", sc_GetBuffer, NULL);
     g_vt_swapchain[12]= rt_alloc_dynamic_thunk("IDXGISwapChain::GetDesc", sc_GetDesc, NULL);
+    g_vt_swapchain[13]= rt_alloc_dynamic_thunk("IDXGISwapChain::ResizeBuffers", sc_ResizeBuffers, NULL);
     g_vt_adapter[6]   = t_get_parent;
     g_vt_adapter[7]   = rt_alloc_dynamic_thunk("IDXGIAdapter::EnumOutputs", adapter_EnumOutputs, NULL);
     g_vt_adapter[8]   = rt_alloc_dynamic_thunk("IDXGIAdapter::GetDesc", adapter_GetDesc, NULL);

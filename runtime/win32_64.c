@@ -800,21 +800,68 @@ static void w_qsort(CPU64 *c, void *ud) {
     g_wqsort_cmp = prev;
 }
 
-/* ---- User32 -> SDL2 Windowing ---- */
+/* ---- User32 -> SDL2 Windowing & Input ---- */
 typedef struct {
     SDL_Window *sdl;
     int         w, h;
+    uint64_t    wndproc;
 } WinHwndObj;
 
 static WinHwndObj *g_hwnds[64];
+static uint64_t    g_last_class_wndproc = 0;
+static uint8_t     g_vk_down[256];
+static int         g_mouse_x = 640, g_mouse_y = 360;
 
 SDL_Window *win32_hwnd_to_sdl(uint64_t hwnd) {
     if (hwnd < 0x1000 || hwnd >= 0x1000 + 64) return NULL;
     WinHwndObj *o = g_hwnds[hwnd - 0x1000];
     return o ? o->sdl : NULL;
 }
+uint64_t win32_get_wndproc(uint64_t hwnd) {
+    if (hwnd < 0x1000 || hwnd >= 0x1000 + 64) return 0;
+    return g_hwnds[hwnd - 0x1000] ? g_hwnds[hwnd - 0x1000]->wndproc : 0;
+}
+uint64_t win32_set_wndproc(uint64_t hwnd, uint64_t fn) {
+    if (hwnd < 0x1000 || hwnd >= 0x1000 + 64 || !g_hwnds[hwnd - 0x1000]) return 0;
+    uint64_t prev = g_hwnds[hwnd - 0x1000]->wndproc;
+    g_hwnds[hwnd - 0x1000]->wndproc = fn;
+    return prev;
+}
+int  win32_vk_is_down(int vk) { return (vk >= 0 && vk < 256) ? (int)g_vk_down[vk] : 0; }
+void win32_get_mouse_xy(int *x, int *y) { if (x) *x = g_mouse_x; if (y) *y = g_mouse_y; }
 
-static void w_RegisterClassExA(CPU64 *c, void *ud) { (void)ud; c->rax = 0xC001; }
+static int sdl_key_to_vk(SDL_Keycode sym) {
+    if (sym >= 'a' && sym <= 'z') return (int)(sym - 'a' + 'A');
+    if (sym >= '0' && sym <= '9') return (int)sym;
+    if (sym >= SDLK_F1 && sym <= SDLK_F12) return 0x70 + (int)(sym - SDLK_F1);
+    switch (sym) {
+        case SDLK_BACKSPACE: return 0x08;
+        case SDLK_TAB:       return 0x09;
+        case SDLK_RETURN:    return 0x0D;
+        case SDLK_LSHIFT: case SDLK_RSHIFT: return 0x10;
+        case SDLK_LCTRL:  case SDLK_RCTRL:  return 0x11;
+        case SDLK_LALT:   case SDLK_RALT:   return 0x12;
+        case SDLK_ESCAPE:    return 0x1B;
+        case SDLK_SPACE:     return 0x20;
+        case SDLK_LEFT:      return 0x25;
+        case SDLK_UP:        return 0x26;
+        case SDLK_RIGHT:     return 0x27;
+        case SDLK_DOWN:      return 0x28;
+        case SDLK_DELETE:    return 0x2E;
+        case SDLK_BACKQUOTE: return 0xC0;
+        default:             return 0;
+    }
+}
+
+static void w_RegisterClassExA(CPU64 *c, void *ud) {
+    (void)ud;
+    /* WNDCLASSEX: cbSize(0), style(4), lpfnWndProc(8) */
+    if (c->rcx) {
+        uint64_t wp = R64(c->rcx + 8);
+        if (wp) g_last_class_wndproc = wp;
+    }
+    c->rax = 0xC001;
+}
 static void create_window_common(CPU64 *c, const char *title) {
     uint32_t style = (uint32_t)c->r9;
     int w = (int)win64_arg_i(c, 6);
@@ -828,7 +875,7 @@ static void create_window_common(CPU64 *c, const char *title) {
                                        w, h, flags);
     if (!win) { c->rax = 0; return; }
     WinHwndObj *o = (WinHwndObj *)calloc(1, sizeof(WinHwndObj));
-    o->sdl = win; o->w = w; o->h = h;
+    o->sdl = win; o->w = w; o->h = h; o->wndproc = g_last_class_wndproc;
     for (int i = 0; i < 64; i++) {
         if (!g_hwnds[i]) { g_hwnds[i] = o; c->rax = (uint64_t)(0x1000 + i); return; }
     }
@@ -872,17 +919,71 @@ static void w_GetClientRect(CPU64 *c, void *ud) {
 }
 static void w_PeekMessageA(CPU64 *c, void *ud) {
     (void)ud;
+    uint64_t msg_va = c->rcx;
     SDL_Event ev;
-    if (SDL_PollEvent(&ev) && c->rcx) {
-        memset((void *)(uintptr_t)c->rcx, 0, 48);
-        if (ev.type == SDL_QUIT) W32(c->rcx + 8, 0x0012 /* WM_QUIT */);
-        c->rax = 1;
-        return;
+    while (SDL_PollEvent(&ev)) {
+        uint32_t wm = 0;
+        uint64_t wp = 0, lp = 0;
+        if (ev.type == SDL_QUIT) {
+            wm = 0x0012; /* WM_QUIT */
+        } else if (ev.type == SDL_MOUSEMOTION) {
+            g_mouse_x = ev.motion.x; g_mouse_y = ev.motion.y;
+            wm = 0x0200; /* WM_MOUSEMOVE */
+            lp = ((uint64_t)(uint16_t)ev.motion.y << 16) | (uint16_t)ev.motion.x;
+        } else if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) {
+            int dn = (ev.type == SDL_MOUSEBUTTONDOWN);
+            g_mouse_x = ev.button.x; g_mouse_y = ev.button.y;
+            lp = ((uint64_t)(uint16_t)ev.button.y << 16) | (uint16_t)ev.button.x;
+            if (ev.button.button == SDL_BUTTON_LEFT)       { wm = dn ? 0x0201 : 0x0202; g_vk_down[0x01] = (uint8_t)dn; }
+            else if (ev.button.button == SDL_BUTTON_RIGHT) { wm = dn ? 0x0204 : 0x0205; g_vk_down[0x02] = (uint8_t)dn; }
+            else if (ev.button.button == SDL_BUTTON_MIDDLE){ wm = dn ? 0x0207 : 0x0208; g_vk_down[0x04] = (uint8_t)dn; }
+        } else if (ev.type == SDL_MOUSEWHEEL) {
+            wm = 0x020A; /* WM_MOUSEWHEEL */
+            wp = (uint64_t)(uint16_t)(int16_t)(ev.wheel.y * 120) << 16;
+            lp = ((uint64_t)(uint16_t)g_mouse_y << 16) | (uint16_t)g_mouse_x;
+        } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+            int dn = (ev.type == SDL_KEYDOWN);
+            int vk = sdl_key_to_vk(ev.key.keysym.sym);
+            if (vk) {
+                g_vk_down[vk] = (uint8_t)dn;
+                wm = dn ? 0x0100 : 0x0101; /* WM_KEYDOWN / WM_KEYUP */
+                wp = (uint64_t)vk;
+                lp = 1ULL | ((uint64_t)(ev.key.keysym.scancode & 0xFF) << 16);
+            }
+        } else if (ev.type == SDL_TEXTINPUT && ev.text.text[0]) {
+            wm = 0x0102; /* WM_CHAR */
+            wp = (uint8_t)ev.text.text[0];
+        }
+        if (wm && msg_va) {
+            memset((void *)(uintptr_t)msg_va, 0, 48);
+            W64(msg_va + 0, 0x1000ULL);
+            W32(msg_va + 8, wm);
+            W64(msg_va + 16, wp);
+            W64(msg_va + 24, lp);
+            W32(msg_va + 36, (uint32_t)g_mouse_x);
+            W32(msg_va + 40, (uint32_t)g_mouse_y);
+            c->rax = 1;
+            return;
+        }
     }
     c->rax = 0;
 }
 static void w_TranslateMessage(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
-static void w_DispatchMessageA(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
+static void w_DispatchMessageA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t msg_va = c->rcx;
+    if (!msg_va) { c->rax = 0; return; }
+    uint64_t hwnd = R64(msg_va + 0);
+    uint32_t wm   = R32(msg_va + 8);
+    uint64_t wp   = R64(msg_va + 16);
+    uint64_t lp   = R64(msg_va + 24);
+    uint64_t fn   = win32_get_wndproc(hwnd);
+    if (fn && wm && wm != 0x0012) {
+        c->rax = rt_invoke_win64(c, fn, hwnd, (uint64_t)wm, wp, lp, 0, 0);
+        return;
+    }
+    c->rax = 0;
+}
 static void w_DefWindowProcA(CPU64 *c, void *ud)   { (void)ud; c->rax = 0; }
 
 void rt_register_win32_64(void) {

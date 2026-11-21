@@ -35,5 +35,9 @@ static inline double win64_arg_d(const CPU64 *c, int idx) {
 
 struct SDL_Window;
 struct SDL_Window *win32_hwnd_to_sdl(uint64_t hwnd);
+uint64_t win32_get_wndproc(uint64_t hwnd);
+uint64_t win32_set_wndproc(uint64_t hwnd, uint64_t fn);
+int      win32_vk_is_down(int vk);
+void     win32_get_mouse_xy(int *x, int *y);
 
 #endif /* ELF64_RECOMP_WIN64_ABI_H */

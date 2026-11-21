@@ -167,7 +167,7 @@ def detect_dxbc_opcodes() -> set[str]:
         "opc == 51": ["min"],
         "opc == 52": ["max"],
         "opc == 68": ["rsq"],
-        "opc == 76": ["sqrt"],
+        "opc == 75": ["sqrt"],
         "opc == 62": ["ret"],
         "opc == 55": ["movc"],
         "opc == 49": ["lt"],
