@@ -9,6 +9,7 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 
+import audit_pe64  # noqa: E402
 import gen_vulkan64  # noqa: E402
 import lift64  # noqa: E402
 import peprep64  # noqa: E402
@@ -126,6 +127,12 @@ class TestPePrep64(unittest.TestCase):
             res = lift64.lift_layout(os.path.join(prep_dir, "layout.json"), lift_dir, shards=2, strict=True)
             self.assertEqual(res["unimpl"], [])
             self.assertGreaterEqual(res["funcs"], 2)
+
+            rep = audit_pe64.audit_target(d, main_exe="app.exe", lift_audit=True)
+            self.assertEqual(rep["modules"], 2)
+            self.assertEqual(rep["missing_imports"], 0)
+            self.assertEqual(rep["unimpl_mnemonics"], [])
+            self.assertIn("D3D11CreateDeviceAndSwapChain", audit_pe64.collect_implemented_shims())
 
 
 if __name__ == "__main__":
