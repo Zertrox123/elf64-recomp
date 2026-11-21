@@ -21,8 +21,15 @@ typedef struct {
 
 typedef struct {
     const char *name;
+    const char *dll;
     uint64_t    addr;
 } RTImportSpec;
+
+typedef struct {
+    const char *name;
+    uint64_t    entry;
+    uint64_t    hmodule;
+} RTDllInit;
 
 typedef struct {
     uint64_t dst;
@@ -62,10 +69,13 @@ extern const RTExportSpec g_rt_exports[];
 extern const size_t       g_rt_export_count;
 extern const RTFuncEntry  g_rt_funcs[];
 extern const size_t       g_rt_func_count;
+extern const RTDllInit    g_rt_dll_inits[];
+extern const size_t       g_rt_dll_init_count;
 extern const uint64_t     g_rt_entry_addr;
 extern const uint64_t     g_rt_main_addr;
 extern const uint64_t     g_rt_total_tls_size;
 extern const uint64_t     g_rt_data_import_base;
+extern const int          g_rt_is_win64;
 
 /* Core runtime API */
 void     rt_init(int argc, char **argv, char **envp);
@@ -76,6 +86,7 @@ void     rt_register_shim(const char *name, RTShimFn fn, void *userdata);
 RTShimFn rt_find_shim(const char *name, void **out_userdata);
 uint64_t rt_alloc_dynamic_thunk(const char *name, RTShimFn fn, void *userdata);
 uint64_t rt_lookup_export(const char *name);
+uint64_t rt_find_module_base(const char *name);
 
 /* Dispatch & invocation */
 void     rt_call(CPU64 *c, uint64_t target);
@@ -83,6 +94,9 @@ void     rt_tailcall(CPU64 *c, uint64_t target);
 uint64_t rt_invoke64(CPU64 *c, uint64_t target,
                      uint64_t a0, uint64_t a1, uint64_t a2,
                      uint64_t a3, uint64_t a4, uint64_t a5);
+uint64_t rt_invoke_win64(CPU64 *c, uint64_t target,
+                         uint64_t a0, uint64_t a1, uint64_t a2,
+                         uint64_t a3, uint64_t a4, uint64_t a5);
 
 /* Current thread CPU64 (for callbacks such as qsort comparators). */
 extern _Thread_local CPU64 *g_tls_cpu;
@@ -91,5 +105,7 @@ extern _Thread_local CPU64 *g_tls_cpu;
 void rt_register_libc64(void);
 void rt_register_sdl2_64(void);
 void rt_register_vulkan64(void);
+void rt_register_win32_64(void);
+void rt_register_d3d11_64(void);
 
 #endif /* ELF64_RECOMP_RUNTIME64_H */

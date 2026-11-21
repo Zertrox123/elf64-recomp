@@ -154,6 +154,24 @@ uint64_t rt_lookup_export(const char *name) {
     return 0;
 }
 
+uint64_t rt_find_module_base(const char *name) {
+    if (!name || !*name) {
+        return g_rt_module_count > 0 ? g_rt_modules[0].map_addr : 0;
+    }
+    for (size_t i = 0; i < g_rt_module_count; i++) {
+        if (strcasecmp(g_rt_modules[i].name, name) == 0) {
+            return g_rt_modules[i].map_addr;
+        }
+        /* Also match without .dll suffix (e.g., "calc64" vs "calc64.dll"). */
+        size_t nlen = strlen(name);
+        if (strncasecmp(g_rt_modules[i].name, name, nlen) == 0 &&
+            strcasecmp(g_rt_modules[i].name + nlen, ".dll") == 0) {
+            return g_rt_modules[i].map_addr;
+        }
+    }
+    return 0;
+}
+
 static void *map_exact_rw(uint64_t addr, size_t size, const char *label) {
     size_t aligned = (size + 0x3FFFULL) & ~0x3FFFULL;
     if (aligned == 0) aligned = 0x4000;
@@ -252,6 +270,23 @@ void rt_init_thread_cpu(CPU64 *c, size_t stack_size) {
     W64(fs + 0x00, fs);              /* %fs:0x00 self-pointer */
     W64(fs + 0x28, RT_STACK_CANARY); /* %fs:0x28 glibc stack guard */
     c->fs_base = fs;
+
+    /* Allocate Windows x64 TEB + PEB on %gs_base when running PE64/Win64. */
+    if (g_rt_is_win64) {
+        uint8_t *teb = (uint8_t *)calloc(1, 0x2000);
+        uint8_t *peb = (uint8_t *)calloc(1, 0x1000);
+        if (!teb || !peb) abort();
+        uint64_t teb_va = (uint64_t)(uintptr_t)teb;
+        uint64_t peb_va = (uint64_t)(uintptr_t)peb;
+        uint64_t stk_lo = (uint64_t)(uintptr_t)stk;
+        uint64_t stk_hi = stk_lo + stack_size;
+        W64(teb_va + 0x08, stk_hi); /* NT_TIB.StackBase */
+        W64(teb_va + 0x10, stk_lo); /* NT_TIB.StackLimit */
+        W64(teb_va + 0x30, teb_va); /* TEB.Self (NtCurrentTeb) */
+        W64(teb_va + 0x60, peb_va); /* TEB.ProcessEnvironmentBlock */
+        W64(peb_va + 0x10, g_rt_module_count > 0 ? g_rt_modules[0].map_addr : 0); /* PEB.ImageBaseAddress */
+        c->gs_base = teb_va;
+    }
     g_tls_cpu = c;
 }
 
@@ -260,11 +295,19 @@ void rt_destroy_thread_cpu(CPU64 *c) {
     (void)c;
 }
 
+__attribute__((weak)) void rt_register_win32_64(void) {}
+__attribute__((weak)) void rt_register_d3d11_64(void) {}
+
 void rt_init(int argc, char **argv, char **envp) {
     (void)argc;
-    rt_register_libc64();
-    rt_register_sdl2_64();
-    rt_register_vulkan64();
+    if (g_rt_is_win64) {
+        rt_register_win32_64();
+        rt_register_d3d11_64();
+    } else {
+        rt_register_libc64();
+        rt_register_sdl2_64();
+        rt_register_vulkan64();
+    }
 
     load_module_images();
     init_data_imports(argv, envp);
@@ -275,7 +318,15 @@ void rt_init(int argc, char **argv, char **envp) {
     }
     for (size_t i = 0; i < g_rt_import_count; i++) {
         void *ud = NULL;
-        RTShimFn fn = rt_find_shim(g_rt_imports[i].name, &ud);
+        RTShimFn fn = NULL;
+        if (g_rt_imports[i].dll) {
+            char qual[256];
+            snprintf(qual, sizeof(qual), "%s!%s", g_rt_imports[i].dll, g_rt_imports[i].name);
+            fn = rt_find_shim(qual, &ud);
+        }
+        if (!fn) {
+            fn = rt_find_shim(g_rt_imports[i].name, &ud);
+        }
         if (fn) {
             disp_insert(g_rt_imports[i].addr, SLOT_SHIM, NULL, fn, ud, g_rt_imports[i].name);
         } else {
@@ -332,6 +383,32 @@ uint64_t rt_invoke64(CPU64 *c, uint64_t target,
 
     c->rdi = saved_rdi; c->rsi = saved_rsi; c->rdx = saved_rdx;
     c->rcx = saved_rcx; c->r8  = saved_r8;  c->r9  = saved_r9;
+    c->r10 = saved_r10; c->r11 = saved_r11; c->rax = saved_rax;
+    c->rip = saved_rip; c->rsp = saved_rsp;
+    memcpy(c->xmm, saved_xmm, sizeof(saved_xmm));
+    return ret;
+}
+
+uint64_t rt_invoke_win64(CPU64 *c, uint64_t target,
+                         uint64_t a0, uint64_t a1, uint64_t a2,
+                         uint64_t a3, uint64_t a4, uint64_t a5) {
+    uint64_t saved_rcx = c->rcx, saved_rdx = c->rdx, saved_r8  = c->r8,  saved_r9  = c->r9;
+    uint64_t saved_r10 = c->r10, saved_r11 = c->r11, saved_rax = c->rax;
+    uint64_t saved_rip = c->rip, saved_rsp = c->rsp;
+    Xmm128   saved_xmm[6];
+    memcpy(saved_xmm, c->xmm, sizeof(saved_xmm));
+
+    /* Win64 ABI: 16-byte aligned before call; 32B shadow space + 2 stack args = 48B. */
+    c->rsp = (c->rsp - 64ULL) & ~15ULL;
+    W64(c->rsp + 0x20, a4);
+    W64(c->rsp + 0x28, a5);
+    push64(c, RT_RETURN_SENTINEL); /* rsp % 16 == 8 at entry, shadow space at [rsp+8..rsp+39] */
+    c->rcx = a0; c->rdx = a1; c->r8 = a2; c->r9 = a3;
+
+    rt_call(c, target);
+    uint64_t ret = c->rax;
+
+    c->rcx = saved_rcx; c->rdx = saved_rdx; c->r8  = saved_r8;  c->r9  = saved_r9;
     c->r10 = saved_r10; c->r11 = saved_r11; c->rax = saved_rax;
     c->rip = saved_rip; c->rsp = saved_rsp;
     memcpy(c->xmm, saved_xmm, sizeof(saved_xmm));

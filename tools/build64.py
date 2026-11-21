@@ -28,6 +28,12 @@ sys.path.insert(0, TOOLS_DIR)
 import elfprep64  # noqa: E402
 import gen_vulkan64  # noqa: E402
 import lift64  # noqa: E402
+import peprep64  # noqa: E402
+
+
+def is_pe_file(path: str) -> bool:
+    with open(path, "rb") as f:
+        return f.read(2) == b"MZ"
 
 
 def pkg_config_flags(pkg: str, mode: str) -> List[str]:
@@ -76,7 +82,10 @@ def build_elf64(
     if not os.path.exists(vk_inc):
         gen_vulkan64.generate(gen_vulkan64.DEFAULT_VK_XML, vk_inc)
 
-    elfprep64.prepare_modules(elf_paths, prep_dir)
+    if is_pe_file(elf_paths[0]):
+        peprep64.prepare_pe_modules(elf_paths, prep_dir)
+    else:
+        elfprep64.prepare_modules(elf_paths, prep_dir)
     layout_path = os.path.join(prep_dir, "layout.json")
     lifted = lift64.lift_layout(layout_path, lift_dir, shards=shards, strict=strict)
 

@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 
 import gen_vulkan64  # noqa: E402
 import lift64  # noqa: E402
+import peprep64  # noqa: E402
+import subprocess  # noqa: E402
 
 
 class TestLift64(unittest.TestCase):
@@ -83,6 +85,45 @@ class TestGenVulkan64(unittest.TestCase):
             ncmds, nsigs = gen_vulkan64.generate(gen_vulkan64.DEFAULT_VK_XML, out)
             self.assertGreater(ncmds, 500)
             self.assertGreater(nsigs, 30)
+
+
+class TestPePrep64(unittest.TestCase):
+    def test_pe64_prepare_and_lift_cross_dll(self):
+        lld_link = "/opt/homebrew/bin/lld-link"
+        if not os.path.exists(lld_link):
+            self.skipTest("lld-link not installed")
+        with tempfile.TemporaryDirectory() as d:
+            dll_c = os.path.join(d, "helper.c")
+            dll_o = os.path.join(d, "helper.obj")
+            dll_p = os.path.join(d, "helper.dll")
+            dll_lib = os.path.join(d, "helper.lib")
+            exe_c = os.path.join(d, "app.c")
+            exe_o = os.path.join(d, "app.obj")
+            exe_p = os.path.join(d, "app.exe")
+
+            open(dll_c, "w").write("__declspec(dllexport) int helper_add(int a, int b) { return a + b + 5; }\n")
+            open(exe_c, "w").write(
+                "__declspec(dllimport) int helper_add(int a, int b);\n"
+                "int main(void) { return helper_add(10, 20); }\n"
+            )
+            subprocess.check_call(["clang", "-target", "x86_64-pc-windows-msvc", "-O2", "-c", dll_c, "-o", dll_o])
+            subprocess.check_call([lld_link, "/dll", "/noentry", f"/implib:{dll_lib}", dll_o, f"/out:{dll_p}"])
+            subprocess.check_call(["clang", "-target", "x86_64-pc-windows-msvc", "-O2", "-c", exe_c, "-o", exe_o])
+            subprocess.check_call([lld_link, "/entry:main", "/subsystem:console", exe_o, dll_lib, f"/out:{exe_p}"])
+
+            prep_dir = os.path.join(d, "prep")
+            lift_dir = os.path.join(d, "lift")
+            layout = peprep64.prepare_pe_modules([exe_p, dll_p], prep_dir)
+            self.assertEqual(layout["format"], "pe64")
+            self.assertEqual(layout["abi"], "win64")
+            self.assertEqual(len(layout["modules"]), 2)
+            # helper_add resolved inside guest DLL -> 0 external host imports!
+            self.assertEqual(len(layout["imports"]), 0)
+            self.assertIn("helper_add", layout["modules"][1]["exports"])
+
+            res = lift64.lift_layout(os.path.join(prep_dir, "layout.json"), lift_dir, shards=2, strict=True)
+            self.assertEqual(res["unimpl"], [])
+            self.assertGreaterEqual(res["funcs"], 2)
 
 
 if __name__ == "__main__":

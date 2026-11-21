@@ -151,9 +151,21 @@ def find_objdump() -> str:
     return "objdump"
 
 
-def disassemble_module(elf_path: str, base: int, code_roots: List[int]) -> List[LiftedFunc]:
+def disassemble_module(
+    elf_path: str,
+    base: int,
+    code_roots: List[int],
+    is_pe: bool = False,
+    vma_delta: int = 0,
+) -> List[LiftedFunc]:
     objdump = find_objdump()
-    cmd = [objdump, "-d", "-M", "intel", f"--adjust-vma=0x{base:x}", elf_path]
+    if is_pe:
+        # Apple llvm-objdump ignores --adjust-vma on COFF/PE64; apply vma_delta in Python.
+        cmd = [objdump, "-d", "-M", "intel", elf_path]
+        shift = vma_delta
+    else:
+        cmd = [objdump, "-d", "-M", "intel", f"--adjust-vma=0x{base:x}", elf_path]
+        shift = 0
     out = subprocess.check_output(cmd, text=True)
 
     # Parse all instructions in address order + symbol header starts.
@@ -165,13 +177,13 @@ def disassemble_module(elf_path: str, base: int, code_roots: List[int]) -> List[
     for line in out.splitlines():
         m = SYM_HDR_RE.match(line)
         if m:
-            addr = int(m.group(1), 16)
+            addr = int(m.group(1), 16) + shift
             sym_starts[addr] = m.group(2)
             pending_prefix = ""
             continue
         m = INSN_RE.match(line)
         if m:
-            addr = int(m.group(1), 16)
+            addr = int(m.group(1), 16) + shift
             raw_hex = m.group(2).strip().split()
             text = m.group(3).strip()
             if not text:
@@ -180,6 +192,14 @@ def disassemble_module(elf_path: str, base: int, code_roots: List[int]) -> List[
                     all_insns[-1].size += len(raw_hex)
                 continue
             prefix, mnem, ops = parse_insn_text(text)
+            # Shift direct PC-relative branch/call immediates when rebasing PE64.
+            if shift and ops and (
+                mnem in ("call", "jmp", "jecxz", "jrcxz")
+                or (mnem.startswith("j") and mnem[1:] in CC_EXPR)
+            ):
+                t = parse_imm(ops[0])
+                if t is not None:
+                    ops[0] = f"0x{t + shift:x}"
             # llvm-objdump emits standalone 'f0: lock' / 'f3: rep' prefix lines before the insn.
             if prefix and mnem == "nop" and not ops:
                 pending_prefix = prefix
@@ -1137,11 +1157,20 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
     with open(layout_path) as f:
         layout = json.load(f)
 
+    is_pe = layout.get("format") == "pe64"
+    is_win64 = layout.get("abi") == "win64"
+
     os.makedirs(out_dir, exist_ok=True)
     all_funcs: List[LiftedFunc] = []
     seen_addrs: Set[int] = set()
     for mod in layout["modules"]:
-        mfuncs = disassemble_module(mod["elf_path"], mod["base"], mod["code_roots"])
+        mfuncs = disassemble_module(
+            mod["elf_path"],
+            mod["base"],
+            mod["code_roots"],
+            is_pe=is_pe,
+            vma_delta=mod.get("vma_delta", 0),
+        )
         for fn in mfuncs:
             if fn.addr not in seen_addrs:
                 seen_addrs.add(fn.addr)
@@ -1190,13 +1219,14 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
 
         f.write("const RTImportSpec g_rt_imports[] = {\n")
         for imp in layout["imports"]:
-            f.write(f'    {{ "{imp["name"]}", 0x{imp["addr"]:x}ULL }},\n')
-        f.write(f"    {{ NULL, 0 }}\n}};\nconst size_t g_rt_import_count = {len(layout['imports'])};\n\n")
+            dll = f'"{imp["dll"]}"' if imp.get("dll") else "NULL"
+            f.write(f'    {{ "{imp["name"]}", {dll}, 0x{imp["addr"]:x}ULL }},\n')
+        f.write(f"    {{ NULL, NULL, 0 }}\n}};\nconst size_t g_rt_import_count = {len(layout['imports'])};\n\n")
 
         f.write("const RTImportSpec g_rt_data_imports[] = {\n")
         for imp in layout["data_imports"]:
-            f.write(f'    {{ "{imp["name"]}", 0x{imp["addr"]:x}ULL }},\n')
-        f.write(f"    {{ NULL, 0 }}\n}};\nconst size_t g_rt_data_import_count = {len(layout['data_imports'])};\n\n")
+            f.write(f'    {{ "{imp["name"]}", NULL, 0x{imp["addr"]:x}ULL }},\n')
+        f.write(f"    {{ NULL, NULL, 0 }}\n}};\nconst size_t g_rt_data_import_count = {len(layout['data_imports'])};\n\n")
 
         f.write("const RTCopyReloc g_rt_copy_relocs[] = {\n")
         for cr in layout["copy_relocs"]:
@@ -1227,10 +1257,17 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
             f.write(f"    {{ 0x{fn.addr:x}ULL, fn_{fn.addr:x} }},\n")
         f.write(f"    {{ 0, NULL }}\n}};\nconst size_t g_rt_func_count = {len(all_funcs)};\n\n")
 
+        dll_inits = layout.get("dll_inits", [])
+        f.write("const RTDllInit g_rt_dll_inits[] = {\n")
+        for di in dll_inits:
+            f.write(f'    {{ "{di["name"]}", 0x{di["entry"]:x}ULL, 0x{di["hmodule"]:x}ULL }},\n')
+        f.write(f"    {{ NULL, 0, 0 }}\n}};\nconst size_t g_rt_dll_init_count = {len(dll_inits)};\n\n")
+
         f.write(f"const uint64_t g_rt_entry_addr = 0x{layout['entry']:x}ULL;\n")
         f.write(f"const uint64_t g_rt_main_addr = 0x{layout['main_symbol']:x}ULL;\n")
         f.write(f"const uint64_t g_rt_total_tls_size = 0x{layout['total_tls_size']:x}ULL;\n")
         f.write(f"const uint64_t g_rt_data_import_base = 0x{layout['data_import_base']:x}ULL;\n")
+        f.write(f"const int g_rt_is_win64 = {1 if is_win64 else 0};\n")
 
     return {
         "funcs": len(all_funcs),
