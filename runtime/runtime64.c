@@ -129,8 +129,9 @@ void rt_register_shim(const char *name, RTShimFn fn, void *userdata) {
 }
 
 RTShimFn rt_find_shim(const char *name, void **out_userdata) {
-    /* Strip optional glibc version suffix (e.g., sym@GLIBC_2.2.5). */
-    const char *at = strchr(name, '@');
+    /* Strip optional glibc version suffix (e.g., sym@GLIBC_2.2.5) on ELF only;
+     * MSVC C++ mangled Win64 symbols legitimately contain '@'. */
+    const char *at = g_rt_is_win64 ? NULL : strchr(name, '@');
     size_t nlen = at ? (size_t)(at - name) : strlen(name);
     for (size_t i = 0; i < g_shim_count; i++) {
         if (strlen(g_shims[i].name) == nlen && memcmp(g_shims[i].name, name, nlen) == 0) {
@@ -377,6 +378,7 @@ void rt_init(int argc, char **argv, char **envp) {
         rt_register_win32_extra();
         rt_register_d3d11_64();
         rt_register_cairo_pango_64();
+        rt_register_v8_jsc_64();
     } else {
         rt_register_libc64();
         rt_register_sdl2_64();

@@ -120,7 +120,7 @@ def build_elf64(
         os.path.join(RUNTIME_DIR, name)
         for name in (
             "runtime64.c", "libc64.c", "sdl2_64.c", "vulkan64.c",
-            "win32_64.c", "win32_crt_extra.c", "cairo_pango64.c",
+            "win32_64.c", "win32_crt_extra.c", "cairo_pango64.c", "v8_jsc64.c",
             "dxbc_msl.c", "d3d11_metal.m", "main64.c",
         )
     ]
@@ -135,6 +135,7 @@ def build_elf64(
     link_cmd = (
         ["clang", "-o", out_bin] + objs + sdl_libs + [
             "-framework", "Metal", "-framework", "QuartzCore", "-framework", "Foundation",
+            "-framework", "JavaScriptCore",
             "-lm", "-lpthread", "-ldl",
         ] + extra_ldflags
     )

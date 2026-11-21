@@ -116,5 +116,6 @@ void rt_register_win32_64(void);
 void rt_register_win32_extra(void);
 void rt_register_d3d11_64(void);
 void rt_register_cairo_pango_64(void);
+void rt_register_v8_jsc_64(void);
 
 #endif /* ELF64_RECOMP_RUNTIME64_H */
