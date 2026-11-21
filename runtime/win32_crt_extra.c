@@ -1352,6 +1352,222 @@ static void w_wsa_getaddrinfo(CPU64 *c, void *ud) {
 }
 static void w_wsa_freeaddrinfo(CPU64 *c, void *ud) { (void)ud; (void)c; }
 
+/* ---- GlobalAlloc / GDI32 DIB+Font / WinMM / User32 / Shell32 / OLE32 ---- */
+typedef struct { void *ptr; size_t size; } GlobalSlot;
+static GlobalSlot g_globals[256];
+static pthread_mutex_t g_glob_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void w_GlobalAlloc(CPU64 *c, void *ud) {
+    (void)ud;
+    size_t sz = (size_t)c->rdx;
+    if (sz == 0) sz = 16;
+    void *p = calloc(1, sz);
+    if (!p) { c->rax = 0; return; }
+    pthread_mutex_lock(&g_glob_mu);
+    for (int i = 0; i < 256; i++) {
+        if (!g_globals[i].ptr) { g_globals[i].ptr = p; g_globals[i].size = sz; break; }
+    }
+    pthread_mutex_unlock(&g_glob_mu);
+    c->rax = (uint64_t)(uintptr_t)p;
+}
+static void w_GlobalLock(CPU64 *c, void *ud)   { (void)ud; c->rax = c->rcx; }
+static void w_GlobalUnlock(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
+static void w_GlobalSize(CPU64 *c, void *ud) {
+    (void)ud;
+    void *p = (void *)(uintptr_t)c->rcx;
+    size_t sz = 0;
+    pthread_mutex_lock(&g_glob_mu);
+    for (int i = 0; i < 256; i++) {
+        if (g_globals[i].ptr == p) { sz = g_globals[i].size; break; }
+    }
+    pthread_mutex_unlock(&g_glob_mu);
+    c->rax = sz;
+}
+static void w_GlobalFree(CPU64 *c, void *ud) {
+    (void)ud;
+    void *p = (void *)(uintptr_t)c->rcx;
+    if (p) {
+        pthread_mutex_lock(&g_glob_mu);
+        for (int i = 0; i < 256; i++) {
+            if (g_globals[i].ptr == p) { g_globals[i].ptr = NULL; g_globals[i].size = 0; break; }
+        }
+        pthread_mutex_unlock(&g_glob_mu);
+        free(p);
+    }
+    c->rax = 0;
+}
+static void w_GetLogicalDriveStringsA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t cap = (uint32_t)c->rcx;
+    char *dst = (char *)(uintptr_t)c->rdx;
+    if (dst && cap >= 5) { memcpy(dst, "C:\\\0\0", 5); }
+    c->rax = 4;
+}
+
+typedef struct { int w, h, bpp; void *bits; } GdiBmp;
+static GdiBmp g_gdi_bmps[128];
+static pthread_mutex_t g_gdi_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void w_CreateDIBSection(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t bmi = c->rdx;
+    uint64_t ppv = c->r9;
+    int w = bmi ? (int32_t)R32(bmi + 4) : 16;
+    int h = bmi ? (int32_t)R32(bmi + 8) : 16;
+    if (w <= 0) w = 16;
+    if (h < 0) h = -h;
+    if (h == 0) h = 16;
+    int bpp = bmi ? (int)R16(bmi + 14) : 32;
+    if (bpp < 8) bpp = 32;
+    size_t stride = (((size_t)w * (size_t)bpp + 31) / 32) * 4;
+    void *bits = calloc(1, stride * (size_t)h + 64);
+    if (ppv) W64(ppv, (uint64_t)(uintptr_t)bits);
+    pthread_mutex_lock(&g_gdi_mu);
+    for (int i = 0; i < 128; i++) {
+        if (!g_gdi_bmps[i].bits) {
+            g_gdi_bmps[i].w = w; g_gdi_bmps[i].h = h; g_gdi_bmps[i].bpp = bpp; g_gdi_bmps[i].bits = bits;
+            pthread_mutex_unlock(&g_gdi_mu);
+            c->rax = 0x50000ULL + (uint64_t)i;
+            return;
+        }
+    }
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = 0x50FFFULL;
+}
+static void w_DeleteObject(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx >= 0x50000ULL && c->rcx < 0x50080ULL) {
+        size_t idx = (size_t)(c->rcx - 0x50000ULL);
+        pthread_mutex_lock(&g_gdi_mu);
+        free(g_gdi_bmps[idx].bits);
+        memset(&g_gdi_bmps[idx], 0, sizeof(g_gdi_bmps[idx]));
+        pthread_mutex_unlock(&g_gdi_mu);
+    }
+    c->rax = 1;
+}
+static void w_GetObjectA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t h = c->rcx;
+    int cb = (int)c->rdx;
+    uint64_t out = c->r8;
+    if (h >= 0x50000ULL && h < 0x50080ULL && out && cb >= 32) {
+        size_t idx = (size_t)(h - 0x50000ULL);
+        memset((void *)(uintptr_t)out, 0, (size_t)cb);
+        W32(out + 4, (uint32_t)g_gdi_bmps[idx].w);
+        W32(out + 8, (uint32_t)g_gdi_bmps[idx].h);
+        W32(out + 12, (uint32_t)(g_gdi_bmps[idx].w * (g_gdi_bmps[idx].bpp / 8)));
+        W16(out + 16, 1);
+        W16(out + 18, (uint16_t)g_gdi_bmps[idx].bpp);
+        W64(out + 24, (uint64_t)(uintptr_t)g_gdi_bmps[idx].bits);
+        c->rax = 32;
+        return;
+    }
+    c->rax = 0;
+}
+static void w_GetTextMetricsA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t tm = c->rdx;
+    if (!tm) { c->rax = 0; return; }
+    memset((void *)(uintptr_t)tm, 0, 56);
+    W32(tm + 0, 16);  /* tmHeight */
+    W32(tm + 4, 13);  /* tmAscent */
+    W32(tm + 8, 3);   /* tmDescent */
+    W32(tm + 20, 8);  /* tmAveCharWidth */
+    W32(tm + 24, 16); /* tmMaxCharWidth */
+    W32(tm + 28, 400);/* tmWeight */
+    W8(tm + 48, 32);  /* tmFirstChar */
+    W8(tm + 49, 126); /* tmLastChar */
+    c->rax = 1;
+}
+static void w_GetCharABCWidths(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t first = (uint32_t)c->rdx, last = (uint32_t)c->r8;
+    uint64_t out = c->r9;
+    if (!out || last < first || (last - first) > 65536) { c->rax = 0; return; }
+    for (uint32_t i = 0; i <= last - first; i++) {
+        W32(out + i * 12ULL + 0, 0);
+        W32(out + i * 12ULL + 4, 8);
+        W32(out + i * 12ULL + 8, 1);
+    }
+    c->rax = 1;
+}
+static void w_GetTextExtentPoint32A(CPU64 *c, void *ud) {
+    (void)ud;
+    int len = (int)c->r8;
+    if (c->r9) { W32(c->r9, (uint32_t)(len > 0 ? len * 8 : 0)); W32(c->r9 + 4, 16); }
+    c->rax = 1;
+}
+static void w_GetGlyphOutlineA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t gm = c->r9;
+    uint32_t cb = (uint32_t)win64_arg_i(c, 4);
+    uint64_t buf = win64_arg_i(c, 5);
+    if (gm) {
+        memset((void *)(uintptr_t)gm, 0, 20);
+        W32(gm + 0, 8); W32(gm + 4, 14); W32(gm + 8, 0); W32(gm + 12, 13);
+        W16(gm + 16, 9); W16(gm + 18, 0);
+    }
+    uint32_t need = 8 * 14;
+    if (buf && cb >= need) memset((void *)(uintptr_t)buf, 0, need);
+    c->rax = need;
+}
+static void w_GetKeyboardLayout(CPU64 *c, void *ud) { (void)ud; c->rax = 0x04090409ULL; }
+static void w_GetKeyboardLayoutList(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx >= 1 && c->rdx) W64(c->rdx, 0x04090409ULL);
+    c->rax = 1;
+}
+static void w_RegisterWindowMessageA(CPU64 *c, void *ud) {
+    (void)ud;
+    static uint32_t msg = 0xC100;
+    c->rax = msg++;
+}
+static void w_GetCursorPos(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) { W32(c->rcx, 640); W32(c->rcx + 4, 360); }
+    c->rax = 1;
+}
+static void w_GetForegroundWindow(CPU64 *c, void *ud) { (void)ud; c->rax = 0x1000ULL; }
+static void w_waveOutOpen(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) W64(c->rcx, 0x60001ULL);
+    c->rax = 0; /* MMSYSERR_NOERROR */
+}
+static void w_waveOutPrepareHeader(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx + 24, R32(c->rdx + 24) | 0x00000002U /* WHDR_PREPARED */);
+    c->rax = 0;
+}
+static void w_waveOutWrite(CPU64 *c, void *ud) {
+    (void)ud;
+    /* Mark buffer immediately done so sound mixer never stalls waiting for playback */
+    if (c->rdx) W32(c->rdx + 24, R32(c->rdx + 24) | 0x00000001U /* WHDR_DONE */);
+    c->rax = 0;
+}
+static void w_waveOutGetPosition(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx + 4, 0);
+    c->rax = 0;
+}
+static void w_CoCreateInstance(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t ppv = win64_arg_i(c, 4);
+    if (ppv) W64(ppv, 0);
+    c->rax = 0x80004002ULL; /* E_NOINTERFACE */
+}
+static void w_CoTaskMemFree(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) free((void *)(uintptr_t)c->rcx);
+}
+static void w_SHGetSpecialFolderPathA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) {
+        const char *home = getenv("HOME");
+        snprintf((char *)(uintptr_t)c->rdx, 260, "%s/Library/Application Support/elf64-recomp", home ? home : "/tmp");
+    }
+    c->rax = 1;
+}
+
 void rt_register_win32_extra(void) {
     #define REG(name, fn) rt_register_shim(name, fn, NULL)
     /* Time */
@@ -1562,5 +1778,65 @@ void rt_register_win32_extra(void) {
     REG("SteamInternal_CreateInterface", w_ret_0); REG("SteamInternal_FindOrCreateGameServerInterface", w_ret_0);
     REG("SteamInternal_GameServer_Init", w_ret_0); REG("SteamGameServer_GetHSteamUser", w_ret_0);
     REG("SteamGameServer_RunCallbacks", w_ret_0); REG("SteamGameServer_Shutdown", w_ret_0);
+    /* Core engine 18-module shims: Kernel32 Global*, GDI32 DIB/Font, User32, IMM32, WinMM, OLE32, Shell32 */
+    REG("GlobalAlloc", w_GlobalAlloc); REG("GlobalLock", w_GlobalLock);
+    REG("GlobalUnlock", w_GlobalUnlock); REG("GlobalSize", w_GlobalSize);
+    REG("GlobalFree", w_GlobalFree); REG("GetLogicalDriveStringsA", w_GetLogicalDriveStringsA);
+    REG("RegCreateKeyExA", w_ret_err2); REG("RegEnumKeyExA", w_ret_err2);
+    REG("RegQueryInfoKeyA", w_ret_err2); REG("RegSetValueExA", w_ret_err2);
+    REG("SHDeleteKeyA", w_ret_err2);
+    REG("CreateDIBSection", w_CreateDIBSection); REG("DeleteObject", w_DeleteObject);
+    REG("GetObjectA", w_GetObjectA); REG("GetTextMetricsA", w_GetTextMetricsA);
+    REG("GetCharABCWidthsA", w_GetCharABCWidths); REG("GetCharABCWidthsW", w_GetCharABCWidths);
+    REG("GetTextExtentPoint32A", w_GetTextExtentPoint32A); REG("GetGlyphOutlineA", w_GetGlyphOutlineA);
+    REG("CreateCompatibleDC", w_ret_1); REG("DeleteDC", w_ret_1);
+    REG("CreateBitmap", w_ret_1); REG("CreateCompatibleBitmap", w_ret_1);
+    REG("CreateFontA", w_ret_1); REG("CreatePen", w_ret_1);
+    REG("CreateRectRgn", w_ret_1); REG("CreateSolidBrush", w_ret_1);
+    REG("SelectObject", w_ret_1); REG("AddFontMemResourceEx", w_ret_1);
+    REG("RemoveFontMemResourceEx", w_ret_1); REG("RemoveFontResourceA", w_ret_1);
+    REG("BitBlt", w_ret_1); REG("StretchBlt", w_ret_1); REG("GetDIBits", w_ret_0);
+    REG("ExtTextOutA", w_ret_1); REG("ExtTextOutW", w_ret_1);
+    REG("GetBkColor", w_ret_0); REG("SetBkColor", w_ret_0); REG("SetBkMode", w_ret_1);
+    REG("GetTextColor", w_ret_0); REG("SetTextColor", w_ret_0); REG("SetTextAlign", w_ret_0);
+    REG("SetMapMode", w_ret_1); REG("SetRectRgn", w_ret_1); REG("SetViewportOrgEx", w_ret_1);
+    REG("MoveToEx", w_ret_1); REG("Polygon", w_ret_1); REG("Polyline", w_ret_1);
+    REG("GetWindowLongPtrA", w_GetWindowLongPtr); REG("SetWindowLongPtrA", w_SetWindowLongPtr);
+    REG("GetKeyboardLayout", w_GetKeyboardLayout); REG("GetKeyboardLayoutList", w_GetKeyboardLayoutList);
+    REG("ActivateKeyboardLayout", w_GetKeyboardLayout); REG("LoadKeyboardLayoutA", w_GetKeyboardLayout);
+    REG("UnloadKeyboardLayout", w_ret_1); REG("MapVirtualKeyExA", w_ret_0);
+    REG("RegisterClassA", w_ret_1); REG("UnregisterClassA", w_ret_1);
+    REG("RegisterWindowMessageA", w_RegisterWindowMessageA);
+    REG("GetCursorPos", w_GetCursorPos); REG("SetCursorPos", w_ret_1);
+    REG("GetFocus", w_GetForegroundWindow); REG("SetFocus", w_GetForegroundWindow);
+    REG("GetForegroundWindow", w_GetForegroundWindow); REG("SetActiveWindow", w_GetForegroundWindow);
+    REG("GetParent", w_ret_0); REG("WindowFromPoint", w_GetForegroundWindow);
+    REG("IsWindowEnabled", w_ret_1); REG("ValidateRect", w_ret_1); REG("FlashWindow", w_ret_1);
+    REG("SetWindowTextW", w_ret_1); REG("SetCapture", w_ret_0); REG("SetCursor", w_ret_1);
+    REG("SetTimer", w_ret_1); REG("GetMessageA", w_ret_0); REG("GetGUIThreadInfo", w_ret_0);
+    REG("SystemParametersInfoA", w_ret_0); REG("RegisterRawInputDevices", w_ret_1); REG("GetRawInputData", w_ret_0);
+    REG("CopyIcon", w_ret_1); REG("CreateIconIndirect", w_ret_1); REG("DestroyCursor", w_ret_1);
+    REG("DestroyIcon", w_ret_1); REG("DrawIconEx", w_ret_1); REG("GetIconInfo", w_ret_0);
+    REG("LoadCursorFromFileA", w_ret_1);
+    REG("OpenClipboard", w_ret_0); REG("CloseClipboard", w_ret_1); REG("EmptyClipboard", w_ret_1);
+    REG("GetClipboardData", w_ret_0); REG("SetClipboardData", w_ret_0);
+    REG("ImmGetContext", w_ret_0); REG("ImmReleaseContext", w_ret_1);
+    REG("ImmGetCandidateListCountW", w_ret_0); REG("ImmGetCandidateListW", w_ret_0);
+    REG("ImmGetCompositionStringW", w_ret_0); REG("ImmGetConversionStatus", w_ret_0);
+    REG("ImmSetConversionStatus", w_ret_1); REG("ImmGetProperty", w_ret_0);
+    REG("ImmNotifyIME", w_ret_1); REG("ImmSetCandidateWindow", w_ret_1);
+    REG("waveOutOpen", w_waveOutOpen); REG("waveOutPrepareHeader", w_waveOutPrepareHeader);
+    REG("waveOutWrite", w_waveOutWrite); REG("waveOutUnprepareHeader", w_ret_0);
+    REG("waveOutReset", w_ret_0); REG("waveOutClose", w_ret_0);
+    REG("waveOutGetPosition", w_waveOutGetPosition); REG("PlaySoundA", w_ret_1);
+    REG("joyGetNumDevs", w_ret_0); REG("joyGetDevCapsA", w_ret_err2); REG("joyGetPosEx", w_ret_err2);
+    REG("dsound.dll!#2", w_ret_0); REG("dsound.dll!#9", w_ret_0);
+    REG("CoInitializeEx", w_ret_0); REG("OleInitialize", w_ret_0);
+    REG("CoCreateInstance", w_CoCreateInstance); REG("CoTaskMemFree", w_CoTaskMemFree);
+    REG("PropVariantClear", w_ret_0); REG("RegisterDragDrop", w_ret_0);
+    REG("RevokeDragDrop", w_ret_0); REG("ReleaseStgMedium", w_ret_0);
+    REG("oleaut32.dll!#9", w_ret_0);
+    REG("DragQueryFileA", w_ret_0); REG("SHGetFileInfoA", w_ret_0);
+    REG("SHGetSpecialFolderPathA", w_SHGetSpecialFolderPathA); REG("Shell_NotifyIconA", w_ret_1);
     #undef REG
 }

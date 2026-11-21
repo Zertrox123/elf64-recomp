@@ -1024,7 +1024,7 @@ def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List
     if m == "ret":
         imm = parse_imm(ops[0]) if ops else 0
         if imm:
-            return f"c->rip = pop64(c); c->rsp += 0x{imm:x}ULL; return;"
+            return f"c->rip = pop64(c); c->rsp += 0x{imm & 0xFFFF:x}ULL; return;"
         return "c->rip = pop64(c); return;"
 
     if m == "call":

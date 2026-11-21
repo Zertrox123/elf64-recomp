@@ -322,7 +322,8 @@ static int is_host_system_dll(const char *name) {
     static const char *const sys[] = {
         "kernel32", "kernelbase", "ntdll", "user32", "gdi32", "advapi32",
         "ole32", "oleaut32", "shell32", "shlwapi", "version", "winmm",
-        "bcrypt", "ws2_32", "dbghelp", "winhttp", "d3d11", "dxgi",
+        "bcrypt", "ws2_32", "dbghelp", "winhttp", "wininet", "d3d11", "dxgi",
+        "imm32", "dsound", "rpcrt4", "iphlpapi",
         "ucrtbase", "msvcrt", "vcruntime140", "steam_api64", NULL
     };
     if (strncasecmp(base, "api-ms-win-", 11) == 0) return 1;
@@ -370,6 +371,12 @@ static void w_GetProcAddress(CPU64 *c, void *ud) {
         for (size_t i = 0; i < g_rt_module_count; i++) {
             if (g_rt_modules[i].map_addr == c->rcx) { c->rax = 0; return; }
         }
+    }
+    if (c->rcx == 0x7090000000ULL) {
+        void *sud = NULL;
+        RTShimFn fn = rt_find_shim(sym, &sud);
+        c->rax = fn ? rt_alloc_dynamic_thunk(sym, fn, sud) : 0;
+        return;
     }
     uint64_t exp = rt_lookup_export(sym);
     if (exp) { c->rax = exp; return; }

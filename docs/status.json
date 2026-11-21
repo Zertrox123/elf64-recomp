@@ -1,11 +1,11 @@
 {
   "libraries": {
     "kernel32": [
-      257,
+      263,
       264
     ],
     "user32": [
-      61,
+      104,
       104
     ],
     "v8": [
@@ -13,7 +13,7 @@
       61
     ],
     "gdi32": [
-      1,
+      38,
       38
     ],
     "ws2_32": [
@@ -21,7 +21,7 @@
       27
     ],
     "advapi32": [
-      18,
+      22,
       22
     ],
     "steam_api64": [
@@ -29,7 +29,7 @@
       21
     ],
     "winmm": [
-      1,
+      12,
       20
     ],
     "wsock32": [
@@ -37,15 +37,15 @@
       13
     ],
     "imm32": [
-      1,
+      11,
       11
     ],
     "ole32": [
-      2,
+      10,
       10
     ],
     "shell32": [
-      4,
+      8,
       8
     ],
     "dbghelp": [
@@ -73,7 +73,7 @@
       4
     ],
     "dsound": [
-      0,
+      2,
       4
     ],
     "version": [
@@ -97,11 +97,11 @@
       1
     ],
     "shlwapi": [
-      0,
+      1,
       1
     ],
     "oleaut32": [
-      0,
+      1,
       1
     ],
     "xaudio2_9redist": [
@@ -140,8 +140,8 @@
     ]
   },
   "summary": {
-    "libraries_pct": 65.54,
-    "libraries_done": 428,
+    "libraries_pct": 84.99,
+    "libraries_done": 555,
     "libraries_total": 653,
     "isa_pct": 87.5,
     "isa_done": 252,

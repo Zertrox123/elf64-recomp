@@ -689,11 +689,100 @@ static void adapter_GetDesc(CPU64 *c, void *ud) {
     DXGIAdapterObj *ad = (DXGIAdapterObj *)(uintptr_t)c->rcx;
     uint64_t dst = c->rdx;
     if (!ad || !dst) { c->rax = E_INVALIDARG_H; return; }
-    memset((void *)(uintptr_t)dst, 0, 304);
+    memset((void *)(uintptr_t)dst, 0, 312);
     const char *name = [[ad->mtl_dev name] UTF8String];
     uint16_t *wname = (uint16_t *)(uintptr_t)dst;
     for (size_t i = 0; name && name[i] && i < 127; i++) wname[i] = (uint8_t)name[i];
     W32(dst + 256, 0x106BU); /* Apple VendorId */
+    W32(dst + 260, 0x0001U); /* DeviceId */
+    W64(dst + 272, 4ULL * 1024 * 1024 * 1024); /* DedicatedVideoMemory: 4 GiB */
+    W64(dst + 288, 8ULL * 1024 * 1024 * 1024); /* SharedSystemMemory: 8 GiB */
+    c->rax = S_OK_HR;
+}
+
+static uint64_t g_vt_output[16];
+static void output_GetDesc(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t dst = c->rdx;
+    if (!dst) { c->rax = E_INVALIDARG_H; return; }
+    memset((void *)(uintptr_t)dst, 0, 96);
+    const char *dn = "\\\\.\\DISPLAY1";
+    uint16_t *w = (uint16_t *)(uintptr_t)dst;
+    for (size_t i = 0; dn[i]; i++) w[i] = (uint8_t)dn[i];
+    W32(dst + 64, 0); W32(dst + 68, 0); W32(dst + 72, 1920); W32(dst + 76, 1080);
+    W32(dst + 80, 1); /* AttachedToDesktop */
+    W32(dst + 84, 1); /* DXGI_MODE_ROTATION_IDENTITY */
+    W64(dst + 88, 0x1001ULL); /* Monitor */
+    c->rax = S_OK_HR;
+}
+static void output_GetDisplayModeList(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t fmt = (uint32_t)c->rdx;
+    uint64_t p_num = c->r9;
+    uint64_t p_desc = win64_arg_i(c, 4);
+    static const struct { uint32_t w, h; } modes[] = { {1280, 720}, {1600, 900}, {1920, 1080} };
+    if (!p_num) { c->rax = E_INVALIDARG_H; return; }
+    if (!p_desc) { W32(p_num, 3); c->rax = S_OK_HR; return; }
+    uint32_t cap = R32(p_num);
+    uint32_t n = cap < 3 ? cap : 3;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t d = p_desc + i * 28ULL;
+        memset((void *)(uintptr_t)d, 0, 28);
+        W32(d + 0, modes[i].w); W32(d + 4, modes[i].h);
+        W32(d + 8, 60); W32(d + 12, 1);
+        W32(d + 16, fmt ? fmt : 28);
+    }
+    W32(p_num, n);
+    c->rax = S_OK_HR;
+}
+static void adapter_EnumOutputs(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t idx = (uint32_t)c->rdx;
+    uint64_t out_va = c->r8;
+    if (idx > 0 || !out_va) { c->rax = 0x887A0002U; return; }
+    ComBase *o = (ComBase *)calloc(1, sizeof(ComBase));
+    o->lpVtbl = g_vt_output; o->kind = COM_GENERIC_STATE; o->refcount = 1;
+    W64(out_va, (uint64_t)(uintptr_t)o);
+    c->rax = S_OK_HR;
+}
+static void factory_CreateSwapChain(CPU64 *c, void *ud) {
+    (void)ud;
+    D3D11DeviceObj *dev = (D3D11DeviceObj *)(uintptr_t)c->rdx;
+    uint64_t sc_desc_va = c->r8;
+    uint64_t pp_sc = c->r9;
+    if (!dev || !pp_sc) { c->rax = E_INVALIDARG_H; return; }
+    uint32_t w = sc_desc_va ? R32(sc_desc_va + 0) : 1280;
+    uint32_t h = sc_desc_va ? R32(sc_desc_va + 4) : 720;
+    uint32_t fmt = sc_desc_va ? R32(sc_desc_va + 16) : 28;
+    uint64_t hwnd = sc_desc_va ? R64(sc_desc_va + 48) : 0;
+    if (w == 0) w = 1280;
+    if (h == 0) h = 720;
+    DXGISwapChainObj *sc = (DXGISwapChainObj *)calloc(1, sizeof(DXGISwapChainObj));
+    sc->base.lpVtbl = g_vt_swapchain; sc->base.kind = COM_SWAPCHAIN; sc->base.refcount = 1;
+    sc->dev = dev; sc->width = w; sc->height = h;
+    sc->backbuffer = create_tex2d_internal(dev, w, h, fmt, 0, NULL, 0);
+    SDL_Window *win = win32_hwnd_to_sdl(hwnd);
+    if (win) {
+        sc->metal_view = SDL_Metal_CreateView(win);
+        if (sc->metal_view) {
+            sc->metal_layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(sc->metal_view);
+            sc->metal_layer.device = dev->mtl_dev;
+            sc->metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            sc->metal_layer.drawableSize = CGSizeMake(w, h);
+        }
+    }
+    W64(pp_sc, (uint64_t)(uintptr_t)sc);
+    c->rax = S_OK_HR;
+}
+static void dev_CheckFormatSupport(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r8) W32(c->r8, 0x00FFFFFFU);
+    c->rax = S_OK_HR;
+}
+static void dev_CheckMultisampleQualityLevels(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t samples = (uint32_t)c->r8;
+    if (c->r9) W32(c->r9, (samples <= 4) ? 1U : 0U);
     c->rax = S_OK_HR;
 }
 
@@ -723,17 +812,20 @@ static void init_d3d11_vtables(void) {
     for (size_t i = 0; i < 20; i++)  g_vt_swapchain[i] = t_ok;
     for (size_t i = 0; i < 16; i++)  g_vt_factory[i] = t_ok;
     for (size_t i = 0; i < 16; i++)  g_vt_adapter[i] = t_ok;
+    for (size_t i = 0; i < 16; i++)  g_vt_output[i]  = t_ok;
     for (size_t i = 0; i < 16; i++)  g_vt_generic[i] = t_ok;
 
     #define SET_IUNK(vt) do { (vt)[0]=t_qi; (vt)[1]=t_add; (vt)[2]=t_rel; } while(0)
     SET_IUNK(g_vt_device); SET_IUNK(g_vt_context); SET_IUNK(g_vt_swapchain);
-    SET_IUNK(g_vt_factory); SET_IUNK(g_vt_adapter); SET_IUNK(g_vt_generic);
+    SET_IUNK(g_vt_factory); SET_IUNK(g_vt_adapter); SET_IUNK(g_vt_output); SET_IUNK(g_vt_generic);
     #undef SET_IUNK
 
     /* ID3D11Device slots */
     g_vt_device[3]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateBuffer", dev_CreateBuffer, NULL);
     g_vt_device[5]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateTexture2D", dev_CreateTexture2D, NULL);
+    g_vt_device[7]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateShaderResourceView", dev_CreateGenericState, NULL);
     g_vt_device[9]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateRenderTargetView", dev_CreateRenderTargetView, NULL);
+    g_vt_device[10] = rt_alloc_dynamic_thunk("ID3D11Device::CreateDepthStencilView", dev_CreateGenericState, NULL);
     g_vt_device[11] = rt_alloc_dynamic_thunk("ID3D11Device::CreateInputLayout", dev_CreateInputLayout, NULL);
     g_vt_device[12] = rt_alloc_dynamic_thunk("ID3D11Device::CreateVertexShader", dev_CreateVertexShader, NULL);
     g_vt_device[15] = rt_alloc_dynamic_thunk("ID3D11Device::CreatePixelShader", dev_CreatePixelShader, NULL);
@@ -741,6 +833,8 @@ static void init_d3d11_vtables(void) {
     g_vt_device[21] = rt_alloc_dynamic_thunk("ID3D11Device::CreateDepthStencilState", dev_CreateGenericState, NULL);
     g_vt_device[22] = rt_alloc_dynamic_thunk("ID3D11Device::CreateRasterizerState", dev_CreateGenericState, NULL);
     g_vt_device[23] = rt_alloc_dynamic_thunk("ID3D11Device::CreateSamplerState", dev_CreateGenericState, NULL);
+    g_vt_device[29] = rt_alloc_dynamic_thunk("ID3D11Device::CheckFormatSupport", dev_CheckFormatSupport, NULL);
+    g_vt_device[30] = rt_alloc_dynamic_thunk("ID3D11Device::CheckMultisampleQualityLevels", dev_CheckMultisampleQualityLevels, NULL);
     g_vt_device[37] = rt_alloc_dynamic_thunk("ID3D11Device::GetFeatureLevel", dev_GetFeatureLevel, NULL);
     g_vt_device[40] = rt_alloc_dynamic_thunk("ID3D11Device::GetImmediateContext", dev_GetImmediateContext, NULL);
 
@@ -763,11 +857,17 @@ static void init_d3d11_vtables(void) {
     g_vt_context[48] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::UpdateSubresource", ctx_UpdateSubresource, NULL);
     g_vt_context[50] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ClearRenderTargetView", ctx_ClearRenderTargetView, NULL);
 
-    /* IDXGISwapChain / IDXGIAdapter / IDXGIFactory slots */
+    /* IDXGISwapChain / IDXGIAdapter / IDXGIOutput / IDXGIFactory slots */
     g_vt_swapchain[8] = rt_alloc_dynamic_thunk("IDXGISwapChain::Present", sc_Present, NULL);
     g_vt_swapchain[9] = rt_alloc_dynamic_thunk("IDXGISwapChain::GetBuffer", sc_GetBuffer, NULL);
+    g_vt_adapter[7]   = rt_alloc_dynamic_thunk("IDXGIAdapter::EnumOutputs", adapter_EnumOutputs, NULL);
     g_vt_adapter[8]   = rt_alloc_dynamic_thunk("IDXGIAdapter::GetDesc", adapter_GetDesc, NULL);
+    g_vt_adapter[10]  = rt_alloc_dynamic_thunk("IDXGIAdapter1::GetDesc1", adapter_GetDesc, NULL);
+    g_vt_output[7]    = rt_alloc_dynamic_thunk("IDXGIOutput::GetDesc", output_GetDesc, NULL);
+    g_vt_output[8]    = rt_alloc_dynamic_thunk("IDXGIOutput::GetDisplayModeList", output_GetDisplayModeList, NULL);
     g_vt_factory[7]   = rt_alloc_dynamic_thunk("IDXGIFactory::EnumAdapters", factory_EnumAdapters, NULL);
+    g_vt_factory[10]  = rt_alloc_dynamic_thunk("IDXGIFactory::CreateSwapChain", factory_CreateSwapChain, NULL);
+    g_vt_factory[12]  = rt_alloc_dynamic_thunk("IDXGIFactory1::EnumAdapters1", factory_EnumAdapters, NULL);
 
     g_vt_ready = 1;
 }
