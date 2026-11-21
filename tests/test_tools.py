@@ -52,6 +52,13 @@ class TestLift64(unittest.TestCase):
         self.assertEqual(unimpl, [])
         self.assertIn("__atomic_fetch_add", code)
 
+    def test_cmpxchg16b(self):
+        ins = lift64.Insn(0x1000, 5, "lock cmpxchg16b xmmword ptr [r9]", "lock", "cmpxchg16b", ["xmmword ptr [r9]"])
+        unimpl = []
+        code = lift64.lift_insn(ins, {0x1000}, False, unimpl)
+        self.assertEqual(unimpl, [])
+        self.assertIn("__atomic_compare_exchange_n((__uint128_t *)", code)
+
     def test_sse_scalar_and_packed(self):
         for txt in ("addsd xmm0, xmm1", "mulss xmm2, dword ptr [rdi]", "xorps xmm0, xmm0", "pshufd xmm0, xmm1, 0xe4"):
             pfx, mnem, ops = lift64.parse_insn_text(txt)

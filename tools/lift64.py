@@ -933,6 +933,22 @@ def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List
         return "c->rdx = ((int64_t)c->rax < 0) ? ~0ULL : 0ULL;"
 
     # Atomics (lock prefix or cmpxchg/xadd)
+    if m == "cmpxchg16b":
+        mm = parse_mem(ops[0], nr)
+        return (
+            f"{{ __uint128_t _exp = ((__uint128_t)c->rdx << 64) | c->rax; "
+            f"__uint128_t _des = ((__uint128_t)c->rcx << 64) | c->rbx; "
+            f"int _ok = __atomic_compare_exchange_n((__uint128_t *)(uintptr_t)({mm[1]}), &_exp, _des, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); "
+            f"c->zf = (uint8_t)_ok; if (!_ok) {{ c->rax = (uint64_t)_exp; c->rdx = (uint64_t)(_exp >> 64); }} }}"
+        )
+    if m == "cmpxchg8b":
+        mm = parse_mem(ops[0], nr)
+        return (
+            f"{{ uint64_t _exp = ((uint64_t)GET32(c->rdx) << 32) | GET32(c->rax); "
+            f"uint64_t _des = ((uint64_t)GET32(c->rcx) << 32) | GET32(c->rbx); "
+            f"int _ok = __atomic_compare_exchange_n((uint64_t *)(uintptr_t)({mm[1]}), &_exp, _des, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); "
+            f"c->zf = (uint8_t)_ok; if (!_ok) {{ SET32(c->rax, _exp); SET32(c->rdx, _exp >> 32); }} }}"
+        )
     if m == "cmpxchg":
         w = infer_width(ops, nr, 64)
         mm = parse_mem(ops[0], nr)

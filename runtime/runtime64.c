@@ -286,8 +286,9 @@ void rt_init_thread_cpu(CPU64 *c, size_t stack_size) {
     if (g_rt_is_win64) {
         uint8_t *teb = (uint8_t *)calloc(1, 0x2000);
         uint8_t *peb = (uint8_t *)calloc(1, 0x1000);
+        uint8_t *pparams = (uint8_t *)calloc(1, 0x400);
         uint64_t *tls_arr = (uint64_t *)calloc(g_rt_module_count + 16, sizeof(uint64_t));
-        if (!teb || !peb || !tls_arr) abort();
+        if (!teb || !peb || !pparams || !tls_arr) abort();
         for (size_t i = 0; i < g_rt_module_count; i++) {
             const RTModuleSpec *m = &g_rt_modules[i];
             size_t bsz = (m->tls_memsz > 0) ? (size_t)m->tls_memsz : 64;
@@ -309,6 +310,7 @@ void rt_init_thread_cpu(CPU64 *c, size_t stack_size) {
         W64(teb_va + 0x58, (uint64_t)(uintptr_t)tls_arr);  /* TEB.ThreadLocalStoragePointer */
         W64(teb_va + 0x60, peb_va);                        /* TEB.ProcessEnvironmentBlock */
         W64(peb_va + 0x10, g_rt_module_count > 0 ? g_rt_modules[0].map_addr : 0); /* PEB.ImageBaseAddress */
+        W64(peb_va + 0x20, (uint64_t)(uintptr_t)pparams);  /* PEB.ProcessParameters */
         c->gs_base = teb_va;
     }
     g_tls_cpu = c;

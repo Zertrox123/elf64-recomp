@@ -219,17 +219,91 @@ static void w_HeapFree(CPU64 *c, void *ud) {
     free((void *)(uintptr_t)c->r8);
     c->rax = 1;
 }
+typedef struct { uint64_t base; size_t size; } VmRegion;
+static pthread_mutex_t g_vm_mu = PTHREAD_MUTEX_INITIALIZER;
+static VmRegion *g_vm_regs = NULL;
+static size_t    g_vm_n = 0, g_vm_cap = 0;
+
+static void vm_track_add(uint64_t base, size_t size) {
+    pthread_mutex_lock(&g_vm_mu);
+    if (g_vm_n == g_vm_cap) {
+        g_vm_cap = g_vm_cap ? g_vm_cap * 2 : 64;
+        g_vm_regs = (VmRegion *)realloc(g_vm_regs, g_vm_cap * sizeof(VmRegion));
+    }
+    g_vm_regs[g_vm_n].base = base;
+    g_vm_regs[g_vm_n].size = size;
+    g_vm_n++;
+    pthread_mutex_unlock(&g_vm_mu);
+}
+
+static int vm_contains(uint64_t addr) {
+    pthread_mutex_lock(&g_vm_mu);
+    for (size_t i = 0; i < g_vm_n; i++) {
+        if (addr >= g_vm_regs[i].base && addr < g_vm_regs[i].base + g_vm_regs[i].size) {
+            pthread_mutex_unlock(&g_vm_mu);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_vm_mu);
+    return 0;
+}
+
+static size_t vm_track_remove(uint64_t base) {
+    pthread_mutex_lock(&g_vm_mu);
+    for (size_t i = 0; i < g_vm_n; i++) {
+        if (g_vm_regs[i].base == base) {
+            size_t sz = g_vm_regs[i].size;
+            g_vm_regs[i] = g_vm_regs[--g_vm_n];
+            pthread_mutex_unlock(&g_vm_mu);
+            return sz;
+        }
+    }
+    pthread_mutex_unlock(&g_vm_mu);
+    return 0;
+}
+
 static void w_VirtualAlloc(CPU64 *c, void *ud) {
     (void)ud;
-    size_t sz = (size_t)c->rdx;
-    if (sz == 0) sz = 0x4000;
-    void *p = mmap((void *)(uintptr_t)c->rcx, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    c->rax = (p == MAP_FAILED) ? 0ULL : (uint64_t)(uintptr_t)p;
+    uint64_t req_addr = c->rcx;
+    size_t   sz       = (size_t)c->rdx;
+    uint32_t fl_type  = (uint32_t)c->r8;
+    if (sz == 0) sz = 0x10000;
+    sz = (sz + 0x3FFFULL) & ~0x3FFFULL;
+
+    /* MEM_COMMIT (0x1000) without MEM_RESERVE (0x2000) inside an already-reserved region. */
+    if ((fl_type & 0x1000) && !(fl_type & 0x2000) && req_addr && vm_contains(req_addr)) {
+        c->rax = req_addr & ~0x3FFFULL;
+        return;
+    }
+
+    /* Windows VirtualAlloc guarantees >=64 KiB alignment; align >=4 MiB requests to 4 MiB
+     * (satisfies mimalloc 4 MiB / 8 MiB segment alignment on the first try). */
+    size_t align = 0x10000;
+    if (sz >= 0x400000) align = 0x400000;
+    if (sz >= 0x800000) align = 0x800000;
+
+    size_t total = sz + align;
+    void *raw = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (raw == MAP_FAILED) { c->rax = 0; return; }
+    uint64_t raw_u = (uint64_t)(uintptr_t)raw;
+    uint64_t aligned = (raw_u + align - 1ULL) & ~(uint64_t)(align - 1ULL);
+    if (aligned > raw_u) munmap((void *)(uintptr_t)raw_u, (size_t)(aligned - raw_u));
+    uint64_t end_u = raw_u + total;
+    if (end_u > aligned + sz) munmap((void *)(uintptr_t)(aligned + sz), (size_t)(end_u - (aligned + sz)));
+
+    vm_track_add(aligned, sz);
+    c->rax = aligned;
 }
 static void w_VirtualFree(CPU64 *c, void *ud) {
     (void)ud;
+    uint64_t addr = c->rcx;
     size_t sz = (size_t)c->rdx;
-    if (c->rcx && sz) munmap((void *)(uintptr_t)c->rcx, sz);
+    uint32_t fl = (uint32_t)c->r8;
+    if ((fl & 0x8000 /* MEM_RELEASE */) && addr) {
+        size_t tracked = vm_track_remove(addr);
+        if (tracked) munmap((void *)(uintptr_t)addr, tracked);
+        else if (sz) munmap((void *)(uintptr_t)addr, sz);
+    }
     c->rax = 1;
 }
 static void w_VirtualProtect(CPU64 *c, void *ud) {
