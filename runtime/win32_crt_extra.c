@@ -4,7 +4,9 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <netdb.h>
@@ -48,6 +50,17 @@ static size_t u8_to_w16(const char *src, uint16_t *dst, size_t cap) {
     while (*src && out + 1 < cap) dst[out++] = (uint8_t)*src++;
     if (cap) dst[out] = 0;
     return out;
+}
+
+static size_t posix_to_win_path(const char *px, char *out, size_t cap) {
+    if (!px || cap < 4) { if (cap) out[0] = '\0'; return 0; }
+    size_t j = 0;
+    if (px[0] == '/') { out[j++] = 'C'; out[j++] = ':'; }
+    for (size_t i = 0; px[i] && j + 1 < cap; i++) {
+        out[j++] = (px[i] == '/') ? '\\' : px[i];
+    }
+    out[j] = '\0';
+    return j;
 }
 
 static void win_path_to_posix(const char *in, char *out, size_t cap) {
@@ -421,24 +434,34 @@ static void w_RtlCaptureStackBackTrace(CPU64 *c, void *ud)    { (void)ud; c->rax
 static void w_RtlLookupFunctionEntry(CPU64 *c, void *ud)      { (void)ud; c->rax = 0; }
 static void w_RtlCaptureContext(CPU64 *c, void *ud)           { (void)ud; if (c->rcx) memset((void *)(uintptr_t)c->rcx, 0, 1232); }
 static void w_RtlPcToFileHeader(CPU64 *c, void *ud)           { (void)ud; if (c->rdx) W64(c->rdx, 0); c->rax = 0; }
-static void w_TerminateProcess(CPU64 *c, void *ud)            { (void)ud; c->exit_code = (int)c->rdx; c->halted = 1; c->rax = 1; }
+static void w_TerminateProcess(CPU64 *c, void *ud) {
+    (void)ud;
+    if (getenv("ELF64_TRACE")) {
+        fprintf(stderr, "[win32] TerminateProcess(code=%d) caller=0x%llx\n",
+                (int)c->rdx, (unsigned long long)R64(c->rsp));
+        void *bt[16];
+        int n = backtrace(bt, 16);
+        backtrace_symbols_fd(bt, n, 2);
+    }
+    c->exit_code = (int)c->rdx; c->halted = 1; c->rax = 1;
+}
 static void w_ExitThread(CPU64 *c, void *ud)                  { (void)ud; c->halted = 1; }
 
 /* ---- Filesystem (CreateFileA/W, ReadFile, GetFileAttributesA/W, Dir, Paths) ---- */
 static void w_GetCurrentDirectoryA(CPU64 *c, void *ud) {
     (void)ud;
-    char cwd[1024];
+    char cwd[1024], win[1024];
     if (!getcwd(cwd, sizeof(cwd))) { c->rax = 0; return; }
-    size_t n = strlen(cwd);
-    if (c->rdx && c->rcx > n) { memcpy((void *)(uintptr_t)c->rdx, cwd, n + 1); c->rax = n; }
+    size_t n = posix_to_win_path(cwd, win, sizeof(win));
+    if (c->rdx && c->rcx > n) { memcpy((void *)(uintptr_t)c->rdx, win, n + 1); c->rax = n; }
     else c->rax = n + 1;
 }
 static void w_GetCurrentDirectoryW(CPU64 *c, void *ud) {
     (void)ud;
-    char cwd[1024];
+    char cwd[1024], win[1024];
     if (!getcwd(cwd, sizeof(cwd))) { c->rax = 0; return; }
-    size_t n = strlen(cwd);
-    if (c->rdx && c->rcx > n) c->rax = u8_to_w16(cwd, (uint16_t *)(uintptr_t)c->rdx, (size_t)c->rcx);
+    size_t n = posix_to_win_path(cwd, win, sizeof(win));
+    if (c->rdx && c->rcx > n) c->rax = u8_to_w16(win, (uint16_t *)(uintptr_t)c->rdx, (size_t)c->rcx);
     else c->rax = n + 1;
 }
 static void w_SetCurrentDirectoryW(CPU64 *c, void *ud) {
@@ -450,13 +473,13 @@ static void w_SetCurrentDirectoryW(CPU64 *c, void *ud) {
 }
 static void w_GetFullPathNameW(CPU64 *c, void *ud) {
     (void)ud;
-    char u8[1024], px[1024], resolved[1024];
+    char u8[1024], px[1024], resolved[1024], win[1024];
     w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, u8, sizeof(u8));
     win_path_to_posix(u8, px, sizeof(px));
     const char *res = realpath(px, resolved) ? resolved : px;
-    size_t n = strlen(res);
+    size_t n = posix_to_win_path(res, win, sizeof(win));
     if (c->r8 && c->rdx > n) {
-        u8_to_w16(res, (uint16_t *)(uintptr_t)c->r8, (size_t)c->rdx);
+        u8_to_w16(win, (uint16_t *)(uintptr_t)c->r8, (size_t)c->rdx);
         if (c->r9) {
             uint16_t *wbuf = (uint16_t *)(uintptr_t)c->r8;
             uint16_t *last = wbuf;
@@ -566,9 +589,18 @@ static void w_ReadFile(CPU64 *c, void *ud) {
     (void)ud;
     int fd = (c->rcx == 1) ? STDIN_FILENO : ((c->rcx >= 0x20000ULL && c->rcx < 0x30000ULL) ? (int)(c->rcx - 0x20000ULL) : -1);
     if (fd < 0) { c->rax = 0; return; }
-    ssize_t n = read(fd, (void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8);
+    uint64_t ov = win64_arg_i(c, 4);
+    ssize_t n;
+    if (ov) {
+        uint64_t off = (uint64_t)R32(ov + 16) | ((uint64_t)R32(ov + 20) << 32);
+        n = pread(fd, (void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8, (off_t)off);
+        if (n >= 0) { W64(ov + 0, 0); W64(ov + 8, (uint64_t)n); }
+    } else {
+        n = read(fd, (void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8);
+    }
     if (getenv("ELF64_TRACE")) {
-        fprintf(stderr, "[fs] read(fd=%d, len=%u) -> %zd\n", fd, (uint32_t)c->r8, n);
+        fprintf(stderr, "[fs] read(fd=%d, len=%u, ov=0x%llx) -> %zd\n",
+                fd, (uint32_t)c->r8, (unsigned long long)ov, n);
     }
     if (c->r9) W32(c->r9, n >= 0 ? (uint32_t)n : 0);
     c->rax = (n >= 0) ? 1 : 0;
@@ -968,6 +1000,203 @@ static void w_SteamAPI_GetSteamInstallPath(CPU64 *c, void *ud) {
         snprintf(path, sizeof(path), "%s/Library/Application Support/Steam", home ? home : "");
     }
     c->rax = (uint64_t)(uintptr_t)path;
+}
+
+/* ---- Native macOS ARM64 libsteam_api.dylib bridge ---- */
+static void *g_steam_dl = NULL;
+static int   g_steam_dl_tried = 0;
+static uint64_t g_steam_ctx_gen = 1;
+static uint64_t g_steam_vt[64];
+static int      g_steam_vt_init = 0;
+
+typedef struct {
+    uint64_t *lpVtbl;
+    void     *real_obj;
+    char      ver[48];
+} SteamProxy;
+
+static SteamProxy *g_steam_proxies[64];
+static int g_steam_proxy_cnt = 0;
+static pthread_mutex_t g_steam_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *steam_dl(void) {
+    if (g_steam_dl_tried) return g_steam_dl;
+    g_steam_dl_tried = 1;
+    const char *env = getenv("ELF64_STEAM_DYLIB");
+    if (env && *env) g_steam_dl = dlopen(env, RTLD_LAZY | RTLD_LOCAL);
+    if (!g_steam_dl) {
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            char p[1024];
+            snprintf(p, sizeof(p),
+                     "%s/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/"
+                     "Frameworks/Steam Helper.app/Contents/MacOS/libsteam_api.dylib", home);
+            g_steam_dl = dlopen(p, RTLD_LAZY | RTLD_LOCAL);
+        }
+    }
+    return g_steam_dl;
+}
+
+static uint64_t steam_wrap_iface(void *real_obj, const char *ver);
+
+static int looks_like_steam_ver(uint64_t va) {
+    if (va < 0x100000ULL) return 0;
+    const char *s = (const char *)(uintptr_t)va;
+    return (strncmp(s, "Steam", 5) == 0 || strncmp(s, "STEAM", 5) == 0);
+}
+
+static void steam_vt_trampoline(CPU64 *c, void *ud) {
+    size_t slot = (size_t)(uintptr_t)ud;
+    SteamProxy *px = (SteamProxy *)(uintptr_t)c->rcx;
+    if (!px || !px->real_obj) { c->rax = 0; return; }
+    void **rvt = *(void ***)px->real_obj;
+    typedef uint64_t (*Arm64Fn)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t, uint64_t);
+    Arm64Fn fn = (Arm64Fn)rvt[slot];
+    int is_csteamid_sret =
+        ((strncmp(px->ver, "SteamUser", 9) == 0 && px->ver[9] >= '0' && px->ver[9] <= '9' && slot == 2) ||
+         (strncmp(px->ver, "SteamApps", 9) == 0 && slot == 17));
+    if (is_csteamid_sret) {
+        uint64_t id = fn((uint64_t)(uintptr_t)px->real_obj, c->r8, c->r9,
+                         win64_arg_i(c, 4), win64_arg_i(c, 5), win64_arg_i(c, 6), 0, 0);
+        if (c->rdx) W64(c->rdx, id);
+        c->rax = c->rdx;
+        return;
+    }
+    uint64_t r = fn((uint64_t)(uintptr_t)px->real_obj, c->rdx, c->r8, c->r9,
+                    win64_arg_i(c, 4), win64_arg_i(c, 5), win64_arg_i(c, 6), win64_arg_i(c, 7));
+    if (r && strncmp(px->ver, "SteamClient", 11) == 0) {
+        const char *subver = NULL;
+        if (looks_like_steam_ver(c->r9)) subver = (const char *)(uintptr_t)c->r9;
+        else if (looks_like_steam_ver(c->r8)) subver = (const char *)(uintptr_t)c->r8;
+        if (subver) r = steam_wrap_iface((void *)(uintptr_t)r, subver);
+    }
+    c->rax = r;
+}
+
+static uint64_t steam_wrap_iface(void *real_obj, const char *ver) {
+    if (!real_obj) return 0;
+    pthread_mutex_lock(&g_steam_mu);
+    if (!g_steam_vt_init) {
+        for (size_t i = 0; i < 64; i++) {
+            g_steam_vt[i] = rt_alloc_dynamic_thunk("ISteam::vcall", steam_vt_trampoline, (void *)(uintptr_t)i);
+        }
+        g_steam_vt_init = 1;
+    }
+    for (int i = 0; i < g_steam_proxy_cnt; i++) {
+        if (g_steam_proxies[i]->real_obj == real_obj) {
+            uint64_t res = (uint64_t)(uintptr_t)g_steam_proxies[i];
+            pthread_mutex_unlock(&g_steam_mu);
+            return res;
+        }
+    }
+    SteamProxy *px = (SteamProxy *)calloc(1, sizeof(SteamProxy));
+    px->lpVtbl = g_steam_vt;
+    px->real_obj = real_obj;
+    if (ver) snprintf(px->ver, sizeof(px->ver), "%s", ver);
+    if (g_steam_proxy_cnt < 64) g_steam_proxies[g_steam_proxy_cnt++] = px;
+    pthread_mutex_unlock(&g_steam_mu);
+    return (uint64_t)(uintptr_t)px;
+}
+
+static void ensure_steam_appid_env(void) {
+    if (getenv("SteamAppId") && getenv("SteamAppId")[0]) return;
+    const char *root = getenv("ELF64_WIN_ROOT");
+    if (!root || !*root) return;
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/steam_appid.txt", root);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    char buf[32] = {0};
+    if (fgets(buf, sizeof(buf), f)) {
+        char *nl = strpbrk(buf, "\r\n \t");
+        if (nl) *nl = '\0';
+        if (buf[0]) { setenv("SteamAppId", buf, 0); setenv("SteamGameId", buf, 0); }
+    }
+    fclose(f);
+}
+
+static void w_SteamAPI_InitSafe(CPU64 *c, void *ud) {
+    (void)ud;
+    void *dl = steam_dl();
+    if (!dl) { c->rax = 0; return; }
+    ensure_steam_appid_env();
+    typedef bool (*Fn)(void);
+    Fn fn = (Fn)dlsym(dl, "SteamAPI_InitSafe");
+    bool ok = fn ? fn() : false;
+    if (ok) g_steam_ctx_gen++;
+    c->rax = ok ? 1 : 0;
+}
+static void w_SteamAPI_Shutdown(CPU64 *c, void *ud) {
+    (void)ud;
+    void *dl = steam_dl();
+    typedef void (*Fn)(void);
+    Fn fn = dl ? (Fn)dlsym(dl, "SteamAPI_Shutdown") : NULL;
+    if (fn) fn();
+    c->rax = 0;
+}
+static void w_SteamAPI_RunCallbacks(CPU64 *c, void *ud) {
+    (void)ud;
+    void *dl = steam_dl();
+    typedef void (*Fn)(void);
+    Fn fn = dl ? (Fn)dlsym(dl, "SteamAPI_RunCallbacks") : NULL;
+    if (fn) fn();
+    c->rax = 0;
+}
+static void w_SteamAPI_GetHSteamUser(CPU64 *c, void *ud) {
+    (void)ud;
+    void *dl = steam_dl();
+    typedef int32_t (*Fn)(void);
+    Fn fn = dl ? (Fn)dlsym(dl, "SteamAPI_GetHSteamUser") : NULL;
+    c->rax = fn ? (uint64_t)(uint32_t)fn() : 0;
+}
+static void w_SteamAPI_GetHSteamPipe(CPU64 *c, void *ud) {
+    (void)ud;
+    void *dl = steam_dl();
+    typedef int32_t (*Fn)(void);
+    Fn fn = dl ? (Fn)dlsym(dl, "SteamAPI_GetHSteamPipe") : NULL;
+    c->rax = fn ? (uint64_t)(uint32_t)fn() : 0;
+}
+static void w_SteamInternal_CreateInterface(CPU64 *c, void *ud) {
+    (void)ud;
+    void *dl = steam_dl();
+    const char *ver = (const char *)(uintptr_t)c->rcx;
+    typedef void *(*Fn)(const char *);
+    Fn fn = dl ? (Fn)dlsym(dl, "SteamInternal_CreateInterface") : NULL;
+    void *obj = (fn && ver) ? fn(ver) : NULL;
+    c->rax = steam_wrap_iface(obj, ver);
+}
+static void w_SteamInternal_FindOrCreateUserInterface(CPU64 *c, void *ud) {
+    (void)ud;
+    void *dl = steam_dl();
+    int32_t huser = (int32_t)c->rcx;
+    const char *ver = (const char *)(uintptr_t)c->rdx;
+    typedef void *(*Fn)(int32_t, const char *);
+    Fn fn = dl ? (Fn)dlsym(dl, "SteamInternal_FindOrCreateUserInterface") : NULL;
+    void *obj = (fn && ver) ? fn(huser, ver) : NULL;
+    c->rax = steam_wrap_iface(obj, ver);
+}
+static void w_SteamInternal_ContextInit(CPU64 *c, void *ud) {
+    (void)ud;
+    /* Steamworks ContextInitData: [0]=guest init_fn, [8]=counter, [16]=interface_ptr(s). */
+    uint64_t ctx = c->rcx;
+    if (!ctx) { c->rax = 0; return; }
+    uint64_t init_fn = R64(ctx);
+    uint64_t gen = R64(ctx + 8);
+    if (gen != g_steam_ctx_gen) {
+        W64(ctx + 8, g_steam_ctx_gen);
+        W64(ctx + 16, 0);
+        if (init_fn) {
+            uint64_t saved_rcx = c->rcx, saved_rsp = c->rsp;
+            c->rcx = ctx + 16;
+            c->rsp = (c->rsp - 48ULL) & ~15ULL;
+            push64(c, 0ULL);
+            rt_call(c, init_fn);
+            c->rsp = saved_rsp;
+            c->rcx = saved_rcx;
+        }
+    }
+    c->rax = ctx + 16;
 }
 static void w_CreateMutexA(CPU64 *c, void *ud)     { (void)ud; c->rax = 0x30001ULL; }
 static void w_CreateSemaphoreA(CPU64 *c, void *ud) { (void)ud; c->rax = 0x30002ULL; }
@@ -1567,6 +1796,40 @@ static void w_SHGetSpecialFolderPathA(CPU64 *c, void *ud) {
     }
     c->rax = 1;
 }
+static void w_wsa_htonl(CPU64 *c, void *ud) { (void)ud; c->rax = htonl((uint32_t)c->rcx); }
+static void w_CompareStringEx(CPU64 *c, void *ud) {
+    (void)ud;
+    const uint16_t *a = (const uint16_t *)(uintptr_t)c->r8;
+    int alen = (int)c->r9;
+    const uint16_t *b = (const uint16_t *)(uintptr_t)win64_arg_i(c, 4);
+    int blen = (int)win64_arg_i(c, 5);
+    if (!a || !b) { c->rax = 2; return; }
+    int i = 0;
+    for (;;) {
+        int ea = (alen >= 0) ? (i >= alen) : (a[i] == 0);
+        int eb = (blen >= 0) ? (i >= blen) : (b[i] == 0);
+        if (ea && eb) { c->rax = 2; return; }
+        if (ea) { c->rax = 1; return; }
+        if (eb) { c->rax = 3; return; }
+        if (a[i] != b[i]) { c->rax = (a[i] < b[i]) ? 1 : 3; return; }
+        i++;
+    }
+}
+static void w_GetKeyboardState(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) memset((void *)(uintptr_t)c->rcx, 0, 256);
+    c->rax = 1;
+}
+static void w_GetWindowInfo(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) {
+        memset((void *)(uintptr_t)c->rdx, 0, 60);
+        W32(c->rdx + 0, 60);
+        W32(c->rdx + 12, 1280); W32(c->rdx + 16, 720);
+        W32(c->rdx + 28, 1280); W32(c->rdx + 32, 720);
+    }
+    c->rax = 1;
+}
 
 void rt_register_win32_extra(void) {
     #define REG(name, fn) rt_register_shim(name, fn, NULL)
@@ -1674,8 +1937,9 @@ void rt_register_win32_extra(void) {
     REG("CryptAcquireContextA", w_CryptAcquireContextA); REG("CryptAcquireContextW", w_CryptAcquireContextA);
     REG("CryptGenRandom", w_CryptGenRandom); REG("CryptReleaseContext", w_CryptReleaseContext);
     REG("SHGetFileInfoW", w_ret_0);
-    REG("SteamAPI_InitSafe", w_ret_0); REG("SteamAPI_GetHSteamUser", w_ret_0);
-    REG("SteamInternal_ContextInit", w_ret_0); REG("SteamInternal_FindOrCreateUserInterface", w_ret_0);
+    REG("SteamAPI_InitSafe", w_SteamAPI_InitSafe); REG("SteamAPI_GetHSteamUser", w_SteamAPI_GetHSteamUser);
+    REG("SteamInternal_ContextInit", w_SteamInternal_ContextInit);
+    REG("SteamInternal_FindOrCreateUserInterface", w_SteamInternal_FindOrCreateUserInterface);
     REG("GetStringTypeW", w_GetStringTypeW); REG("LCMapStringEx", w_LCMapStringEx);
     REG("LCMapStringW", w_LCMapStringW); REG("CompareStringW", w_CompareStringW);
     REG("GetLocaleInfoW", w_ret_0); REG("GetUserDefaultLCID", w_ret_0);
@@ -1771,11 +2035,11 @@ void rt_register_win32_extra(void) {
     REG("InternetCloseHandle", w_ret_1); REG("InternetCrackUrlA", w_ret_0);
     REG("HttpQueryInfoA", w_ret_0); REG("InternetSetStatusCallback", w_ret_0);
     REG("VideoPlaybackInitialize", w_ret_0); REG("VideoPlaybackShutdown", w_ret_0);
-    REG("SteamAPI_RestartAppIfNecessary", w_ret_0); REG("SteamAPI_Shutdown", w_ret_0);
-    REG("SteamAPI_RunCallbacks", w_ret_0); REG("SteamAPI_SetTryCatchCallbacks", w_ret_0);
+    REG("SteamAPI_RestartAppIfNecessary", w_ret_0); REG("SteamAPI_Shutdown", w_SteamAPI_Shutdown);
+    REG("SteamAPI_RunCallbacks", w_SteamAPI_RunCallbacks); REG("SteamAPI_SetTryCatchCallbacks", w_ret_0);
     REG("SteamAPI_RegisterCallback", w_ret_0); REG("SteamAPI_UnregisterCallback", w_ret_0);
     REG("SteamAPI_RegisterCallResult", w_ret_0); REG("SteamAPI_UnregisterCallResult", w_ret_0);
-    REG("SteamInternal_CreateInterface", w_ret_0); REG("SteamInternal_FindOrCreateGameServerInterface", w_ret_0);
+    REG("SteamInternal_CreateInterface", w_SteamInternal_CreateInterface); REG("SteamInternal_FindOrCreateGameServerInterface", w_ret_0);
     REG("SteamInternal_GameServer_Init", w_ret_0); REG("SteamGameServer_GetHSteamUser", w_ret_0);
     REG("SteamGameServer_RunCallbacks", w_ret_0); REG("SteamGameServer_Shutdown", w_ret_0);
     /* Core engine 18-module shims: Kernel32 Global*, GDI32 DIB/Font, User32, IMM32, WinMM, OLE32, Shell32 */
@@ -1838,5 +2102,36 @@ void rt_register_win32_extra(void) {
     REG("oleaut32.dll!#9", w_ret_0);
     REG("DragQueryFileA", w_ret_0); REG("SHGetFileInfoA", w_ret_0);
     REG("SHGetSpecialFolderPathA", w_SHGetSpecialFolderPathA); REG("Shell_NotifyIconA", w_ret_1);
+    /* Remaining 24-module game shims: wsock32 ordinals, IMM32, User32, Advapi32 W, Video64, SteamPipe, CompareStringEx */
+    REG("CompareStringEx", w_CompareStringEx);
+    REG("RegOpenKeyExW", w_ret_err2); REG("RegQueryInfoKeyW", w_ret_err2); REG("RegQueryValueExW", w_ret_err2);
+    REG("GetAsyncKeyState", w_ret_0); REG("GetKeyboardState", w_GetKeyboardState);
+    REG("GetWindowInfo", w_GetWindowInfo); REG("MapVirtualKeyW", w_ret_0);
+    REG("PostQuitMessage", w_ret_0); REG("SendInput", w_ret_0); REG("ToUnicodeEx", w_ret_0);
+    REG("ImmAssociateContextEx", w_ret_1); REG("ImmGetIMEFileNameA", w_ret_0);
+    REG("ImmGetOpenStatus", w_ret_0); REG("ImmGetVirtualKey", w_ret_0);
+    REG("ImmIsUIMessageW", w_ret_0); REG("ImmSetCompositionStringW", w_ret_0);
+    REG("ImmSetCompositionWindow", w_ret_1); REG("ImmSetOpenStatus", w_ret_1);
+    REG("wsock32.dll!#1", w_wsa_accept); REG("wsock32.dll!#2", w_wsa_bind);
+    REG("wsock32.dll!#3", w_wsa_closesocket); REG("wsock32.dll!#8", w_wsa_htonl);
+    REG("wsock32.dll!#9", w_wsa_htons); REG("wsock32.dll!#13", w_wsa_listen);
+    REG("wsock32.dll!#16", w_wsa_recv); REG("wsock32.dll!#18", w_wsa_select);
+    REG("wsock32.dll!#19", w_wsa_send); REG("wsock32.dll!#23", w_wsa_socket);
+    REG("wsock32.dll!#115", w_ret_0); REG("wsock32.dll!#116", w_ret_0);
+    REG("wsock32.dll!#151", w_ret_0);
+    REG("CreateVideoPlayer", w_ret_0); REG("DeleteVideoPlayer", w_ret_0);
+    REG("SteamAPI_GetHSteamPipe", w_SteamAPI_GetHSteamPipe); REG("SteamGameServer_GetHSteamPipe", w_ret_0);
+    /* engineaudio.dll: WinMM mixer, DirectSound, XAudio2, Steam Audio (phonon) */
+    REG("mixerGetNumDevs", w_ret_0); REG("mixerOpen", w_ret_err2); REG("mixerClose", w_ret_0);
+    REG("mixerGetDevCapsA", w_ret_err2); REG("mixerGetLineInfoA", w_ret_err2);
+    REG("mixerGetLineControlsA", w_ret_err2); REG("mixerGetControlDetailsA", w_ret_err2);
+    REG("mixerSetControlDetails", w_ret_err2);
+    REG("dsound.dll!#11", w_ret_err2); REG("dsound.dll!#12", w_ret_err2);
+    REG("xaudio2_9redist.dll!#1", w_CoCreateInstance);
+    REG("iplContextCreate", w_ret_err2); REG("iplHRTFCreate", w_ret_err2);
+    REG("iplBinauralEffectCreate", w_ret_err2); REG("iplBinauralEffectApply", w_ret_0);
+    REG("iplBinauralEffectRelease", w_ret_0); REG("iplDirectEffectCreate", w_ret_err2);
+    REG("iplDirectEffectApply", w_ret_0); REG("iplAudioBufferInterleave", w_ret_0);
+    REG("DiscordCreate", w_ret_err2);
     #undef REG
 }

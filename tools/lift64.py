@@ -1434,36 +1434,41 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
     os.makedirs(out_dir, exist_ok=True)
     all_funcs: List[LiftedFunc] = []
     seen_addrs: Set[int] = set()
-    for mod in layout["modules"]:
-        mfuncs = disassemble_module(
+    unimpl: List[str] = []
+    shard_files: List[str] = []
+    header = '#include "runtime64.h"\n#include <stdio.h>\n#include <stdlib.h>\n#include <math.h>\n\n'
+    for mi, mod in enumerate(layout["modules"]):
+        raw_funcs = disassemble_module(
             mod["elf_path"],
             mod["base"],
             mod["code_roots"],
             is_pe=is_pe,
             vma_delta=mod.get("vma_delta", 0),
         )
-        for fn in mfuncs:
+        mfuncs: List[LiftedFunc] = []
+        for fn in raw_funcs:
             if fn.addr not in seen_addrs:
                 seen_addrs.add(fn.addr)
+                mfuncs.append(fn)
                 all_funcs.append(fn)
+        mfuncs.sort(key=lambda fn: fn.addr)
+        if not mfuncs:
+            continue
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", mod["name"])
+        mshards = max(1, min(shards, (len(mfuncs) + 1999) // 2000))
+        buckets: List[List[LiftedFunc]] = [[] for _ in range(mshards)]
+        for i, fn in enumerate(mfuncs):
+            buckets[i % mshards].append(fn)
+        for si, bucket in enumerate(buckets):
+            cpath = os.path.join(out_dir, f"m{mi:02d}_{safe}_{si:02d}.c")
+            with open(cpath, "w") as f:
+                f.write(header)
+                for fn in bucket:
+                    f.write(emit_function_c(fn, unimpl))
+                    f.write("\n\n")
+            shard_files.append(os.path.abspath(cpath))
 
     all_funcs.sort(key=lambda fn: fn.addr)
-    num_shards = max(1, min(shards, len(all_funcs) or 1))
-    shard_buckets: List[List[LiftedFunc]] = [[] for _ in range(num_shards)]
-    for i, fn in enumerate(all_funcs):
-        shard_buckets[i % num_shards].append(fn)
-
-    unimpl: List[str] = []
-    shard_files: List[str] = []
-    header = '#include "runtime64.h"\n#include <stdio.h>\n#include <stdlib.h>\n#include <math.h>\n\n'
-    for si, bucket in enumerate(shard_buckets):
-        cpath = os.path.join(out_dir, f"lifted_{si:02d}.c")
-        with open(cpath, "w") as f:
-            f.write(header)
-            for fn in bucket:
-                f.write(emit_function_c(fn, unimpl))
-                f.write("\n\n")
-        shard_files.append(os.path.abspath(cpath))
 
     if unimpl:
         print(f"lift64: WARNING {len(unimpl)} unimplemented instruction(s):", file=sys.stderr)

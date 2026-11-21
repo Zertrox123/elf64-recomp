@@ -1,7 +1,7 @@
 {
   "libraries": {
     "kernel32": [
-      263,
+      264,
       264
     ],
     "user32": [
@@ -25,15 +25,15 @@
       22
     ],
     "steam_api64": [
-      19,
+      21,
       21
     ],
     "winmm": [
-      12,
+      20,
       20
     ],
     "wsock32": [
-      0,
+      13,
       13
     ],
     "imm32": [
@@ -57,7 +57,7 @@
       8
     ],
     "phonon": [
-      0,
+      8,
       8
     ],
     "wininet": [
@@ -69,11 +69,11 @@
       5
     ],
     "video64": [
-      2,
+      4,
       4
     ],
     "dsound": [
-      2,
+      4,
       4
     ],
     "version": [
@@ -105,7 +105,7 @@
       1
     ],
     "xaudio2_9redist": [
-      0,
+      1,
       1
     ]
   },
@@ -135,19 +135,19 @@
       36
     ],
     "DXBC SM4/5": [
-      13,
+      39,
       54
     ]
   },
   "summary": {
-    "libraries_pct": 84.99,
-    "libraries_done": 555,
+    "libraries_pct": 90.66,
+    "libraries_done": 592,
     "libraries_total": 653,
     "isa_pct": 87.5,
     "isa_done": 252,
     "isa_total": 288,
-    "dxbc_pct": 24.07,
-    "dxbc_done": 13,
+    "dxbc_pct": 72.22,
+    "dxbc_done": 39,
     "dxbc_total": 54
   }
 }

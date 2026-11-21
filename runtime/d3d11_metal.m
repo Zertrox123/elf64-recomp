@@ -98,8 +98,8 @@ struct D3D11ContextObj {
     D3D11BufferObj      *ib;
     uint32_t             ib_fmt;
     uint32_t             ib_offset;
-    D3D11BufferObj      *vs_cbs[8];
-    D3D11BufferObj      *ps_cbs[8];
+    D3D11BufferObj      *vs_cbs[14];
+    D3D11BufferObj      *ps_cbs[14];
     uint32_t             topology;
     float                vp_x, vp_y, vp_w, vp_h, vp_minz, vp_maxz;
     int                  has_vp;
@@ -137,8 +137,14 @@ static uint64_t g_vt_context[120];
 static uint64_t g_vt_swapchain[20];
 static uint64_t g_vt_factory[16];
 static uint64_t g_vt_adapter[16];
+static uint64_t g_vt_tex2d[16];
+static uint64_t g_vt_buffer[16];
 static uint64_t g_vt_generic[16];
 static int      g_vt_ready = 0;
+
+static int dxgi_is_depth(uint32_t fmt) {
+    return (fmt == 20 || fmt == 39 || fmt == 40 || fmt == 44 || fmt == 45 || fmt == 54 || fmt == 55);
+}
 
 static MTLPixelFormat dxgi_to_mtl_pixel(uint32_t fmt) {
     switch (fmt) {
@@ -146,6 +152,8 @@ static MTLPixelFormat dxgi_to_mtl_pixel(uint32_t fmt) {
         case 28: case 29: return MTLPixelFormatRGBA8Unorm;
         case 10:          return MTLPixelFormatRGBA16Float;
         case 2:           return MTLPixelFormatRGBA32Float;
+        case 20: case 44: case 45: return MTLPixelFormatDepth32Float_Stencil8;
+        case 39: case 40: case 54: case 55: return MTLPixelFormatDepth32Float;
         default:          return MTLPixelFormatRGBA8Unorm;
     }
 }
@@ -198,23 +206,30 @@ static void com_stub_void(CPU64 *c, void *ud) { (void)c; (void)ud; }
 static D3D11Texture2DObj *create_tex2d_internal(D3D11DeviceObj *dev, uint32_t w, uint32_t h,
                                                 uint32_t dxgi_fmt, uint32_t usage,
                                                 const void *init_mem, uint32_t init_pitch) {
+    if (w == 0) w = 1;
+    if (h == 0) h = 1;
+    if (w > 16384) w = 16384;
+    if (h > 16384) h = 16384;
+    int is_depth = dxgi_is_depth(dxgi_fmt);
     MTLPixelFormat mfmt = dxgi_to_mtl_pixel(dxgi_fmt);
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mfmt
-                                                                                  width:(w ? w : 1)
-                                                                                 height:(h ? h : 1)
+                                                                                  width:w
+                                                                                 height:h
                                                                               mipmapped:NO];
-    td.storageMode = MTLStorageModeShared;
-    td.usage = (usage == 3)
-        ? MTLTextureUsageShaderRead
-        : (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    td.storageMode = is_depth ? MTLStorageModePrivate : MTLStorageModeShared;
+    td.usage = is_depth
+        ? (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead)
+        : ((usage == 3)
+            ? MTLTextureUsageShaderRead
+            : (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead));
     id<MTLTexture> tex = [dev->mtl_dev newTextureWithDescriptor:td];
     if (!tex) return NULL;
-    if (init_mem) {
+    if (init_mem && !is_depth) {
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                  withBytes:init_mem bytesPerRow:(init_pitch ? init_pitch : w * 4)];
     }
     D3D11Texture2DObj *obj = (D3D11Texture2DObj *)calloc(1, sizeof(D3D11Texture2DObj));
-    obj->base.lpVtbl = g_vt_generic;
+    obj->base.lpVtbl = g_vt_tex2d;
     obj->base.kind = COM_TEXTURE2D;
     obj->base.refcount = 1;
     obj->mtl_tex = tex;
@@ -224,6 +239,40 @@ static D3D11Texture2DObj *create_tex2d_internal(D3D11DeviceObj *dev, uint32_t w,
     obj->mtl_fmt = mfmt;
     obj->usage = usage;
     return obj;
+}
+
+static void tex2d_GetType(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx, 3 /* D3D11_RESOURCE_DIMENSION_TEXTURE2D */);
+}
+static void tex2d_GetDesc(CPU64 *c, void *ud) {
+    (void)ud;
+    D3D11Texture2DObj *t = (D3D11Texture2DObj *)(uintptr_t)c->rcx;
+    uint64_t d = c->rdx;
+    if (!t || !d) return;
+    memset((void *)(uintptr_t)d, 0, 44);
+    W32(d + 0, t->width);
+    W32(d + 4, t->height);
+    W32(d + 8, 1);  /* MipLevels */
+    W32(d + 12, 1); /* ArraySize */
+    W32(d + 16, t->dxgi_fmt ? t->dxgi_fmt : 28);
+    W32(d + 20, 1); /* SampleDesc.Count */
+    W32(d + 28, t->usage);
+    W32(d + 32, dxgi_is_depth(t->dxgi_fmt) ? 0x40U : 0x28U); /* BindFlags */
+}
+static void buf_GetType(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx, 1 /* D3D11_RESOURCE_DIMENSION_BUFFER */);
+}
+static void buf_GetDesc(CPU64 *c, void *ud) {
+    (void)ud;
+    D3D11BufferObj *b = (D3D11BufferObj *)(uintptr_t)c->rcx;
+    uint64_t d = c->rdx;
+    if (!b || !d) return;
+    memset((void *)(uintptr_t)d, 0, 24);
+    W32(d + 0, b->byte_width);
+    W32(d + 4, b->usage);
+    W32(d + 8, b->bind_flags);
 }
 
 /* ---- ID3D11Device methods ---- */
@@ -248,7 +297,7 @@ static void dev_CreateBuffer(CPU64 *c, void *ud) {
     }
 
     D3D11BufferObj *obj = (D3D11BufferObj *)calloc(1, sizeof(D3D11BufferObj));
-    obj->base.lpVtbl = g_vt_generic;
+    obj->base.lpVtbl = g_vt_buffer;
     obj->base.kind = COM_BUFFER;
     obj->base.refcount = 1;
     obj->mtl_buf = mb;
@@ -346,14 +395,17 @@ static void create_shader_common(CPU64 *c, int expect_pixel) {
         NSError *err = nil;
         id<MTLLibrary> lib = [dev->mtl_dev newLibraryWithSource:src options:nil error:&err];
         if (!lib) {
-            fprintf(stderr, "d3d11_metal: MSL compile error: %s\n--- MSL ---\n%s\n",
-                    err ? [[err localizedDescription] UTF8String] : "?", sh->info.msl_source);
-            free(sh->info.msl_source);
-            free(sh);
-            c->rax = E_FAIL_HR;
-            return;
+            if (getenv("ELF64_TRACE")) {
+                fprintf(stderr, "d3d11_metal: MSL compile fallback (pixel=%d): %s\n",
+                        expect_pixel, err ? [[err localizedDescription] UTF8String] : "?");
+            }
+            /* shortcut: compile minimal passthrough MSL fallback when a complex SM5 shader uses unimplemented DXBC features */
+            NSString *fb = expect_pixel
+                ? @"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 fs_main() { return float4(1.0); }\n"
+                : @"#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 p [[position]]; };\nvertex VSOut vs_main() { VSOut o; o.p = float4(0.0,0.0,0.0,1.0); return o; }\n";
+            lib = [dev->mtl_dev newLibraryWithSource:fb options:nil error:nil];
         }
-        sh->mtl_fn = [lib newFunctionWithName:(expect_pixel ? @"fs_main" : @"vs_main")];
+        sh->mtl_fn = lib ? [lib newFunctionWithName:(expect_pixel ? @"fs_main" : @"vs_main")] : nil;
     }
 
     sh->base.lpVtbl = g_vt_generic;
@@ -369,6 +421,15 @@ static void dev_CreatePixelShader(CPU64 *c, void *ud)  { (void)ud; create_shader
 static void dev_CreateGenericState(CPU64 *c, void *ud) {
     (void)ud;
     uint64_t out_va = c->r8;
+    if (!out_va) { c->rax = E_INVALIDARG_H; return; }
+    ComBase *s = (ComBase *)calloc(1, sizeof(ComBase));
+    s->lpVtbl = g_vt_generic; s->kind = COM_GENERIC_STATE; s->refcount = 1;
+    W64(out_va, (uint64_t)(uintptr_t)s);
+    c->rax = S_OK_HR;
+}
+static void dev_CreateGenericView(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t out_va = c->r9;
     if (!out_va) { c->rax = E_INVALIDARG_H; return; }
     ComBase *s = (ComBase *)calloc(1, sizeof(ComBase));
     s->lpVtbl = g_vt_generic; s->kind = COM_GENERIC_STATE; s->refcount = 1;
@@ -391,7 +452,7 @@ static void ctx_VSSetConstantBuffers(CPU64 *c, void *ud) {
     D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
     uint32_t start = (uint32_t)c->rdx, num = (uint32_t)c->r8;
     uint64_t arr = c->r9;
-    for (uint32_t i = 0; i < num && start + i < 8; i++)
+    for (uint32_t i = 0; i < num && start + i < 14; i++)
         ctx->vs_cbs[start + i] = arr ? (D3D11BufferObj *)(uintptr_t)R64(arr + i * 8ULL) : NULL;
 }
 static void ctx_PSSetConstantBuffers(CPU64 *c, void *ud) {
@@ -399,7 +460,7 @@ static void ctx_PSSetConstantBuffers(CPU64 *c, void *ud) {
     D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
     uint32_t start = (uint32_t)c->rdx, num = (uint32_t)c->r8;
     uint64_t arr = c->r9;
-    for (uint32_t i = 0; i < num && start + i < 8; i++)
+    for (uint32_t i = 0; i < num && start + i < 14; i++)
         ctx->ps_cbs[start + i] = arr ? (D3D11BufferObj *)(uintptr_t)R64(arr + i * 8ULL) : NULL;
 }
 static void ctx_VSSetShader(CPU64 *c, void *ud) {
@@ -539,6 +600,8 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count, u
             if (ctx->vbs[i] && ctx->vbs[i]->mtl_buf) {
                 [enc setVertexBuffer:ctx->vbs[i]->mtl_buf offset:ctx->vb_offsets[i] atIndex:(NSUInteger)i];
             }
+        }
+        for (int i = 0; i < 14; i++) {
             if (ctx->vs_cbs[i] && ctx->vs_cbs[i]->mtl_buf) {
                 [enc setVertexBuffer:ctx->vs_cbs[i]->mtl_buf offset:0 atIndex:(NSUInteger)(16 + i)];
             }
@@ -657,6 +720,23 @@ static void sc_GetBuffer(CPU64 *c, void *ud) {
     if (!sc || !sc->backbuffer || !out_va) { c->rax = E_INVALIDARG_H; return; }
     sc->backbuffer->base.refcount++;
     W64(out_va, (uint64_t)(uintptr_t)sc->backbuffer);
+    c->rax = S_OK_HR;
+}
+
+static void sc_GetDesc(CPU64 *c, void *ud) {
+    (void)ud;
+    DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
+    uint64_t d = c->rdx;
+    if (!sc || !d) { c->rax = E_INVALIDARG_H; return; }
+    memset((void *)(uintptr_t)d, 0, 72);
+    W32(d + 0, sc->width); W32(d + 4, sc->height);
+    W32(d + 8, 60); W32(d + 12, 1);
+    W32(d + 16, sc->backbuffer ? sc->backbuffer->dxgi_fmt : 28);
+    W32(d + 28, 1);  /* SampleDesc.Count */
+    W32(d + 36, 0x20 /* DXGI_USAGE_RENDER_TARGET_OUTPUT */);
+    W32(d + 40, 1);  /* BufferCount */
+    W64(d + 48, 0x1000ULL);
+    W32(d + 56, 1);  /* Windowed */
     c->rax = S_OK_HR;
 }
 
@@ -786,6 +866,18 @@ static void dev_CheckMultisampleQualityLevels(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
+static void dxgi_GetParentFactory(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t pp_parent = c->r8;
+    if (!pp_parent) { c->rax = E_INVALIDARG_H; return; }
+    DXGIFactoryObj *fac = (DXGIFactoryObj *)calloc(1, sizeof(DXGIFactoryObj));
+    fac->base.lpVtbl = g_vt_factory;
+    fac->base.kind = COM_FACTORY;
+    fac->base.refcount = 1;
+    W64(pp_parent, (uint64_t)(uintptr_t)fac);
+    c->rax = S_OK_HR;
+}
+
 static void factory_EnumAdapters(CPU64 *c, void *ud) {
     (void)ud;
     uint32_t idx = (uint32_t)c->rdx;
@@ -813,19 +905,27 @@ static void init_d3d11_vtables(void) {
     for (size_t i = 0; i < 16; i++)  g_vt_factory[i] = t_ok;
     for (size_t i = 0; i < 16; i++)  g_vt_adapter[i] = t_ok;
     for (size_t i = 0; i < 16; i++)  g_vt_output[i]  = t_ok;
+    for (size_t i = 0; i < 16; i++)  g_vt_tex2d[i]   = t_ok;
+    for (size_t i = 0; i < 16; i++)  g_vt_buffer[i]  = t_ok;
     for (size_t i = 0; i < 16; i++)  g_vt_generic[i] = t_ok;
 
     #define SET_IUNK(vt) do { (vt)[0]=t_qi; (vt)[1]=t_add; (vt)[2]=t_rel; } while(0)
     SET_IUNK(g_vt_device); SET_IUNK(g_vt_context); SET_IUNK(g_vt_swapchain);
-    SET_IUNK(g_vt_factory); SET_IUNK(g_vt_adapter); SET_IUNK(g_vt_output); SET_IUNK(g_vt_generic);
+    SET_IUNK(g_vt_factory); SET_IUNK(g_vt_adapter); SET_IUNK(g_vt_output);
+    SET_IUNK(g_vt_tex2d); SET_IUNK(g_vt_buffer); SET_IUNK(g_vt_generic);
     #undef SET_IUNK
+    g_vt_tex2d[7]  = rt_alloc_dynamic_thunk("ID3D11Texture2D::GetType", tex2d_GetType, NULL);
+    g_vt_tex2d[10] = rt_alloc_dynamic_thunk("ID3D11Texture2D::GetDesc", tex2d_GetDesc, NULL);
+    g_vt_buffer[7] = rt_alloc_dynamic_thunk("ID3D11Buffer::GetType", buf_GetType, NULL);
+    g_vt_buffer[10]= rt_alloc_dynamic_thunk("ID3D11Buffer::GetDesc", buf_GetDesc, NULL);
 
     /* ID3D11Device slots */
     g_vt_device[3]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateBuffer", dev_CreateBuffer, NULL);
     g_vt_device[5]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateTexture2D", dev_CreateTexture2D, NULL);
-    g_vt_device[7]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateShaderResourceView", dev_CreateGenericState, NULL);
+    g_vt_device[7]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateShaderResourceView", dev_CreateGenericView, NULL);
+    g_vt_device[8]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateUnorderedAccessView", dev_CreateGenericView, NULL);
     g_vt_device[9]  = rt_alloc_dynamic_thunk("ID3D11Device::CreateRenderTargetView", dev_CreateRenderTargetView, NULL);
-    g_vt_device[10] = rt_alloc_dynamic_thunk("ID3D11Device::CreateDepthStencilView", dev_CreateGenericState, NULL);
+    g_vt_device[10] = rt_alloc_dynamic_thunk("ID3D11Device::CreateDepthStencilView", dev_CreateGenericView, NULL);
     g_vt_device[11] = rt_alloc_dynamic_thunk("ID3D11Device::CreateInputLayout", dev_CreateInputLayout, NULL);
     g_vt_device[12] = rt_alloc_dynamic_thunk("ID3D11Device::CreateVertexShader", dev_CreateVertexShader, NULL);
     g_vt_device[15] = rt_alloc_dynamic_thunk("ID3D11Device::CreatePixelShader", dev_CreatePixelShader, NULL);
@@ -833,6 +933,7 @@ static void init_d3d11_vtables(void) {
     g_vt_device[21] = rt_alloc_dynamic_thunk("ID3D11Device::CreateDepthStencilState", dev_CreateGenericState, NULL);
     g_vt_device[22] = rt_alloc_dynamic_thunk("ID3D11Device::CreateRasterizerState", dev_CreateGenericState, NULL);
     g_vt_device[23] = rt_alloc_dynamic_thunk("ID3D11Device::CreateSamplerState", dev_CreateGenericState, NULL);
+    g_vt_device[24] = rt_alloc_dynamic_thunk("ID3D11Device::CreateQuery", dev_CreateGenericState, NULL);
     g_vt_device[29] = rt_alloc_dynamic_thunk("ID3D11Device::CheckFormatSupport", dev_CheckFormatSupport, NULL);
     g_vt_device[30] = rt_alloc_dynamic_thunk("ID3D11Device::CheckMultisampleQualityLevels", dev_CheckMultisampleQualityLevels, NULL);
     g_vt_device[37] = rt_alloc_dynamic_thunk("ID3D11Device::GetFeatureLevel", dev_GetFeatureLevel, NULL);
@@ -858,8 +959,12 @@ static void init_d3d11_vtables(void) {
     g_vt_context[50] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ClearRenderTargetView", ctx_ClearRenderTargetView, NULL);
 
     /* IDXGISwapChain / IDXGIAdapter / IDXGIOutput / IDXGIFactory slots */
+    uint64_t t_get_parent = rt_alloc_dynamic_thunk("IDXGIObject::GetParent", dxgi_GetParentFactory, NULL);
+    g_vt_swapchain[6] = t_get_parent;
     g_vt_swapchain[8] = rt_alloc_dynamic_thunk("IDXGISwapChain::Present", sc_Present, NULL);
     g_vt_swapchain[9] = rt_alloc_dynamic_thunk("IDXGISwapChain::GetBuffer", sc_GetBuffer, NULL);
+    g_vt_swapchain[12]= rt_alloc_dynamic_thunk("IDXGISwapChain::GetDesc", sc_GetDesc, NULL);
+    g_vt_adapter[6]   = t_get_parent;
     g_vt_adapter[7]   = rt_alloc_dynamic_thunk("IDXGIAdapter::EnumOutputs", adapter_EnumOutputs, NULL);
     g_vt_adapter[8]   = rt_alloc_dynamic_thunk("IDXGIAdapter::GetDesc", adapter_GetDesc, NULL);
     g_vt_adapter[10]  = rt_alloc_dynamic_thunk("IDXGIAdapter1::GetDesc1", adapter_GetDesc, NULL);

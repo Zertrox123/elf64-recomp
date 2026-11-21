@@ -214,60 +214,158 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
     uint32_t stype = (toks[0] >> 16) & 0xFFFFU;
     out->is_pixel = (stype == 0) ? 1 : 0;
 
-    /* Pre-scan for DCL_TEMPS and constant buffers */
+    /* Pre-scan for DCL_TEMPS, constant buffers, textures, and samplers */
     uint32_t num_temps = 4;
-    int has_cb0 = 0;
+    uint32_t cb_mask = 0, tex_mask = 0, samp_mask = 0;
     for (size_t p = 2; p < ntoks; ) {
         uint32_t tok = toks[p];
         uint32_t op = tok & 0x7FFU;
         uint32_t len = (tok >> 24) & 0x7FU;
         if (len == 0 || p + len > ntoks) break;
-        if (op == 104 && len >= 2) num_temps = toks[p + 1]; /* DCL_TEMPS */
-        if (op == 89) has_cb0 = 1; /* DCL_CONSTANT_BUFFER */
-        p += len;
+        size_t end = p + len, cur = p + 1;
+        while ((tok & 0x80000000U) && cur < end) tok = toks[cur++];
+        if (op == 104 && cur < end) {
+            if (toks[cur] > num_temps) num_temps = toks[cur];
+        } else if (op == 89 && cur < end) {
+            DxbcOp cb;
+            decode_operand(toks, cur, end, &cb);
+            if (cb.idx[0] < 14) cb_mask |= (1U << cb.idx[0]);
+        } else if (op == 88 && cur < end) {
+            DxbcOp tx;
+            decode_operand(toks, cur, end, &tx);
+            if (tx.idx[0] < 16) tex_mask |= (1U << tx.idx[0]);
+        } else if (op == 90 && cur < end) {
+            DxbcOp sm;
+            decode_operand(toks, cur, end, &sm);
+            if (sm.idx[0] < 16) samp_mask |= (1U << sm.idx[0]);
+        }
+        p = end;
     }
 
     StrBuf sb = {0};
     sb_appendf(&sb, "#include <metal_stdlib>\nusing namespace metal;\n\n");
 
+    int has_vid = 0;
     if (!out->is_pixel) {
-        sb_appendf(&sb, "struct VSIn {\n");
+        int n_stage_in = 0;
+        uint32_t seen_in = 0, seen_out = 0;
         for (int i = 0; i < out->num_inputs; i++) {
-            sb_appendf(&sb, "    float4 v%u [[attribute(%u)]];\n", out->inputs[i].reg, out->inputs[i].reg);
-        }
-        sb_appendf(&sb, "};\n\nstruct VSOut {\n");
-        for (int i = 0; i < out->num_outputs; i++) {
-            if (out->outputs[i].sys_val == 1 || strcasecmp(out->outputs[i].semantic, "SV_POSITION") == 0) {
-                sb_appendf(&sb, "    float4 o%u [[position]];\n", out->outputs[i].reg);
-            } else {
-                sb_appendf(&sb, "    float4 o%u [[user(loc%u)]];\n", out->outputs[i].reg, out->outputs[i].reg);
+            if (out->inputs[i].sys_val == 6 || strcasecmp(out->inputs[i].semantic, "SV_VERTEXID") == 0) {
+                has_vid = 1;
+            } else if (!(seen_in & (1U << (out->inputs[i].reg & 31U)))) {
+                seen_in |= (1U << (out->inputs[i].reg & 31U));
+                n_stage_in++;
             }
         }
-        sb_appendf(&sb, "};\n\nvertex VSOut vs_main(VSIn in [[stage_in]]");
-        if (has_cb0) sb_appendf(&sb, ", constant float4 *cb0 [[buffer(16)]]");
-        sb_appendf(&sb, ") {\n");
-        for (int i = 0; i < out->num_inputs; i++) {
-            sb_appendf(&sb, "    float4 v%u = in.v%u;\n", out->inputs[i].reg, out->inputs[i].reg);
+        if (n_stage_in > 0) {
+            seen_in = 0;
+            sb_appendf(&sb, "struct VSIn {\n");
+            for (int i = 0; i < out->num_inputs; i++) {
+                if (out->inputs[i].sys_val == 6 || strcasecmp(out->inputs[i].semantic, "SV_VERTEXID") == 0) continue;
+                uint32_t r = out->inputs[i].reg & 31U;
+                if (seen_in & (1U << r)) continue;
+                seen_in |= (1U << r);
+                sb_appendf(&sb, "    float4 v%u [[attribute(%u)]];\n", r, r);
+            }
+            sb_appendf(&sb, "};\n\n");
         }
+        sb_appendf(&sb, "struct VSOut {\n");
+        int has_pos = 0;
+        seen_out = 0;
         for (int i = 0; i < out->num_outputs; i++) {
-            sb_appendf(&sb, "    float4 o%u = float4(0.0);\n", out->outputs[i].reg);
+            uint32_t r = out->outputs[i].reg & 31U;
+            if (seen_out & (1U << r)) continue;
+            seen_out |= (1U << r);
+            if (out->outputs[i].sys_val == 1 || strcasecmp(out->outputs[i].semantic, "SV_POSITION") == 0) {
+                sb_appendf(&sb, "    float4 o%u [[position]];\n", r);
+                has_pos = 1;
+            } else {
+                sb_appendf(&sb, "    float4 o%u [[user(loc%u)]];\n", r, r);
+            }
+        }
+        if (!has_pos) sb_appendf(&sb, "    float4 _pos [[position]];\n");
+        sb_appendf(&sb, "};\n\nvertex VSOut vs_main(");
+        int first_arg = 1;
+        if (n_stage_in > 0) { sb_appendf(&sb, "VSIn in [[stage_in]]"); first_arg = 0; }
+        if (has_vid) { sb_appendf(&sb, "%suint _vid [[vertex_id]]", first_arg ? "" : ", "); first_arg = 0; }
+        for (uint32_t k = 0; k < 14; k++) {
+            if (cb_mask & (1U << k)) { sb_appendf(&sb, "%sconstant float4 *cb%u [[buffer(%u)]]", first_arg ? "" : ", ", k, 16 + k); first_arg = 0; }
+        }
+        for (uint32_t k = 0; k < 16; k++) {
+            if (tex_mask & (1U << k)) { sb_appendf(&sb, "%stexture2d<float> t%u [[texture(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
+        }
+        for (uint32_t k = 0; k < 16; k++) {
+            if (samp_mask & (1U << k)) { sb_appendf(&sb, "%ssampler s%u [[sampler(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
+        }
+        sb_appendf(&sb, ") {\n");
+        seen_in = 0;
+        for (int i = 0; i < out->num_inputs; i++) {
+            uint32_t r = out->inputs[i].reg & 31U;
+            if (seen_in & (1U << r)) continue;
+            seen_in |= (1U << r);
+            if (out->inputs[i].sys_val == 6 || strcasecmp(out->inputs[i].semantic, "SV_VERTEXID") == 0) {
+                sb_appendf(&sb, "    float4 v%u = as_type<float4>(uint4(_vid, 0u, 0u, 0u));\n", r);
+            } else {
+                sb_appendf(&sb, "    float4 v%u = in.v%u;\n", r, r);
+            }
+        }
+        seen_out = 0;
+        for (int i = 0; i < out->num_outputs; i++) {
+            uint32_t r = out->outputs[i].reg & 31U;
+            if (seen_out & (1U << r)) continue;
+            seen_out |= (1U << r);
+            sb_appendf(&sb, "    float4 o%u = float4(0.0);\n", r);
         }
     } else {
-        sb_appendf(&sb, "struct PSIn {\n");
+        uint32_t seen_in = 0, seen_out = 0;
+        int n_ps_in = 0;
         for (int i = 0; i < out->num_inputs; i++) {
-            if (out->inputs[i].sys_val == 1 || strcasecmp(out->inputs[i].semantic, "SV_POSITION") == 0) {
-                sb_appendf(&sb, "    float4 v%u [[position]];\n", out->inputs[i].reg);
-            } else {
-                sb_appendf(&sb, "    float4 v%u [[user(loc%u)]];\n", out->inputs[i].reg, out->inputs[i].reg);
-            }
+            uint32_t r = out->inputs[i].reg & 31U;
+            if (!(seen_in & (1U << r))) { seen_in |= (1U << r); n_ps_in++; }
         }
-        sb_appendf(&sb, "};\n\nfragment float4 fs_main(PSIn in [[stage_in]]");
-        if (has_cb0) sb_appendf(&sb, ", constant float4 *cb0 [[buffer(16)]]");
+        if (n_ps_in > 0) {
+            seen_in = 0;
+            sb_appendf(&sb, "struct PSIn {\n");
+            for (int i = 0; i < out->num_inputs; i++) {
+                uint32_t r = out->inputs[i].reg & 31U;
+                if (seen_in & (1U << r)) continue;
+                seen_in |= (1U << r);
+                if (out->inputs[i].sys_val == 1 || strcasecmp(out->inputs[i].semantic, "SV_POSITION") == 0) {
+                    sb_appendf(&sb, "    float4 v%u [[position]];\n", r);
+                } else {
+                    sb_appendf(&sb, "    float4 v%u [[user(loc%u)]];\n", r, r);
+                }
+            }
+            sb_appendf(&sb, "};\n\n");
+        }
+        sb_appendf(&sb, "fragment float4 fs_main(");
+        int first_arg = 1;
+        if (n_ps_in > 0) { sb_appendf(&sb, "PSIn in [[stage_in]]"); first_arg = 0; }
+        for (uint32_t k = 0; k < 14; k++) {
+            if (cb_mask & (1U << k)) { sb_appendf(&sb, "%sconstant float4 *cb%u [[buffer(%u)]]", first_arg ? "" : ", ", k, 16 + k); first_arg = 0; }
+        }
+        for (uint32_t k = 0; k < 16; k++) {
+            if (tex_mask & (1U << k)) { sb_appendf(&sb, "%stexture2d<float> t%u [[texture(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
+        }
+        for (uint32_t k = 0; k < 16; k++) {
+            if (samp_mask & (1U << k)) { sb_appendf(&sb, "%ssampler s%u [[sampler(%u)]]", first_arg ? "" : ", ", k, k); first_arg = 0; }
+        }
         sb_appendf(&sb, ") {\n");
+        seen_in = 0;
         for (int i = 0; i < out->num_inputs; i++) {
-            sb_appendf(&sb, "    float4 v%u = in.v%u;\n", out->inputs[i].reg, out->inputs[i].reg);
+            uint32_t r = out->inputs[i].reg & 31U;
+            if (seen_in & (1U << r)) continue;
+            seen_in |= (1U << r);
+            sb_appendf(&sb, "    float4 v%u = in.v%u;\n", r, r);
         }
         sb_appendf(&sb, "    float4 o0 = float4(0.0);\n");
+        seen_out = 1U;
+        for (int i = 0; i < out->num_outputs; i++) {
+            uint32_t r = out->outputs[i].reg & 31U;
+            if (seen_out & (1U << r)) continue;
+            seen_out |= (1U << r);
+            sb_appendf(&sb, "    float4 o%u = float4(0.0);\n", r);
+        }
     }
 
     for (uint32_t t = 0; t < num_temps; t++) {
@@ -289,9 +387,13 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
         if (opc >= 88) { p = end; continue; } /* Declarations */
         if (opc == 62) { /* RET */
             if (!out->is_pixel) {
+                uint32_t seen_out = 0;
                 sb_appendf(&sb, "    VSOut _out;\n");
                 for (int i = 0; i < out->num_outputs; i++) {
-                    sb_appendf(&sb, "    _out.o%u = o%u;\n", out->outputs[i].reg, out->outputs[i].reg);
+                    uint32_t r = out->outputs[i].reg & 31U;
+                    if (seen_out & (1U << r)) continue;
+                    seen_out |= (1U << r);
+                    sb_appendf(&sb, "    _out.o%u = o%u;\n", r, r);
                 }
                 sb_appendf(&sb, "    return _out;\n");
             } else {
@@ -353,14 +455,104 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             fmt_src(&s0, m, a0, sizeof(a0));
             fmt_src(&s1, m, a1, sizeof(a1));
             sb_appendf(&sb, "    %s = %s(%s, %s);\n", ds, fn, a0, a1);
-        } else if (opc == 68 || opc == 72) { /* RSQ / SQRT */
-            const char *fn = (opc == 68) ? "rsqrt" : "sqrt";
+        } else if (opc == 68 || opc == 76 || opc == 26 || opc == 25 || opc == 47) { /* RSQ / SQRT / FRC / EXP / LOG */
+            const char *fn = (opc == 68) ? "rsqrt" : (opc == 76 ? "sqrt" : (opc == 26 ? "fract" : (opc == 25 ? "exp2" : "log2")));
             cur = decode_operand(toks, cur, end, &d);
             cur = decode_operand(toks, cur, end, &s0);
             uint32_t m = d.mask ? d.mask : 0xF;
             fmt_dst(&d, ds, sizeof(ds), dm);
             fmt_src(&s0, m, a0, sizeof(a0));
             sb_appendf(&sb, "    %s = %s(%s);\n", ds, fn, a0);
+        } else if (opc == 128) { /* RCP */
+            cur = decode_operand(toks, cur, end, &d);
+            cur = decode_operand(toks, cur, end, &s0);
+            uint32_t m = d.mask ? d.mask : 0xF;
+            fmt_dst(&d, ds, sizeof(ds), dm);
+            fmt_src(&s0, m, a0, sizeof(a0));
+            sb_appendf(&sb, "    %s = (1.0 / (%s));\n", ds, a0);
+        } else if (opc == 55) { /* MOVC */
+            cur = decode_operand(toks, cur, end, &d);
+            cur = decode_operand(toks, cur, end, &s0);
+            cur = decode_operand(toks, cur, end, &s1);
+            cur = decode_operand(toks, cur, end, &s2);
+            uint32_t m = d.mask ? d.mask : 0xF;
+            int nc = mask_lane_count(m);
+            fmt_dst(&d, ds, sizeof(ds), dm);
+            fmt_src(&s0, m, a0, sizeof(a0));
+            fmt_src(&s1, m, a1, sizeof(a1));
+            fmt_src(&s2, m, a2, sizeof(a2));
+            if (nc == 1) sb_appendf(&sb, "    %s = (as_type<uint>(%s) != 0u) ? (%s) : (%s);\n", ds, a0, a1, a2);
+            else         sb_appendf(&sb, "    %s = select(%s, %s, as_type<uint%d>(%s) != 0u);\n", ds, a2, a1, nc, a0);
+        } else if (opc == 24 || opc == 57 || opc == 49 || opc == 29) { /* EQ / NE / LT / GE */
+            const char *cmp = (opc == 24) ? "==" : (opc == 57 ? "!=" : (opc == 49 ? "<" : ">="));
+            cur = decode_operand(toks, cur, end, &d);
+            cur = decode_operand(toks, cur, end, &s0);
+            cur = decode_operand(toks, cur, end, &s1);
+            uint32_t m = d.mask ? d.mask : 0xF;
+            int nc = mask_lane_count(m);
+            fmt_dst(&d, ds, sizeof(ds), dm);
+            fmt_src(&s0, m, a0, sizeof(a0));
+            fmt_src(&s1, m, a1, sizeof(a1));
+            if (nc == 1) sb_appendf(&sb, "    %s = as_type<float>(((%s) %s (%s)) ? 0xFFFFFFFFu : 0u);\n", ds, a0, cmp, a1);
+            else         sb_appendf(&sb, "    %s = as_type<float%d>(select(uint%d(0u), uint%d(0xFFFFFFFFu), (%s) %s (%s)));\n", ds, nc, nc, nc, a0, cmp, a1);
+        } else if (opc == 1 || opc == 60 || opc == 87 || opc == 30 || opc == 41 || opc == 42 || opc == 85) { /* AND/OR/XOR/IADD/ISHL/ISHR/USHR */
+            const char *bop = (opc == 1) ? "&" : (opc == 60 ? "|" : (opc == 87 ? "^" : (opc == 30 ? "+" : (opc == 41 ? "<<" : ">>"))));
+            const char *it = (opc == 42) ? "int" : "uint";
+            cur = decode_operand(toks, cur, end, &d);
+            cur = decode_operand(toks, cur, end, &s0);
+            cur = decode_operand(toks, cur, end, &s1);
+            uint32_t m = d.mask ? d.mask : 0xF;
+            int nc = mask_lane_count(m);
+            fmt_dst(&d, ds, sizeof(ds), dm);
+            fmt_src(&s0, m, a0, sizeof(a0));
+            fmt_src(&s1, m, a1, sizeof(a1));
+            if (nc == 1) sb_appendf(&sb, "    %s = as_type<float>(as_type<%s>(%s) %s as_type<%s>(%s));\n", ds, it, a0, bop, it, a1);
+            else         sb_appendf(&sb, "    %s = as_type<float%d>(as_type<%s%d>(%s) %s as_type<%s%d>(%s));\n", ds, nc, it, nc, a0, bop, it, nc, a1);
+        } else if (opc == 43 || opc == 86 || opc == 27 || opc == 28) { /* ITOF / UTOF / FTOI / FTOU */
+            cur = decode_operand(toks, cur, end, &d);
+            cur = decode_operand(toks, cur, end, &s0);
+            uint32_t m = d.mask ? d.mask : 0xF;
+            int nc = mask_lane_count(m);
+            fmt_dst(&d, ds, sizeof(ds), dm);
+            fmt_src(&s0, m, a0, sizeof(a0));
+            if (opc == 43 || opc == 86) {
+                const char *it = (opc == 43) ? "int" : "uint";
+                if (nc == 1) sb_appendf(&sb, "    %s = float(as_type<%s>(%s));\n", ds, it, a0);
+                else         sb_appendf(&sb, "    %s = float%d(as_type<%s%d>(%s));\n", ds, nc, it, nc, a0);
+            } else {
+                const char *it = (opc == 27) ? "int" : "uint";
+                if (nc == 1) sb_appendf(&sb, "    %s = as_type<float>(%s(%s));\n", ds, it, a0);
+                else         sb_appendf(&sb, "    %s = as_type<float%d>(%s%d(%s));\n", ds, nc, it, nc, a0);
+            }
+        } else if (opc == 69 || opc == 72 || opc == 73) { /* SAMPLE / SAMPLE_L / SAMPLE_B */
+            DxbcOp stex, ssamp;
+            cur = decode_operand(toks, cur, end, &d);
+            cur = decode_operand(toks, cur, end, &s0);
+            cur = decode_operand(toks, cur, end, &stex);
+            cur = decode_operand(toks, cur, end, &ssamp);
+            if (opc == 72 || opc == 73) cur = decode_operand(toks, cur, end, &s1);
+            uint32_t m = d.mask ? d.mask : 0xF;
+            fmt_dst(&d, ds, sizeof(ds), dm);
+            fmt_src(&s0, 0x3, a0, sizeof(a0));
+            if (stex.idx[0] < 16 && ssamp.idx[0] < 16 && (tex_mask & (1U << stex.idx[0])) && (samp_mask & (1U << ssamp.idx[0]))) {
+                sb_appendf(&sb, "    %s = (t%u.sample(s%u, %s)).%s;\n", ds, stex.idx[0], ssamp.idx[0], a0, dm);
+            } else {
+                sb_appendf(&sb, "    %s = (float4(1.0)).%s;\n", ds, dm);
+            }
+        } else if (opc == 13 && out->is_pixel) { /* DISCARD */
+            cur = decode_operand(toks, cur, end, &s0);
+            fmt_src(&s0, 0x1, a0, sizeof(a0));
+            int nz = (tok >> 18) & 1;
+            sb_appendf(&sb, "    if (as_type<uint>(%s) %s 0u) discard_fragment();\n", a0, nz ? "!=" : "==");
+        } else if (opc == 31) { /* IF */
+            cur = decode_operand(toks, cur, end, &s0);
+            fmt_src(&s0, 0x1, a0, sizeof(a0));
+            int nz = (tok >> 18) & 1;
+            sb_appendf(&sb, "    if (as_type<uint>(%s) %s 0u) {\n", a0, nz ? "!=" : "==");
+        } else if (opc == 18) { /* ELSE */
+            sb_appendf(&sb, "    } else {\n");
+        } else if (opc == 21) { /* ENDIF */
+            sb_appendf(&sb, "    }\n");
         }
         p = end;
     }
