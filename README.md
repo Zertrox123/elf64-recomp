@@ -8,7 +8,7 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 
 ![Status treemap](docs/status_treemap.svg)
 
-<sub>*System libraries coverage measured against Portal: Revolution Win64 core binaries (22 PE64 modules: `revolution.exe`, `launcher.dll`, `tier0.dll`, `vstdlib.dll`, `filesystem_stdio.dll`, `engine.dll`, `materialsystem.dll`, `shaderapidx11.dll`, `stdshader_dx11.dll`, `client.dll`, `server.dll`, etc.). Regenerated with <code>make status</code>.</sub>
+<sub>*System libraries coverage measured against Portal: Revolution Win64 binaries (31 PE64 modules: `revolution.exe`, `launcher.dll`, `tier0.dll`, `vstdlib.dll`, `filesystem_stdio.dll`, `engine.dll`, `materialsystem.dll`, `shaderapidx11.dll`, `stdshader_dx11.dll`, `client.dll`, `server.dll`, `panorama.dll`, `panoramauiclient.dll`, `panorama_text_pango.dll`, etc.). Regenerated with <code>make status</code>.</sub>
 
 ## What is this project for?
 
@@ -20,6 +20,12 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 - **Direct3D 11 & DXGI -> Apple Metal**: Translates Windows x64 Direct3D 11 COM calls and DXBC (SM4/SM5) shader bytecode live into Apple Metal Shading Language (MSL) running directly on the Apple Silicon GPU.
 - **Linux Vulkan -> MoltenVK**: Bridges 865+ Vulkan commands (generated from Khronos `vk.xml`) directly to `libMoltenVK.dylib` in a unified 64-bit address space (zero pointer/struct marshalling).
 - **Primary target & roadmap**: Built first to bring **Portal: Revolution** (Strata Source, Windows x64 + Direct3D 11) natively to macOS Apple Silicon, and designed as a reusable engine to port other 64-bit Windows/Linux PC games (64-bit Source / Strata Source titles and beyond) one by one.
+
+## Portal Revolution
+
+![Portal: Revolution running natively on Apple Silicon Metal](docs/portal_revolution_loading.png)
+
+<sub>First native ARM64 Apple Metal render of **Portal: Revolution** (31 Windows x64 PE32+ modules statically recompiled to ARM64 Mach-O, Direct3D 11 / DXBC SM5 -> Apple Metal, Panorama UI + V8 -> JavaScriptCore + Cairo/Pango/FreeType — zero Rosetta, zero Wine, zero JIT).</sub>
 
 ## Architecture
 
