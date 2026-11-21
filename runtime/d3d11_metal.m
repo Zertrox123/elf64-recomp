@@ -116,6 +116,10 @@ typedef struct {
     ComBase          base;
     id<MTLFunction>  mtl_fn;
     DxbcTranslated   info;
+    uint8_t         *bc_copy;
+    size_t           bc_len;
+    int              is_pixel;
+    int              compiled;
 } D3D11ShaderObj;
 
 typedef struct {
@@ -587,28 +591,22 @@ static void dev_CreateInputLayout(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
-static void create_shader_common(CPU64 *c, int expect_pixel) {
-    D3D11DeviceObj *dev = (D3D11DeviceObj *)(uintptr_t)c->rcx;
-    const void *bc = (const void *)(uintptr_t)c->rdx;
-    size_t bclen = (size_t)c->r8;
-    uint64_t out_va = win64_arg_i(c, 4);
-    if (!dev || !bc || !out_va) { c->rax = E_INVALIDARG_H; return; }
-
-    D3D11ShaderObj *sh = (D3D11ShaderObj *)calloc(1, sizeof(D3D11ShaderObj));
-    if (dxbc_to_msl(bc, bclen, &sh->info) != 0 || sh->info.is_pixel != expect_pixel) {
-        fprintf(stderr, "d3d11_metal: DXBC -> MSL translation failed (expect_pixel=%d)\n", expect_pixel);
-        free(sh->info.msl_source);
-        free(sh);
-        c->rax = E_FAIL_HR;
+static void ensure_shader_compiled(D3D11DeviceObj *dev, D3D11ShaderObj *sh) {
+    if (!dev || !sh || sh->compiled) return;
+    sh->compiled = 1;
+    int expect_pixel = sh->is_pixel;
+    if (!sh->bc_copy || dxbc_to_msl(sh->bc_copy, sh->bc_len, &sh->info) != 0) {
+        if (getenv("ELF64_D3D11_TRACE") || getenv("ELF64_TRACE")) {
+            fprintf(stderr, "d3d11_metal: DXBC -> MSL translation failed (pixel=%d)\n", expect_pixel);
+        }
         return;
     }
-
     @autoreleasepool {
         NSString *src = [NSString stringWithUTF8String:sh->info.msl_source];
         NSError *err = nil;
         id<MTLLibrary> lib = [dev->mtl_dev newLibraryWithSource:src options:nil error:&err];
         if (!lib) {
-            if (getenv("ELF64_TRACE")) {
+            if (getenv("ELF64_D3D11_TRACE") || getenv("ELF64_TRACE")) {
                 fprintf(stderr, "d3d11_metal: MSL compile fallback (pixel=%d): %s\n",
                         expect_pixel, err ? [[err localizedDescription] UTF8String] : "?");
             }
@@ -620,7 +618,22 @@ static void create_shader_common(CPU64 *c, int expect_pixel) {
         }
         sh->mtl_fn = lib ? [lib newFunctionWithName:(expect_pixel ? @"fs_main" : @"vs_main")] : nil;
     }
+}
 
+static void create_shader_common(CPU64 *c, int expect_pixel) {
+    D3D11DeviceObj *dev = (D3D11DeviceObj *)(uintptr_t)c->rcx;
+    const void *bc = (const void *)(uintptr_t)c->rdx;
+    size_t bclen = (size_t)c->r8;
+    uint64_t out_va = win64_arg_i(c, 4);
+    if (!dev || !bc || bclen < 32 || !out_va) { c->rax = E_INVALIDARG_H; return; }
+    if (memcmp(bc, "DXBC", 4) != 0) { c->rax = E_FAIL_HR; return; }
+
+    D3D11ShaderObj *sh = (D3D11ShaderObj *)calloc(1, sizeof(D3D11ShaderObj));
+    sh->bc_copy = (uint8_t *)malloc(bclen);
+    if (!sh->bc_copy) { free(sh); c->rax = E_FAIL_HR; return; }
+    memcpy(sh->bc_copy, bc, bclen);
+    sh->bc_len = bclen;
+    sh->is_pixel = expect_pixel;
     sh->base.lpVtbl = g_vt_generic;
     sh->base.kind = expect_pixel ? COM_PSHADER : COM_VSHADER;
     sh->base.refcount = 1;
@@ -968,8 +981,11 @@ static void ctx_ClearDepthStencilView(CPU64 *c, void *ud) {
 }
 
 static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count, uint32_t start, int32_t base_vtx) {
-    if (!ctx || !ctx->vs || !ctx->ps || !ctx->vs->mtl_fn || !ctx->ps->mtl_fn ||
+    if (!ctx || !ctx->vs || !ctx->ps ||
         ctx->num_rtvs <= 0 || !ctx->rtvs[0] || !ctx->rtvs[0]->tex) return;
+    ensure_shader_compiled(ctx->dev, ctx->vs);
+    ensure_shader_compiled(ctx->dev, ctx->ps);
+    if (!ctx->vs->mtl_fn || !ctx->ps->mtl_fn) return;
     @autoreleasepool {
         D3D11Texture2DObj *rt = ctx->rtvs[0]->tex;
         D3D11Texture2DObj *dt = (ctx->dsv && ctx->dsv->tex &&
