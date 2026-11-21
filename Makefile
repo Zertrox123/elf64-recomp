@@ -1,4 +1,4 @@
-.PHONY: check test-unit test-smoke test-vulkan test-win64 test-d3d11 regen-vk clean
+.PHONY: check test-unit test-smoke test-vulkan test-win64 test-d3d11 status regen-vk clean
 
 check: test-unit test-smoke test-vulkan test-win64 test-d3d11
 
@@ -16,6 +16,9 @@ test-win64:
 
 test-d3d11:
 	python3 tests/run_e2e.py d3d11
+
+status:
+	python3 tools/gen_status.py
 
 regen-vk:
 	python3 tools/gen_vulkan64.py -o runtime/vulkan64_gen.inc

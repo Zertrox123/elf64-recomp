@@ -1,0 +1,153 @@
+{
+  "libraries": {
+    "kernel32": [
+      184,
+      264
+    ],
+    "user32": [
+      21,
+      104
+    ],
+    "v8": [
+      0,
+      61
+    ],
+    "gdi32": [
+      0,
+      38
+    ],
+    "ws2_32": [
+      2,
+      27
+    ],
+    "advapi32": [
+      8,
+      22
+    ],
+    "steam_api64": [
+      1,
+      21
+    ],
+    "winmm": [
+      1,
+      20
+    ],
+    "wsock32": [
+      0,
+      13
+    ],
+    "imm32": [
+      0,
+      11
+    ],
+    "ole32": [
+      2,
+      10
+    ],
+    "shell32": [
+      3,
+      8
+    ],
+    "dbghelp": [
+      3,
+      8
+    ],
+    "winhttp": [
+      0,
+      8
+    ],
+    "phonon": [
+      0,
+      8
+    ],
+    "wininet": [
+      0,
+      7
+    ],
+    "rpcrt4": [
+      0,
+      5
+    ],
+    "video64": [
+      0,
+      4
+    ],
+    "dsound": [
+      0,
+      4
+    ],
+    "version": [
+      3,
+      3
+    ],
+    "bcrypt": [
+      1,
+      1
+    ],
+    "iphlpapi": [
+      0,
+      1
+    ],
+    "d3d11": [
+      1,
+      1
+    ],
+    "dxgi": [
+      1,
+      1
+    ],
+    "shlwapi": [
+      0,
+      1
+    ],
+    "oleaut32": [
+      0,
+      1
+    ],
+    "xaudio2_9redist": [
+      0,
+      1
+    ]
+  },
+  "isa_and_shaders": {
+    "GPR / ALU": [
+      41,
+      41
+    ],
+    "CTRL": [
+      39,
+      39
+    ],
+    "SSE / SSE2": [
+      118,
+      118
+    ],
+    "SSE4 / BIT": [
+      10,
+      29
+    ],
+    "ATOMIC / STR": [
+      25,
+      25
+    ],
+    "AVX / FMA": [
+      1,
+      36
+    ],
+    "DXBC SM4/5": [
+      13,
+      54
+    ]
+  },
+  "summary": {
+    "libraries_pct": 35.38,
+    "libraries_done": 231,
+    "libraries_total": 653,
+    "isa_pct": 81.25,
+    "isa_done": 234,
+    "isa_total": 288,
+    "dxbc_pct": 24.07,
+    "dxbc_done": 13,
+    "dxbc_total": 54
+  }
+}

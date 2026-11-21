@@ -10,6 +10,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 
 import audit_pe64  # noqa: E402
+import gen_status  # noqa: E402
 import gen_vulkan64  # noqa: E402
 import lift64  # noqa: E402
 import peprep64  # noqa: E402
@@ -133,6 +134,18 @@ class TestPePrep64(unittest.TestCase):
             self.assertEqual(rep["missing_imports"], 0)
             self.assertEqual(rep["unimpl_mnemonics"], [])
             self.assertIn("D3D11CreateDeviceAndSwapChain", audit_pe64.collect_implemented_shims())
+
+
+class TestGenStatus(unittest.TestCase):
+    def test_squarify_and_svg_bounds(self):
+        rects = gen_status.squarify_layout([("a", 50.0), ("b", 30.0), ("c", 20.0)], 0, 0, 400, 200)
+        self.assertEqual(len(rects), 3)
+        total_area = sum(rw * rh for _, _, _, rw, rh in rects)
+        self.assertAlmostEqual(total_area, 80000.0, places=2)
+        svg = gen_status.render_full_svg({"kernel32": (10, 20)}, {"GPR": (5, 5)})
+        self.assertIn("<svg", svg)
+        self.assertIn("kernel32", svg)
+        self.assertIn("GPR", svg)
 
 
 if __name__ == "__main__":
