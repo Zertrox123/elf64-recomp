@@ -60,7 +60,20 @@ class TestLift64(unittest.TestCase):
         self.assertIn("__atomic_compare_exchange_n((__uint128_t *)", code)
 
     def test_sse_scalar_and_packed(self):
-        for txt in ("addsd xmm0, xmm1", "mulss xmm2, dword ptr [rdi]", "xorps xmm0, xmm0", "pshufd xmm0, xmm1, 0xe4"):
+        for txt in (
+            "addsd xmm0, xmm1",
+            "mulss xmm2, dword ptr [rdi]",
+            "xorps xmm0, xmm0",
+            "pshufd xmm0, xmm1, 0xe4",
+            "pshufb xmm0, xmm1",
+            "palignr xmm0, xmm1, 0x4",
+            "ptest xmm0, xmm1",
+            "pmovzxbd xmm0, dword ptr [rsi]",
+            "roundss xmm0, xmm1, 0x1",
+            "blendvps xmm1, xmm2, xmm0",
+            "pextrd eax, xmm0, 0x2",
+            "pinsrd xmm0, eax, 0x1",
+        ):
             pfx, mnem, ops = lift64.parse_insn_text(txt)
             ins = lift64.Insn(0x1000, 4, txt, pfx, mnem, ops)
             unimpl = []

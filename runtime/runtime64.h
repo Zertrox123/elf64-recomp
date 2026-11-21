@@ -49,6 +49,7 @@ typedef struct {
 
 typedef struct {
     const char *name;
+    uint64_t    mod_base;
     uint64_t    addr;
 } RTExportSpec;
 
@@ -86,6 +87,7 @@ void     rt_register_shim(const char *name, RTShimFn fn, void *userdata);
 RTShimFn rt_find_shim(const char *name, void **out_userdata);
 uint64_t rt_alloc_dynamic_thunk(const char *name, RTShimFn fn, void *userdata);
 uint64_t rt_lookup_export(const char *name);
+uint64_t rt_lookup_export_in_module(uint64_t mod_base, const char *name);
 uint64_t rt_find_module_base(const char *name);
 
 /* Dispatch & invocation */

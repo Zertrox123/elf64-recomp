@@ -127,14 +127,14 @@ typedef struct {
     WinHandleKind kind;
     pthread_t     tid;
     int           joined;
-    pthread_mutex_t ev_mu;
-    pthread_cond_t  ev_cv;
+    int           finished;
     int           ev_signaled;
     int           ev_manual;
     int           fd;
 } WinHandleObj;
 
 static pthread_mutex_t g_wh_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_wh_cv = PTHREAD_COND_INITIALIZER;
 static WinHandleObj   *g_wh_slots[1024];
 static uint32_t        g_wh_next = 0x100;
 
@@ -363,6 +363,14 @@ static void w_GetProcAddress(CPU64 *c, void *ud) {
     (void)ud;
     const char *sym = (const char *)(uintptr_t)c->rdx;
     if (!sym || (uintptr_t)sym < 0x10000) { c->rax = 0; return; }
+    if (c->rcx && c->rcx != 0x7090000000ULL) {
+        uint64_t mod_exp = rt_lookup_export_in_module(c->rcx, sym);
+        if (mod_exp) { c->rax = mod_exp; return; }
+        /* Guest module does not export this symbol; do not cross-leak another DLL's export! */
+        for (size_t i = 0; i < g_rt_module_count; i++) {
+            if (g_rt_modules[i].map_addr == c->rcx) { c->rax = 0; return; }
+        }
+    }
     uint64_t exp = rt_lookup_export(sym);
     if (exp) { c->rax = exp; return; }
     void *sud = NULL;
@@ -458,7 +466,7 @@ static void w_LeaveCriticalSection(CPU64 *c, void *ud)    { (void)ud; pthread_mu
 static void w_DeleteCriticalSection(CPU64 *c, void *ud)   { (void)ud; (void)c; }
 
 /* Threads & Events */
-typedef struct { uint64_t fn; uint64_t param; } WinThreadStart;
+typedef struct { uint64_t fn; uint64_t param; WinHandleObj *ho; } WinThreadStart;
 
 static void *win_thread_tramp(void *p) {
     WinThreadStart st = *(WinThreadStart *)p;
@@ -467,22 +475,28 @@ static void *win_thread_tramp(void *p) {
     rt_init_thread_cpu(&cpu, 4 * 1024 * 1024);
     uint64_t r = rt_invoke_win64(&cpu, st.fn, st.param, 0, 0, 0, 0, 0);
     rt_destroy_thread_cpu(&cpu);
+    pthread_mutex_lock(&g_wh_mu);
+    st.ho->finished = 1;
+    pthread_cond_broadcast(&g_wh_cv);
+    pthread_mutex_unlock(&g_wh_mu);
     return (void *)(uintptr_t)r;
 }
 
 static void w_CreateThread(CPU64 *c, void *ud) {
     (void)ud;
+    WinHandleObj *ho = (WinHandleObj *)calloc(1, sizeof(WinHandleObj));
+    ho->kind = WH_THREAD;
     WinThreadStart *st = (WinThreadStart *)malloc(sizeof(WinThreadStart));
     st->fn = c->r8;
     st->param = c->r9;
-    WinHandleObj *ho = (WinHandleObj *)calloc(1, sizeof(WinHandleObj));
-    ho->kind = WH_THREAD;
-    if (pthread_create(&ho->tid, NULL, win_thread_tramp, st) != 0) {
+    st->ho = ho;
+    uint64_t handle = wh_alloc(ho);
+    if (!handle || pthread_create(&ho->tid, NULL, win_thread_tramp, st) != 0) {
         free(st); free(ho); c->rax = 0; return;
     }
     uint64_t tid_out = win64_arg_i(c, 5);
     if (tid_out) W32(tid_out, (uint32_t)(uintptr_t)ho->tid);
-    c->rax = wh_alloc(ho);
+    c->rax = handle;
 }
 
 static void w_CreateEventA(CPU64 *c, void *ud) {
@@ -491,64 +505,146 @@ static void w_CreateEventA(CPU64 *c, void *ud) {
     ho->kind = WH_EVENT;
     ho->ev_manual = (int)(c->rdx != 0);
     ho->ev_signaled = (int)(c->r8 != 0);
-    pthread_mutex_init(&ho->ev_mu, NULL);
-    pthread_cond_init(&ho->ev_cv, NULL);
     c->rax = wh_alloc(ho);
 }
 static void w_SetEvent(CPU64 *c, void *ud) {
     (void)ud;
+    pthread_mutex_lock(&g_wh_mu);
     WinHandleObj *ho = wh_get(c->rcx);
-    if (!ho || ho->kind != WH_EVENT) { c->rax = 0; return; }
-    pthread_mutex_lock(&ho->ev_mu);
+    if (!ho || ho->kind != WH_EVENT) { pthread_mutex_unlock(&g_wh_mu); c->rax = 0; return; }
     ho->ev_signaled = 1;
-    if (ho->ev_manual) pthread_cond_broadcast(&ho->ev_cv);
-    else pthread_cond_signal(&ho->ev_cv);
-    pthread_mutex_unlock(&ho->ev_mu);
+    pthread_cond_broadcast(&g_wh_cv);
+    pthread_mutex_unlock(&g_wh_mu);
     c->rax = 1;
 }
 static void w_ResetEvent(CPU64 *c, void *ud) {
     (void)ud;
+    pthread_mutex_lock(&g_wh_mu);
     WinHandleObj *ho = wh_get(c->rcx);
-    if (!ho || ho->kind != WH_EVENT) { c->rax = 0; return; }
-    pthread_mutex_lock(&ho->ev_mu);
+    if (!ho || ho->kind != WH_EVENT) { pthread_mutex_unlock(&g_wh_mu); c->rax = 0; return; }
     ho->ev_signaled = 0;
-    pthread_mutex_unlock(&ho->ev_mu);
+    pthread_mutex_unlock(&g_wh_mu);
     c->rax = 1;
 }
+
+static int wh_is_signaled_locked(uint64_t h) {
+    if (h >= 0x30000ULL && h < 0x40000ULL) return 1; /* mutex/semaphore */
+    WinHandleObj *ho = wh_get(h);
+    if (!ho) return 1;
+    if (ho->kind == WH_EVENT) return ho->ev_signaled;
+    if (ho->kind == WH_THREAD) return ho->finished;
+    return 1;
+}
+
+static void wh_consume_locked(uint64_t h) {
+    WinHandleObj *ho = wh_get(h);
+    if (!ho) return;
+    if (ho->kind == WH_EVENT && !ho->ev_manual) ho->ev_signaled = 0;
+}
+
+static uint32_t wait_handles_impl(const uint64_t *handles, uint32_t count, int wait_all, uint32_t ms) {
+    if (count == 0) return 0xFFFFFFFFU;
+    struct timespec deadline;
+    int has_timeout = (ms != 0xFFFFFFFFU && ms != 0);
+    if (has_timeout) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += (time_t)(ms / 1000U);
+        deadline.tv_nsec += (long)(ms % 1000U) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    }
+
+    pthread_mutex_lock(&g_wh_mu);
+    for (;;) {
+        if (wait_all) {
+            int all_ready = 1;
+            for (uint32_t i = 0; i < count; i++) {
+                if (!wh_is_signaled_locked(handles[i])) { all_ready = 0; break; }
+            }
+            if (all_ready) {
+                for (uint32_t i = 0; i < count; i++) wh_consume_locked(handles[i]);
+                pthread_mutex_unlock(&g_wh_mu);
+                return 0;
+            }
+        } else {
+            for (uint32_t i = 0; i < count; i++) {
+                if (wh_is_signaled_locked(handles[i])) {
+                    wh_consume_locked(handles[i]);
+                    pthread_mutex_unlock(&g_wh_mu);
+                    return i; /* WAIT_OBJECT_0 + i */
+                }
+            }
+        }
+        if (ms == 0) {
+            pthread_mutex_unlock(&g_wh_mu);
+            return 0x102; /* WAIT_TIMEOUT */
+        }
+        if (has_timeout) {
+            int rc = pthread_cond_timedwait(&g_wh_cv, &g_wh_mu, &deadline);
+            if (rc == ETIMEDOUT) {
+                pthread_mutex_unlock(&g_wh_mu);
+                return 0x102;
+            }
+        } else {
+            pthread_cond_wait(&g_wh_cv, &g_wh_mu);
+        }
+    }
+}
+
 static void w_WaitForSingleObject(CPU64 *c, void *ud) {
     (void)ud;
-    if (c->rcx >= 0x30000ULL && c->rcx < 0x40000ULL) { c->rax = 0; return; } /* mutex/semaphore */
-    WinHandleObj *ho = wh_get(c->rcx);
-    if (!ho) { c->rax = 0xFFFFFFFFU; return; }
-    if (ho->kind == WH_THREAD) {
-        if (!ho->joined) { pthread_join(ho->tid, NULL); ho->joined = 1; }
-        c->rax = 0; /* WAIT_OBJECT_0 */
-        return;
-    }
-    if (ho->kind == WH_EVENT) {
-        uint32_t ms = (uint32_t)c->rdx;
-        pthread_mutex_lock(&ho->ev_mu);
-        if (!ho->ev_signaled && ms == 0) {
-            pthread_mutex_unlock(&ho->ev_mu);
-            c->rax = 0x102; /* WAIT_TIMEOUT */
-            return;
+    uint64_t h = c->rcx;
+    uint32_t ms = (uint32_t)c->rdx;
+    uint32_t r = wait_handles_impl(&h, 1, 0, ms);
+    if (r == 0) {
+        pthread_t to_join = 0;
+        int do_join = 0;
+        pthread_mutex_lock(&g_wh_mu);
+        WinHandleObj *ho = wh_get(h);
+        if (ho && ho->kind == WH_THREAD && !ho->joined) {
+            ho->joined = 1;
+            to_join = ho->tid;
+            do_join = 1;
         }
-        while (!ho->ev_signaled) pthread_cond_wait(&ho->ev_cv, &ho->ev_mu);
-        if (!ho->ev_manual) ho->ev_signaled = 0;
-        pthread_mutex_unlock(&ho->ev_mu);
-        c->rax = 0;
-        return;
+        pthread_mutex_unlock(&g_wh_mu);
+        if (do_join) pthread_join(to_join, NULL);
     }
-    c->rax = 0;
+    c->rax = r;
+}
+static void w_WaitForMultipleObjects(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t count = (uint32_t)c->rcx;
+    uint64_t arr_va = c->rdx;
+    int wait_all = (int)(c->r8 != 0);
+    uint32_t ms = (uint32_t)c->r9;
+    if (count == 0 || count > 64 || !arr_va) { c->rax = 0xFFFFFFFFU; return; }
+    uint64_t hs[64];
+    for (uint32_t i = 0; i < count; i++) hs[i] = R64(arr_va + i * 8ULL);
+    c->rax = wait_handles_impl(hs, count, wait_all, ms);
+}
+static void w_GetExitCodeThread(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rdx) { c->rax = 0; return; }
+    pthread_mutex_lock(&g_wh_mu);
+    WinHandleObj *ho = wh_get(c->rcx);
+    uint32_t code = (ho && ho->kind == WH_THREAD && !ho->finished) ? 259U /* STILL_ACTIVE */ : 0U;
+    pthread_mutex_unlock(&g_wh_mu);
+    W32(c->rdx, code);
+    c->rax = 1;
 }
 static void w_CloseHandle(CPU64 *c, void *ud) {
     (void)ud;
-    WinHandleObj *ho = wh_get(c->rcx);
-    if (!ho) { c->rax = 1; return; }
-    if (ho->kind == WH_FILE && ho->fd >= 0) close(ho->fd);
+    if (c->rcx >= 0x20000ULL && c->rcx < 0x30000ULL) {
+        int fd = (int)(c->rcx - 0x20000ULL);
+        if (fd > 2) close(fd);
+        c->rax = 1;
+        return;
+    }
     pthread_mutex_lock(&g_wh_mu);
+    WinHandleObj *ho = wh_get(c->rcx);
+    if (!ho) { pthread_mutex_unlock(&g_wh_mu); c->rax = 1; return; }
     g_wh_slots[c->rcx - 0x100] = NULL;
     pthread_mutex_unlock(&g_wh_mu);
+    if (ho->kind == WH_FILE && ho->fd >= 0) close(ho->fd);
     free(ho);
     c->rax = 1;
 }
@@ -619,24 +715,35 @@ static void w_OutputDebugStringA(CPU64 *c, void *ud) {
 }
 static void w_MultiByteToWideChar(CPU64 *c, void *ud) {
     (void)ud;
-    const char *src = (const char *)(uintptr_t)c->r8;
+    const uint8_t *src = (const uint8_t *)(uintptr_t)c->r8;
+    int slen = (int)(int32_t)c->r9;
     uint16_t *dst = (uint16_t *)(uintptr_t)win64_arg_i(c, 4);
-    int dst_cap = (int)win64_arg_i(c, 5);
-    size_t len = strlen(src) + 1;
-    if (dst_cap == 0 || !dst) { c->rax = len; return; }
-    c->rax = utf8_to_utf16(src, dst, (size_t)dst_cap) + 1;
+    int dst_cap = (int)(int32_t)win64_arg_i(c, 5);
+    if (!src) { c->rax = 0; return; }
+    size_t nbytes = (slen < 0) ? (strlen((const char *)src) + 1) : (size_t)slen;
+    if (dst_cap == 0 || !dst) { c->rax = nbytes; return; }
+    size_t n = nbytes < (size_t)dst_cap ? nbytes : (size_t)dst_cap;
+    for (size_t i = 0; i < n; i++) dst[i] = src[i];
+    c->rax = n;
 }
 static void w_WideCharToMultiByte(CPU64 *c, void *ud) {
     (void)ud;
     const uint16_t *src = (const uint16_t *)(uintptr_t)c->r8;
+    int slen = (int)(int32_t)c->r9;
     char *dst = (char *)(uintptr_t)win64_arg_i(c, 4);
-    int dst_cap = (int)win64_arg_i(c, 5);
-    char tmp[1024];
-    size_t n = utf16_to_utf8(src, tmp, sizeof(tmp)) + 1;
-    if (dst_cap == 0 || !dst) { c->rax = n; return; }
-    size_t cp = n < (size_t)dst_cap ? n : (size_t)dst_cap;
-    memcpy(dst, tmp, cp);
-    c->rax = cp;
+    int dst_cap = (int)(int32_t)win64_arg_i(c, 5);
+    if (!src) { c->rax = 0; return; }
+    size_t nchars = 0;
+    if (slen < 0) {
+        while (src[nchars]) nchars++;
+        nchars++; /* include NUL */
+    } else {
+        nchars = (size_t)slen;
+    }
+    if (dst_cap == 0 || !dst) { c->rax = nchars; return; }
+    size_t n = nchars < (size_t)dst_cap ? nchars : (size_t)dst_cap;
+    for (size_t i = 0; i < n; i++) dst[i] = (src[i] < 128) ? (char)src[i] : '?';
+    c->rax = n;
 }
 static void w_ExitProcess(CPU64 *c, void *ud) {
     (void)ud;
@@ -785,7 +892,11 @@ void rt_register_win32_64(void) {
     REG("DeleteCriticalSection", w_DeleteCriticalSection);
     REG("CreateThread", w_CreateThread); REG("CreateEventA", w_CreateEventA); REG("CreateEventW", w_CreateEventA);
     REG("SetEvent", w_SetEvent); REG("ResetEvent", w_ResetEvent);
-    REG("WaitForSingleObject", w_WaitForSingleObject); REG("CloseHandle", w_CloseHandle);
+    REG("WaitForSingleObject", w_WaitForSingleObject);
+    REG("WaitForSingleObjectEx", w_WaitForSingleObject);
+    REG("WaitForMultipleObjects", w_WaitForMultipleObjects);
+    REG("GetExitCodeThread", w_GetExitCodeThread);
+    REG("CloseHandle", w_CloseHandle);
     REG("TlsAlloc", w_TlsAlloc); REG("TlsGetValue", w_TlsGetValue);
     REG("TlsSetValue", w_TlsSetValue); REG("TlsFree", w_TlsFree);
     REG("GetStdHandle", w_GetStdHandle); REG("WriteFile", w_WriteFile);

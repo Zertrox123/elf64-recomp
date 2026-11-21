@@ -214,6 +214,73 @@ def disassemble_module(
     if not all_insns:
         return []
 
+    # Resync disassembly for any known code_root whose entry byte was swallowed by
+    # inline jump-table data in .text (e.g., MSVC switch tables right before a function).
+    missing_roots = sorted(r for r in code_roots if r not in addr_to_idx)
+    if missing_roots:
+        resynced_ranges: List[Tuple[int, int]] = []
+        resynced_insns: List[Insn] = []
+        for mr in missing_roots:
+            if mr in addr_to_idx:
+                continue
+            stop_addr = mr + 0x2000
+            raw_start = mr - shift
+            raw_stop = stop_addr - shift
+            rcmd = [
+                objdump, "-d", "-M", "intel",
+                f"--start-address=0x{raw_start:x}",
+                f"--stop-address=0x{raw_stop:x}",
+            ]
+            if not is_pe:
+                rcmd.append(f"--adjust-vma=0x{base:x}")
+            rcmd.append(elf_path)
+            rout = subprocess.check_output(rcmd, text=True)
+            r_pending = ""
+            added_any = False
+            for line in rout.splitlines():
+                m = INSN_RE.match(line)
+                if not m:
+                    continue
+                addr = int(m.group(1), 16) + shift
+                raw_hex = m.group(2).strip().split()
+                text = m.group(3).strip()
+                if not text:
+                    if added_any and resynced_insns:
+                        resynced_insns[-1].size += len(raw_hex)
+                    continue
+                # Stop once we resynchronize with the primary disassembly stream.
+                if added_any and addr in addr_to_idx:
+                    break
+                prefix, mnem, ops = parse_insn_text(text)
+                if shift and ops and (
+                    mnem in ("call", "jmp", "jecxz", "jrcxz")
+                    or (mnem.startswith("j") and mnem[1:] in CC_EXPR)
+                ):
+                    t = parse_imm(ops[0])
+                    if t is not None:
+                        ops[0] = f"0x{t + shift:x}"
+                if prefix and mnem == "nop" and not ops:
+                    r_pending = prefix
+                    prefix = ""
+                elif r_pending:
+                    prefix = r_pending
+                    r_pending = ""
+                if addr not in addr_to_idx:
+                    ins_obj = Insn(addr, len(raw_hex), text, prefix, mnem, ops)
+                    resynced_insns.append(ins_obj)
+                    addr_to_idx[addr] = -1
+                    added_any = True
+            if added_any:
+                resynced_ranges.append((mr, resynced_insns[-1].next_addr))
+        if resynced_insns:
+            # Drop stale desynchronized instructions overlapped by resynced spans.
+            all_insns = [
+                ins for ins in all_insns
+                if not any(lo <= ins.addr < hi for lo, hi in resynced_ranges)
+            ] + resynced_insns
+            all_insns.sort(key=lambda ins: ins.addr)
+            addr_to_idx = {ins.addr: i for i, ins in enumerate(all_insns)}
+
     # Function starts = objdump symbol headers U layout code_roots (that exist in disassembly).
     root_set: Set[int] = set(sym_starts.keys())
     for r in code_roots:
@@ -795,6 +862,64 @@ def lift_sse(insn: Insn) -> Optional[str]:
         d = f"c->{REG_INFO[ops[0]][0]}"
         sh = f"{parse_imm(ops[1])}U" if parse_imm(ops[1]) is not None else f"(unsigned)({read_xmm128(ops[1], nr)}.q[0])"
         return f"{{ unsigned _sh = {sh}; if (_sh >= {bits}) _sh = {bits - 1}; for (int _i=0; _i<{lanes}; _i++) {d}.{sf}[_i] >>= _sh; }}"
+    if m == "pshufb":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (
+            f"{{ Xmm128 _a = {d}, _m = {read_xmm128(ops[1], nr)}, _r; "
+            f"for (int _i=0; _i<16; _i++) _r.b[_i] = (_m.b[_i] & 0x80) ? 0 : _a.b[_m.b[_i] & 0xF]; {d} = _r; }}"
+        )
+    if m == "palignr":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        imm = parse_imm(ops[2])
+        return (
+            f"{{ Xmm128 _a = {d}, _b = {read_xmm128(ops[1], nr)}, _r; uint8_t _cat[32]; "
+            f"memcpy(_cat, _b.b, 16); memcpy(_cat + 16, _a.b, 16); "
+            f"for (int _i=0; _i<16; _i++) _r.b[_i] = (_i + {imm} < 32) ? _cat[_i + {imm}] : 0; {d} = _r; }}"
+        )
+    if m == "ptest":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (
+            f"{{ Xmm128 _a = {d}, _b = {read_xmm128(ops[1], nr)}; "
+            f"c->zf = (((_a.q[0] & _b.q[0]) | (_a.q[1] & _b.q[1])) == 0); "
+            f"c->cf = ((((~_a.q[0]) & _b.q[0]) | ((~_a.q[1]) & _b.q[1])) == 0); c->of = c->sf = c->pf = c->af = 0; }}"
+        )
+    if m in ("roundss", "roundsd"):
+        is_d = (m == "roundsd")
+        imm = parse_imm(ops[2]) & 3
+        fn = {0: "rint", 1: "floor", 2: "ceil", 3: "trunc"}[imm]
+        if is_d:
+            return f"c->{REG_INFO[ops[0]][0]}.df[0] = {fn}({read_xmm_double(ops[1], nr)});"
+        return f"c->{REG_INFO[ops[0]][0]}.f[0] = {fn}f({read_xmm_float(ops[1], nr)});"
+    if m == "blendvps":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        msk = f"c->{REG_INFO[ops[2]][0]}" if len(ops) > 2 else "c->xmm[0]"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<4; _i++) if ({msk}.d[_i] >> 31) {d}.d[_i] = _s.d[_i]; }}"
+    if m == "pblendw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        imm = parse_imm(ops[2])
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<8; _i++) if (({imm} >> _i) & 1) {d}.w[_i] = _s.w[_i]; }}"
+    if m in ("pextrb", "pextrw", "pextrd", "pextrq"):
+        fld, bits, mask = {"pextrb": ("b", 8, 15), "pextrw": ("w", 16, 7), "pextrd": ("d", 32, 3), "pextrq": ("q", 64, 1)}[m]
+        s = f"c->{REG_INFO[ops[1]][0]}"
+        idx = parse_imm(ops[2]) & mask
+        dw = op_width(ops[0], nr) or (64 if bits == 64 else 32)
+        return f"{write_op(ops[0], dw, f'{s}.{fld}[{idx}]', nr)};"
+    if m in ("pinsrb", "pinsrw", "pinsrd", "pinsrq"):
+        fld, bits, mask = {"pinsrb": ("b", 8, 15), "pinsrw": ("w", 16, 7), "pinsrd": ("d", 32, 3), "pinsrq": ("q", 64, 1)}[m]
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        idx = parse_imm(ops[2]) & mask
+        return f"{d}.{fld}[{idx}] = (uint{bits}_t)({read_op(ops[1], bits, nr)});"
+    if m in ("pmovzxbw", "pmovzxbd", "pmovzxwd", "pmovzxbq", "pmovzxwq", "pmovzxdq"):
+        spec = {
+            "pmovzxbw": ("b", "w", 8, 8), "pmovzxbd": ("b", "d", 4, 4), "pmovzxwd": ("w", "d", 4, 8),
+            "pmovzxbq": ("b", "q", 2, 2), "pmovzxwq": ("w", "q", 2, 4), "pmovzxdq": ("d", "q", 2, 8),
+        }[m]
+        sf, df, cnt, nbytes = spec
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        mm = parse_mem(ops[1], nr)
+        if mm is not None:
+            return f"{{ Xmm128 _s; memset(&_s, 0, 16); memcpy(&_s, (const void *)(uintptr_t)({mm[1]}), {nbytes}); Xmm128 _r; memset(&_r, 0, 16); for (int _i=0; _i<{cnt}; _i++) _r.{df}[_i] = _s.{sf}[_i]; {d} = _r; }}"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; Xmm128 _r; memset(&_r, 0, 16); for (int _i=0; _i<{cnt}; _i++) _r.{df}[_i] = _s.{sf}[_i]; {d} = _r; }}"
     if m == "pcmpistri":
         imm = parse_imm(ops[2])
         return f"f_pcmpistri(c, c->{REG_INFO[ops[0]][0]}, {read_xmm128(ops[1], nr)}, 0x{imm & 0xFF:x}U);"
@@ -1332,12 +1457,13 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
 
         exports = []
         for m in layout["modules"]:
+            mbase = m["map_addr"]
             for name, addr in m["exports"].items():
-                exports.append((name, addr))
+                exports.append((name, mbase, addr))
         f.write("const RTExportSpec g_rt_exports[] = {\n")
-        for name, addr in exports:
-            f.write(f'    {{ "{name}", 0x{addr:x}ULL }},\n')
-        f.write(f"    {{ NULL, 0 }}\n}};\nconst size_t g_rt_export_count = {len(exports)};\n\n")
+        for name, mbase, addr in exports:
+            f.write(f'    {{ "{name}", 0x{mbase:x}ULL, 0x{addr:x}ULL }},\n')
+        f.write(f"    {{ NULL, 0, 0 }}\n}};\nconst size_t g_rt_export_count = {len(exports)};\n\n")
 
         f.write("const RTFuncEntry g_rt_funcs[] = {\n")
         for fn in all_funcs:

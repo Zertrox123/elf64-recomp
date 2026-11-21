@@ -159,6 +159,16 @@ uint64_t rt_lookup_export(const char *name) {
     return 0;
 }
 
+uint64_t rt_lookup_export_in_module(uint64_t mod_base, const char *name) {
+    if (!mod_base || !name) return 0;
+    for (size_t i = 0; i < g_rt_export_count; i++) {
+        if (g_rt_exports[i].mod_base == mod_base && strcmp(g_rt_exports[i].name, name) == 0) {
+            return g_rt_exports[i].addr;
+        }
+    }
+    return 0;
+}
+
 uint64_t rt_find_module_base(const char *name) {
     if (!name || !*name) {
         return g_rt_module_count > 0 ? g_rt_modules[0].map_addr : 0;

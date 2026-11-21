@@ -1,7 +1,7 @@
 {
   "libraries": {
     "kernel32": [
-      184,
+      217,
       264
     ],
     "user32": [
@@ -21,11 +21,11 @@
       27
     ],
     "advapi32": [
-      8,
+      11,
       22
     ],
     "steam_api64": [
-      1,
+      5,
       21
     ],
     "winmm": [
@@ -45,7 +45,7 @@
       10
     ],
     "shell32": [
-      3,
+      4,
       8
     ],
     "dbghelp": [
@@ -123,7 +123,7 @@
       118
     ],
     "SSE4 / BIT": [
-      10,
+      28,
       29
     ],
     "ATOMIC / STR": [
@@ -140,11 +140,11 @@
     ]
   },
   "summary": {
-    "libraries_pct": 35.38,
-    "libraries_done": 231,
+    "libraries_pct": 41.65,
+    "libraries_done": 272,
     "libraries_total": 653,
-    "isa_pct": 81.25,
-    "isa_done": 234,
+    "isa_pct": 87.5,
+    "isa_done": 252,
     "isa_total": 288,
     "dxbc_pct": 24.07,
     "dxbc_done": 13,

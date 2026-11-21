@@ -326,6 +326,7 @@ static void w_GetStartupInfoW(CPU64 *c, void *ud) {
 static void w_GetCurrentProcess(CPU64 *c, void *ud) { (void)ud; c->rax = (uint64_t)-1LL; }
 static void w_GetCurrentThread(CPU64 *c, void *ud)  { (void)ud; c->rax = (uint64_t)-2LL; }
 static void w_GetCurrentProcessorNumber(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
+static void w_GetThreadId(CPU64 *c, void *ud) { (void)ud; c->rax = c->rcx ? (uint32_t)c->rcx : 1U; }
 static void w_EncodePointer(CPU64 *c, void *ud)     { (void)ud; c->rax = c->rcx; }
 static void w_DecodePointer(CPU64 *c, void *ud)     { (void)ud; c->rax = c->rcx; }
 static void w_IsDebuggerPresent(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
@@ -540,6 +541,9 @@ static uint64_t open_win_file(const char *path, uint32_t access, uint32_t disp) 
     else if (disp == 4 /* OPEN_ALWAYS */) flags |= O_CREAT;
     else if (disp == 5 /* TRUNCATE_EXISTING */) flags |= O_TRUNC;
     int fd = open(px, flags, 0644);
+    if (getenv("ELF64_TRACE")) {
+        fprintf(stderr, "[fs] open('%s', flags=0x%x) -> fd=%d\n", px, flags, fd);
+    }
     if (fd < 0) return (uint64_t)-1LL;
     return 0x20000ULL + (uint64_t)fd;
 }
@@ -557,6 +561,9 @@ static void w_ReadFile(CPU64 *c, void *ud) {
     int fd = (c->rcx == 1) ? STDIN_FILENO : ((c->rcx >= 0x20000ULL && c->rcx < 0x30000ULL) ? (int)(c->rcx - 0x20000ULL) : -1);
     if (fd < 0) { c->rax = 0; return; }
     ssize_t n = read(fd, (void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8);
+    if (getenv("ELF64_TRACE")) {
+        fprintf(stderr, "[fs] read(fd=%d, len=%u) -> %zd\n", fd, (uint32_t)c->r8, n);
+    }
     if (c->r9) W32(c->r9, n >= 0 ? (uint32_t)n : 0);
     c->rax = (n >= 0) ? 1 : 0;
 }
@@ -595,6 +602,194 @@ static void w_OutputDebugStringW(CPU64 *c, void *ud) {
     w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, buf, sizeof(buf));
     fprintf(stderr, "[ODS] %s", buf);
 }
+/* ---- Real POSIX FindFirstFileA/W + FindNextFileA/W + FindClose ---- */
+typedef struct {
+    DIR  *dir;
+    char  dir_path[1024];
+    char  pattern[256];
+} WinFindObj;
+
+static WinFindObj *g_finds[64];
+
+static int match_wildcard(const char *pat, const char *str) {
+    while (*pat) {
+        if (*pat == '*') {
+            while (*pat == '*') pat++;
+            if (!*pat) return 1;
+            for (; *str; str++) if (match_wildcard(pat, str)) return 1;
+            return 0;
+        }
+        if (*pat == '?' || tolower((unsigned char)*pat) == tolower((unsigned char)*str)) {
+            if (!*str) return 0;
+            pat++; str++;
+        } else return 0;
+    }
+    return *str == '\0';
+}
+
+static int fill_find_next(WinFindObj *fo, uint64_t data_va, int is_wide) {
+    struct dirent *de;
+    while ((de = readdir(fo->dir)) != NULL) {
+        if (!match_wildcard(fo->pattern, de->d_name)) continue;
+        char full[1280];
+        snprintf(full, sizeof(full), "%s/%s", fo->dir_path, de->d_name);
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        stat(full, &st);
+        uint32_t attrs = S_ISDIR(st.st_mode) ? 0x10U : 0x80U;
+        uint64_t mft = unix_to_filetime(st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec);
+        if (is_wide) {
+            memset((void *)(uintptr_t)data_va, 0, 592);
+            W32(data_va + 0, attrs);
+            W64(data_va + 20, mft);
+            W32(data_va + 28, (uint32_t)((uint64_t)st.st_size >> 32));
+            W32(data_va + 32, (uint32_t)st.st_size);
+            u8_to_w16(de->d_name, (uint16_t *)(uintptr_t)(data_va + 44), 260);
+        } else {
+            memset((void *)(uintptr_t)data_va, 0, 320);
+            W32(data_va + 0, attrs);
+            W64(data_va + 20, mft);
+            W32(data_va + 28, (uint32_t)((uint64_t)st.st_size >> 32));
+            W32(data_va + 32, (uint32_t)st.st_size);
+            snprintf((char *)(uintptr_t)(data_va + 44), 260, "%s", de->d_name);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static uint64_t start_find(const char *win_spec, uint64_t data_va, int is_wide) {
+    char px[1024];
+    win_path_to_posix(win_spec, px, sizeof(px));
+    char *slash = strrchr(px, '/');
+    char dirp[1024], pat[256];
+    if (slash) {
+        size_t dl = (size_t)(slash - px);
+        if (dl == 0) strcpy(dirp, "/");
+        else { memcpy(dirp, px, dl); dirp[dl] = '\0'; }
+        snprintf(pat, sizeof(pat), "%s", slash + 1);
+    } else {
+        strcpy(dirp, ".");
+        snprintf(pat, sizeof(pat), "%s", px);
+    }
+    DIR *d = opendir(dirp);
+    if (!d) return (uint64_t)-1LL;
+    WinFindObj *fo = (WinFindObj *)calloc(1, sizeof(WinFindObj));
+    fo->dir = d;
+    snprintf(fo->dir_path, sizeof(fo->dir_path), "%s", dirp);
+    snprintf(fo->pattern, sizeof(fo->pattern), "%s", pat);
+    if (!fill_find_next(fo, data_va, is_wide)) {
+        closedir(d); free(fo);
+        return (uint64_t)-1LL;
+    }
+    for (int i = 0; i < 64; i++) {
+        if (!g_finds[i]) { g_finds[i] = fo; return 0x40000ULL + (uint64_t)i; }
+    }
+    closedir(d); free(fo);
+    return (uint64_t)-1LL;
+}
+
+static void w_FindFirstFileA(CPU64 *c, void *ud)   { (void)ud; c->rax = c->rcx ? start_find((const char *)(uintptr_t)c->rcx, c->rdx, 0) : (uint64_t)-1LL; }
+static void w_FindFirstFileExA(CPU64 *c, void *ud) { (void)ud; c->rax = c->rcx ? start_find((const char *)(uintptr_t)c->rcx, c->r8, 0) : (uint64_t)-1LL; }
+static void w_FindFirstFileW(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) { c->rax = (uint64_t)-1LL; return; }
+    char u8[1024]; w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, u8, sizeof(u8));
+    c->rax = start_find(u8, c->rdx, 1);
+}
+static void w_FindFirstFileExW(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) { c->rax = (uint64_t)-1LL; return; }
+    char u8[1024]; w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, u8, sizeof(u8));
+    c->rax = start_find(u8, c->r8, 1);
+}
+static void w_FindNextFileA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx < 0x40000ULL || c->rcx >= 0x40000ULL + 64) { c->rax = 0; return; }
+    WinFindObj *fo = g_finds[c->rcx - 0x40000ULL];
+    c->rax = fo ? (uint64_t)fill_find_next(fo, c->rdx, 0) : 0;
+}
+static void w_FindNextFileW(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx < 0x40000ULL || c->rcx >= 0x40000ULL + 64) { c->rax = 0; return; }
+    WinFindObj *fo = g_finds[c->rcx - 0x40000ULL];
+    c->rax = fo ? (uint64_t)fill_find_next(fo, c->rdx, 1) : 0;
+}
+static void w_FindClose(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx >= 0x40000ULL && c->rcx < 0x40000ULL + 64) {
+        WinFindObj *fo = g_finds[c->rcx - 0x40000ULL];
+        if (fo) { closedir(fo->dir); free(fo); g_finds[c->rcx - 0x40000ULL] = NULL; }
+    }
+    c->rax = 1;
+}
+
+static void w_GetFileSize(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx < 0x20000ULL || c->rcx >= 0x30000ULL) { c->rax = 0xFFFFFFFFU; return; }
+    struct stat st;
+    if (fstat((int)(c->rcx - 0x20000ULL), &st) != 0) { c->rax = 0xFFFFFFFFU; return; }
+    if (c->rdx) W32(c->rdx, (uint32_t)((uint64_t)st.st_size >> 32));
+    c->rax = (uint32_t)st.st_size;
+}
+static void w_SetFilePointer(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx < 0x20000ULL || c->rcx >= 0x30000ULL) { c->rax = 0xFFFFFFFFU; return; }
+    int64_t dist = (int32_t)c->rdx;
+    if (c->r8) dist = ((int64_t)(int32_t)R32(c->r8) << 32) | (uint32_t)c->rdx;
+    int whence = (c->r9 == 1) ? SEEK_CUR : ((c->r9 == 2) ? SEEK_END : SEEK_SET);
+    off_t r = lseek((int)(c->rcx - 0x20000ULL), (off_t)dist, whence);
+    if (r < 0) { c->rax = 0xFFFFFFFFU; return; }
+    if (c->r8) W32(c->r8, (uint32_t)((uint64_t)r >> 32));
+    c->rax = (uint32_t)r;
+}
+static void w_SetEndOfFile(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx < 0x20000ULL || c->rcx >= 0x30000ULL) { c->rax = 0; return; }
+    int fd = (int)(c->rcx - 0x20000ULL);
+    off_t pos = lseek(fd, 0, SEEK_CUR);
+    c->rax = (pos >= 0 && ftruncate(fd, pos) == 0) ? 1 : 0;
+}
+static void w_GetFileInformationByHandle(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx < 0x20000ULL || c->rcx >= 0x30000ULL || !c->rdx) { c->rax = 0; return; }
+    struct stat st;
+    if (fstat((int)(c->rcx - 0x20000ULL), &st) != 0) { c->rax = 0; return; }
+    memset((void *)(uintptr_t)c->rdx, 0, 52);
+    W32(c->rdx + 0, S_ISDIR(st.st_mode) ? 0x10U : 0x80U);
+    W32(c->rdx + 32, (uint32_t)((uint64_t)st.st_size >> 32));
+    W32(c->rdx + 36, (uint32_t)st.st_size);
+    W32(c->rdx + 40, 1);
+    c->rax = 1;
+}
+static void w_DeleteFileA(CPU64 *c, void *ud) {
+    (void)ud;
+    char px[1024]; win_path_to_posix((const char *)(uintptr_t)c->rcx, px, sizeof(px));
+    c->rax = (unlink(px) == 0) ? 1 : 0;
+}
+static void w_DeleteFileW(CPU64 *c, void *ud) {
+    (void)ud;
+    char u8[1024], px[1024]; w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, u8, sizeof(u8));
+    win_path_to_posix(u8, px, sizeof(px));
+    c->rax = (unlink(px) == 0) ? 1 : 0;
+}
+static void w_CryptAcquireContextA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) W64(c->rcx, 0x50001ULL);
+    c->rax = 1;
+}
+static void w_CryptGenRandom(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r8 && c->rdx) arc4random_buf((void *)(uintptr_t)c->r8, (size_t)(uint32_t)c->rdx);
+    c->rax = 1;
+}
+static void w_CryptReleaseContext(CPU64 *c, void *ud) { (void)ud; c->rax = 1; }
+static void w_RaiseException(CPU64 *c, void *ud) {
+    (void)ud;
+    fprintf(stderr, "elf64-recomp: guest RaiseException code=0x%x flags=0x%x\n",
+            (uint32_t)c->rcx, (uint32_t)c->rdx);
+}
+
 static void w_GetConsoleMode(CPU64 *c, void *ud) { (void)ud; if (c->rdx) W32(c->rdx, 7); c->rax = 1; }
 static void w_GetConsoleScreenBufferInfo(CPU64 *c, void *ud) {
     (void)ud;
@@ -810,6 +1005,9 @@ void rt_register_win32_extra(void) {
     REG("SetEnvironmentVariableA", w_SetEnvironmentVariableA); REG("SetEnvironmentVariableW", w_SetEnvironmentVariableW);
     REG("GetStartupInfoW", w_GetStartupInfoW);
     REG("GetCurrentProcess", w_GetCurrentProcess); REG("GetCurrentThread", w_GetCurrentThread);
+    REG("GetThreadId", w_GetThreadId);
+    REG("ResumeThread", w_ret_0); REG("SuspendThread", w_ret_0);
+    REG("DuplicateHandle", w_ret_1);
     REG("GetCurrentProcessorNumber", w_GetCurrentProcessorNumber);
     REG("EncodePointer", w_EncodePointer); REG("DecodePointer", w_DecodePointer);
     REG("IsDebuggerPresent", w_IsDebuggerPresent); REG("IsProcessorFeaturePresent", w_IsProcessorFeaturePresent);
@@ -836,7 +1034,7 @@ void rt_register_win32_extra(void) {
     REG("RtlCaptureContext", w_RtlCaptureContext); REG("RtlPcToFileHeader", w_RtlPcToFileHeader);
     REG("RtlUnwind", w_ret_0); REG("RtlUnwindEx", w_ret_0); REG("RtlVirtualUnwind", w_ret_0);
     REG("TerminateProcess", w_TerminateProcess); REG("ExitThread", w_ExitThread);
-    REG("WaitForSingleObjectEx", w_ret_0); REG("WaitForMultipleObjects", w_ret_0);
+    REG("FreeLibraryAndExitThread", w_ExitThread);
     /* Filesystem / Console */
     REG("GetCurrentDirectoryA", w_GetCurrentDirectoryA); REG("GetCurrentDirectoryW", w_GetCurrentDirectoryW);
     REG("SetCurrentDirectoryW", w_SetCurrentDirectoryW); REG("GetFullPathNameW", w_GetFullPathNameW);
@@ -857,8 +1055,29 @@ void rt_register_win32_extra(void) {
     REG("ReadConsoleOutputCharacterA", w_ret_0); REG("WriteConsoleOutputA", w_ret_1);
     REG("WriteConsoleInputA", w_ret_0); REG("ReadConsoleW", w_ret_0); REG("SetStdHandle", w_ret_1);
     REG("GetConsoleOutputCP", w_GetACP); REG("AttachConsole", w_ret_0); REG("AllocConsole", w_ret_0);
-    REG("FreeConsole", w_ret_1); REG("FindFirstFileW", w_ret_inv); REG("FindFirstFileExW", w_ret_inv);
-    REG("FindNextFileW", w_ret_0); REG("FindClose", w_ret_1);
+    REG("FreeConsole", w_ret_1);
+    REG("FindFirstFileA", w_FindFirstFileA); REG("FindFirstFileExA", w_FindFirstFileExA);
+    REG("FindFirstFileW", w_FindFirstFileW); REG("FindFirstFileExW", w_FindFirstFileExW);
+    REG("FindNextFileA", w_FindNextFileA); REG("FindNextFileW", w_FindNextFileW);
+    REG("FindClose", w_FindClose);
+    REG("GetFileSize", w_GetFileSize); REG("SetFilePointer", w_SetFilePointer);
+    REG("SetEndOfFile", w_SetEndOfFile); REG("GetFileInformationByHandle", w_GetFileInformationByHandle);
+    REG("GetFileInformationByHandleEx", w_ret_0);
+    REG("DeleteFileA", w_DeleteFileA); REG("DeleteFileW", w_DeleteFileW);
+    REG("MoveFileExW", w_ret_0); REG("SetFileAttributesW", w_ret_1);
+    REG("AreFileApisANSI", w_ret_1); REG("GetDriveTypeW", w_ret_1);
+    REG("GetDiskFreeSpaceA", w_ret_0); REG("GetLocaleInfoEx", w_ret_0);
+    REG("FormatMessageA", w_ret_0); REG("FormatMessageW", w_ret_0);
+    REG("CreateFileMappingA", w_ret_0); REG("MapViewOfFile", w_ret_0); REG("UnmapViewOfFile", w_ret_1);
+    REG("ConnectNamedPipe", w_ret_0); REG("CreateNamedPipeA", w_ret_inv);
+    REG("DeviceIoControl", w_ret_0); REG("GetOverlappedResult", w_ret_0);
+    REG("PeekNamedPipe", w_ret_0); REG("InterlockedPushEntrySList", w_ret_0);
+    REG("RaiseException", w_RaiseException);
+    REG("CryptAcquireContextA", w_CryptAcquireContextA); REG("CryptAcquireContextW", w_CryptAcquireContextA);
+    REG("CryptGenRandom", w_CryptGenRandom); REG("CryptReleaseContext", w_CryptReleaseContext);
+    REG("SHGetFileInfoW", w_ret_0);
+    REG("SteamAPI_InitSafe", w_ret_0); REG("SteamAPI_GetHSteamUser", w_ret_0);
+    REG("SteamInternal_ContextInit", w_ret_0); REG("SteamInternal_FindOrCreateUserInterface", w_ret_0);
     REG("GetStringTypeW", w_GetStringTypeW); REG("LCMapStringEx", w_LCMapStringEx);
     REG("LCMapStringW", w_LCMapStringW); REG("CompareStringW", w_CompareStringW);
     REG("GetLocaleInfoW", w_ret_0); REG("GetUserDefaultLCID", w_ret_0);
