@@ -46,24 +46,32 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 ## Requirements (macOS Apple Silicon)
 
 ```sh
-brew install sdl2 molten-vk vulkan-headers lld
+brew install sdl2 cairo pango molten-vk vulkan-headers lld
 ```
 
-## Packaging a Standalone macOS `.app`
+## Quick Start: Building Portal: Revolution on macOS
 
-To turn a recompiled build into a self-contained double-clickable Apple Silicon `.app` bundle (with bundled `.img` images, game assets, relocated SDL2/SDL3/Cairo/Pango/FreeType/Fontconfig dylibs, and ad-hoc code signing — zero Homebrew dependency at runtime):
+Because this repository contains **no game files or binaries**, you must supply your own legal Steam copy of **Portal: Revolution** (free on Steam for Portal 2 owners, AppID `601360`):
 
-```sh
-python3 tools/package_macos_app.py \
-  --app "build/release/Portal Revolution.app" \
-  --binary build/rev_game/revolution_arm64 \
-  --prep-dir build/rev_game/prep \
-  --game-root build/rev_root \
-  --name "Portal: Revolution" \
-  --bundle-id com.elf64recomp.portal-revolution \
-  --icon build/rev_root/revolution/resource/game.icns \
-  --default-cfg-rel revolution/cfg/video.txt
-```
+1. **Download the Windows x64 Steam depots on macOS** — open the Steam console (`open steam://open/console`) and run:
+   ```text
+   download_depot 601360 601361
+   download_depot 601360 601363
+   ```
+   Wait until Steam prints `Depot download complete` for both depots.
+2. **Build & package the standalone macOS `.app` in one command**:
+   ```sh
+   ./scripts/build_portal_revolution.sh
+   ```
+   *(Or pass `--game-dir "/path/to/Portal Revolution"` if you copied an existing Windows Steam installation.)*
+3. **Play**: double-click `build/release/Portal Revolution.app` in Finder (or drag it into `/Applications`), or run:
+   ```sh
+   open "build/release/Portal Revolution.app"
+   ```
+
+The resulting `.app` bundle is fully self-contained (native ARM64 Mach-O binary, `.img` memory images, game assets, relocated SDL2/SDL3/Cairo/Pango/FreeType/Fontconfig dylibs, Fontconfig config, and ad-hoc code signature — zero Homebrew dependency at runtime).
+
+For custom targets, you can invoke `tools/build64.py` and `tools/package_macos_app.py` directly.
 
 ## Verification
 
@@ -78,3 +86,10 @@ CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all" LDFLAGS="-fsanitize=unde
 - `test-vulkan`: Linux ELF64 -> SDL2 -> MoltenVK on Apple Silicon GPU.
 - `test-win64`: Windows PE32+ `.exe` + `.dll` (`DllMain`, 6-arg Win64 shadow space, `gs:[0x30]` TEB, `HeapAlloc`, `VirtualAlloc`, `QPC`, `GetProcAddress`, `qsort`, 4 Win32 `CreateThread` + `CRITICAL_SECTION` + `TlsAlloc`).
 - `test-d3d11`: Windows PE32+ Direct3D 11 + DXGI -> Apple Metal GPU (DXBC SM4.0 shaders -> MSL, clear + triangle `Draw` + staging `CopyResource`/`Map` pixel readback).
+
+## Legal & Disclaimer
+
+- **Clean-room interoperability tool**: `elf64-recomp` is an independent, MIT-licensed static recompiler and runtime bridge. It contains **no copyrighted game assets, binaries, source code, shaders, or proprietary SDK files** from Valve Corporation, Second Face Software, Microsoft, or any third party.
+- **Legally owned copies only**: End users must supply their own legally obtained Steam copy of any game they recompile. The Steamworks bridge delegates authentication and initialization (`SteamAPI_InitSafe`) to the user's locally installed native macOS Steam client and does not bypass DRM or ownership checks.
+- **Third-party licenses**: The generated Vulkan bridge (`tools/gen_vulkan64.py`) parses Khronos `vk.xml` (Apache-2.0) at build time. When packaging a local `.app` with `tools/package_macos_app.py`, third-party libraries (SDL2/SDL3 under zlib; Cairo/Pango/GLib/FriBidi under LGPL-2.1; FreeType under FTL/GPL-2.0; HarfBuzz/Pixman/Fontconfig/libpng under MIT/BSD/zlib) are dynamically linked as separate `.dylib` files inside `Contents/Frameworks/` — do not redistribute bundles containing third-party copyrighted game files.
+- **Trademarks**: *Portal*, *Portal 2*, *Steam*, and *Source* are trademarks of Valve Corporation. *Portal: Revolution* and *Strata Source* are trademarks of their respective owners (Second Face Software / Strata Source team). *DirectX* and *Windows* are trademarks of Microsoft Corporation. *macOS*, *Apple Silicon*, and *Metal* are trademarks of Apple Inc. This project is unofficial and not affiliated with or endorsed by any of these entities.

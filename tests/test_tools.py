@@ -192,7 +192,8 @@ class TestPackageMacOSApp(unittest.TestCase):
             self.assertEqual(n, 1)
             out_f = os.path.join(dst, "linked.bin")
             self.assertTrue(os.path.isfile(out_f) and not os.path.islink(out_f))
-            self.assertEqual(open(out_f, "rb").read(), b"DATA")
+            with open(out_f, "rb") as rf:
+                self.assertEqual(rf.read(), b"DATA")
             self.assertFalse(os.path.exists(os.path.join(dst, "cfg", "video.txt")))
 
 
