@@ -46,6 +46,7 @@ static void parse_sig(const uint8_t *payload, uint32_t sz, DxbcSigElem *arr, int
         uint32_t name_off = rd32(payload + off + 0);
         arr[i].semantic_index = rd32(payload + off + 4);
         arr[i].sys_val = rd32(payload + off + 8);
+        arr[i].comp_type = rd32(payload + off + 12);
         arr[i].reg = rd32(payload + off + 16);
         arr[i].mask = payload[off + 20];
         if (name_off < sz) {
@@ -320,7 +321,8 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
                 uint32_t r = out->inputs[i].reg & 31U;
                 if (seen_in & (1U << r)) continue;
                 seen_in |= (1U << r);
-                sb_appendf(&sb, "    float4 v%u [[attribute(%u)]];\n", r, r);
+                const char *vt = (out->inputs[i].comp_type == 1) ? "uint4" : (out->inputs[i].comp_type == 2 ? "int4" : "float4");
+                sb_appendf(&sb, "    %s v%u [[attribute(%u)]];\n", vt, r, r);
             }
             sb_appendf(&sb, "};\n\n");
         }
@@ -377,6 +379,8 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
                 sb_appendf(&sb, "    float4 v%u = as_type<float4>(uint4(_vid, 0u, 0u, 0u));\n", r);
             } else if (out->inputs[i].sys_val == 8 || strcasecmp(out->inputs[i].semantic, "SV_INSTANCEID") == 0) {
                 sb_appendf(&sb, "    float4 v%u = as_type<float4>(uint4(_iid, 0u, 0u, 0u));\n", r);
+            } else if (out->inputs[i].comp_type == 1 || out->inputs[i].comp_type == 2) {
+                sb_appendf(&sb, "    float4 v%u = as_type<float4>(in.v%u);\n", r, r);
             } else {
                 sb_appendf(&sb, "    float4 v%u = in.v%u;\n", r, r);
             }

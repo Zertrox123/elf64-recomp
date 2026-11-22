@@ -196,6 +196,7 @@ typedef struct {
     MTLPixelFormat       color_fmts[4];
     int                  num_rts;
     MTLPixelFormat       depth_fmt;
+    uint32_t             vb_strides[8];
     id<MTLRenderPipelineState> pso;
 } PsoCacheEntry;
 
@@ -216,6 +217,7 @@ extern void win32_set_hwnd_size(uint64_t hwnd, int w, int h);
 extern void win32_get_hwnd_size(uint64_t hwnd, int *w, int *h);
 extern void win32_fit_window_size(SDL_Window *win, int req_w, int req_h);
 extern void win32_desktop_size(int *w, int *h);
+extern void win32_clear_borderless_fs(uint64_t hwnd);
 
 typedef struct {
     ComBase            base;
@@ -380,19 +382,41 @@ static MTLVertexFormat dxgi_to_mtl_vertex(uint32_t fmt) {
         case 3:  return MTLVertexFormatUInt4;
         case 4:  return MTLVertexFormatInt4;
         case 6:  return MTLVertexFormatFloat3;
+        case 7:  return MTLVertexFormatUInt3;
+        case 8:  return MTLVertexFormatInt3;
         case 10: return MTLVertexFormatHalf4;
         case 11: return MTLVertexFormatUShort4Normalized;
+        case 12: return MTLVertexFormatUShort4;
         case 13: return MTLVertexFormatShort4Normalized;
+        case 14: return MTLVertexFormatShort4;
         case 16: return MTLVertexFormatFloat2;
+        case 17: return MTLVertexFormatUInt2;
+        case 18: return MTLVertexFormatInt2;
         case 28: return MTLVertexFormatUChar4Normalized;
         case 30: return MTLVertexFormatUChar4;
         case 31: return MTLVertexFormatChar4Normalized;
+        case 32: return MTLVertexFormatChar4;
         case 34: return MTLVertexFormatHalf2;
         case 35: return MTLVertexFormatUShort2Normalized;
+        case 36: return MTLVertexFormatUShort2;
         case 37: return MTLVertexFormatShort2Normalized;
+        case 38: return MTLVertexFormatShort2;
         case 41: return MTLVertexFormatFloat;
         case 42: return MTLVertexFormatUInt;
         case 43: return MTLVertexFormatInt;
+        case 49: return MTLVertexFormatUChar2Normalized;
+        case 50: return MTLVertexFormatUChar2;
+        case 51: return MTLVertexFormatChar2Normalized;
+        case 52: return MTLVertexFormatChar2;
+        case 54: return MTLVertexFormatHalf;
+        case 56: return MTLVertexFormatUShortNormalized;
+        case 57: return MTLVertexFormatUShort;
+        case 58: return MTLVertexFormatShortNormalized;
+        case 59: return MTLVertexFormatShort;
+        case 61: return MTLVertexFormatUCharNormalized;
+        case 62: return MTLVertexFormatUChar;
+        case 63: return MTLVertexFormatCharNormalized;
+        case 64: return MTLVertexFormatChar;
         case 87: return MTLVertexFormatUChar4Normalized_BGRA;
         default: return MTLVertexFormatFloat4;
     }
@@ -645,7 +669,7 @@ static void dev_CreateInputLayout(CPU64 *c, void *ud) {
         il->elems[i].dxgi_fmt = fmt;
         il->elems[i].offset   = off;
         il->elems[i].attr_idx = i;
-        uint32_t sz = (fmt == 2 || fmt == 3 || fmt == 4) ? 16 : (fmt == 6 ? 12 : ((fmt == 16 || fmt == 10 || fmt == 11 || fmt == 13) ? 8 : 4));
+        uint32_t sz = (fmt == 2 || fmt == 3 || fmt == 4) ? 16 : ((fmt == 6 || fmt == 7 || fmt == 8) ? 12 : ((fmt == 16 || fmt == 17 || fmt == 18 || fmt == 10 || fmt == 11 || fmt == 12 || fmt == 13 || fmt == 14) ? 8 : 4));
         auto_off = off + sz;
     }
     W64(out_va, (uint64_t)(uintptr_t)il);
@@ -1050,6 +1074,26 @@ static void ctx_OMSetRenderTargets(CPU64 *c, void *ud) {
     ComBase *dsv = (ComBase *)(uintptr_t)c->r9;
     ctx->dsv = (dsv && dsv->kind == COM_DSV) ? (D3D11DSVObj *)dsv : NULL;
 }
+static void ctx_OMGetRenderTargets(CPU64 *c, void *ud) {
+    (void)ud;
+    D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
+    uint32_t num = (uint32_t)c->rdx;
+    uint64_t rtvs_va = c->r8;
+    uint64_t dsv_va = c->r9;
+    if (rtvs_va && num > 0) {
+        if (num > 8) num = 8;
+        for (uint32_t i = 0; i < num; i++) {
+            D3D11RTVObj *r = (ctx && (int)i < ctx->num_rtvs) ? ctx->rtvs[i] : NULL;
+            if (r) r->base.refcount++;
+            W64(rtvs_va + i * 8ULL, (uint64_t)(uintptr_t)r);
+        }
+    }
+    if (dsv_va) {
+        D3D11DSVObj *d = ctx ? ctx->dsv : NULL;
+        if (d) d->base.refcount++;
+        W64(dsv_va, (uint64_t)(uintptr_t)d);
+    }
+}
 static void ctx_RSSetViewports(CPU64 *c, void *ud) {
     (void)ud;
     D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
@@ -1177,7 +1221,8 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count,
             PsoCacheEntry *e = &ctx->dev->pso_cache[i];
             if (e->vs == ctx->vs && e->ps == ctx->ps && e->layout == ctx->layout &&
                 e->blend == ctx->blend_state && e->num_rts == nrt && e->depth_fmt == dfmt &&
-                memcmp(e->color_fmts, cfmts, sizeof(cfmts)) == 0) {
+                memcmp(e->color_fmts, cfmts, sizeof(cfmts)) == 0 &&
+                memcmp(e->vb_strides, ctx->vb_strides, sizeof(e->vb_strides)) == 0) {
                 pso = e->pso;
                 break;
             }
@@ -1264,7 +1309,8 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count,
             if (ctx->dev->pso_count < 512) {
                 PsoCacheEntry *e = &ctx->dev->pso_cache[ctx->dev->pso_count++];
                 e->vs = ctx->vs; e->ps = ctx->ps; e->layout = ctx->layout; e->blend = ctx->blend_state;
-                e->num_rts = nrt; memcpy(e->color_fmts, cfmts, sizeof(cfmts)); e->depth_fmt = dfmt; e->pso = pso;
+                e->num_rts = nrt; memcpy(e->color_fmts, cfmts, sizeof(cfmts)); e->depth_fmt = dfmt;
+                memcpy(e->vb_strides, ctx->vb_strides, sizeof(e->vb_strides)); e->pso = pso;
             }
         }
 
@@ -1737,6 +1783,7 @@ static void sc_SetFullscreenState(CPU64 *c, void *ud) {
         if (getenv("ELF64_IO_LOG"))
             fprintf(stderr, "[d3d11_metal] SetFullscreenState fs=%d\n", fs);
         if (sc->sdl_win && !getenv("ELF64_HEADLESS")) {
+            if (fs && sc->hwnd) win32_clear_borderless_fs(sc->hwnd);
             SDL_SetWindowFullscreen(sc->sdl_win, fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
             if (!fs) win32_fit_window_size(sc->sdl_win, (int)sc->width, (int)sc->height);
             if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
@@ -2011,14 +2058,21 @@ static void output_GetDisplayModeList(CPU64 *c, void *ud) {
     uint64_t p_desc = win64_arg_i(c, 4);
     int dw = 1920, dh = 1080;
     win32_desktop_size(&dw, &dh);
-    struct { uint32_t w, h; } modes[10] = {
+    static const struct { uint32_t w, h; } base_modes[] = {
         {800, 600}, {1024, 768}, {1280, 720}, {1280, 800},
-        {1440, 900}, {1600, 900}, {1680, 1050}, {1920, 1080},
+        {1280, 960}, {1366, 768}, {1440, 900}, {1600, 900},
+        {1680, 1050}, {1920, 1080},
     };
-    uint32_t count = 8;
+    struct { uint32_t w, h; } modes[12];
+    uint32_t count = 0;
     int has_desk = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if ((int)modes[i].w == dw && (int)modes[i].h == dh) has_desk = 1;
+    for (size_t i = 0; i < sizeof(base_modes) / sizeof(base_modes[0]); i++) {
+        if ((int)base_modes[i].w <= dw && (int)base_modes[i].h <= dh) {
+            modes[count].w = base_modes[i].w;
+            modes[count].h = base_modes[i].h;
+            if ((int)modes[count].w == dw && (int)modes[count].h == dh) has_desk = 1;
+            count++;
+        }
     }
     if (!has_desk && dw >= 640 && dh >= 480) {
         modes[count].w = (uint32_t)dw; modes[count].h = (uint32_t)dh;
@@ -2033,9 +2087,31 @@ static void output_GetDisplayModeList(CPU64 *c, void *ud) {
         memset((void *)(uintptr_t)d, 0, 28);
         W32(d + 0, modes[i].w); W32(d + 4, modes[i].h);
         W32(d + 8, 60); W32(d + 12, 1);
-        W32(d + 16, fmt ? fmt : 28);
+        W32(d + 16, fmt ? fmt : 87);
     }
     W32(p_num, n);
+    c->rax = S_OK_HR;
+}
+static void output_FindClosestMatchingMode(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t req_va = c->rdx;
+    uint64_t out_va = c->r8;
+    if (!out_va) { c->rax = E_INVALIDARG_H; return; }
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    uint32_t w = req_va ? R32(req_va + 0) : 0;
+    uint32_t h = req_va ? R32(req_va + 4) : 0;
+    uint32_t num = req_va ? R32(req_va + 8) : 0;
+    uint32_t den = req_va ? R32(req_va + 12) : 0;
+    uint32_t fmt = req_va ? R32(req_va + 16) : 0;
+    if (w == 0 || h == 0) { w = (uint32_t)dw; h = (uint32_t)dh; }
+    if (num == 0 || den == 0) { num = 60; den = 1; }
+    if (fmt == 0) fmt = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
+    memset((void *)(uintptr_t)out_va, 0, 28);
+    W32(out_va + 0, w); W32(out_va + 4, h);
+    W32(out_va + 8, num); W32(out_va + 12, den);
+    W32(out_va + 16, fmt);
+    W32(out_va + 20, 1); /* DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE */
     c->rax = S_OK_HR;
 }
 static void adapter_EnumOutputs(CPU64 *c, void *ud) {
@@ -2208,6 +2284,7 @@ static void init_d3d11_vtables(void) {
     g_vt_context[24] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::IASetPrimitiveTopology", ctx_IASetPrimitiveTopology, NULL);
     g_vt_context[25] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::VSSetShaderResources", ctx_VSSetShaderResources, NULL);
     g_vt_context[26] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::VSSetSamplers", ctx_VSSetSamplers, NULL);
+    g_vt_context[29] = t_ok; /* ID3D11DeviceContext::GetData (returns S_OK) */
     g_vt_context[33] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::OMSetRenderTargets", ctx_OMSetRenderTargets, NULL);
     g_vt_context[35] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::OMSetBlendState", ctx_OMSetBlendState, NULL);
     g_vt_context[36] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::OMSetDepthStencilState", ctx_OMSetDepthStencilState, NULL);
@@ -2221,6 +2298,7 @@ static void init_d3d11_vtables(void) {
     g_vt_context[53] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ClearDepthStencilView", ctx_ClearDepthStencilView, NULL);
     g_vt_context[54] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::GenerateMips", ctx_GenerateMips, NULL);
     g_vt_context[57] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ResolveSubresource", ctx_ResolveSubresource, NULL);
+    g_vt_context[89] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::OMGetRenderTargets", ctx_OMGetRenderTargets, NULL);
     g_vt_context[111]= rt_alloc_dynamic_thunk("ID3D11DeviceContext::Flush", ctx_Flush, NULL);
 
     /* IDXGISwapChain / IDXGIAdapter / IDXGIOutput / IDXGIFactory slots */
@@ -2240,6 +2318,7 @@ static void init_d3d11_vtables(void) {
     g_vt_adapter[10]  = rt_alloc_dynamic_thunk("IDXGIAdapter1::GetDesc1", adapter_GetDesc, NULL);
     g_vt_output[7]    = rt_alloc_dynamic_thunk("IDXGIOutput::GetDesc", output_GetDesc, NULL);
     g_vt_output[8]    = rt_alloc_dynamic_thunk("IDXGIOutput::GetDisplayModeList", output_GetDisplayModeList, NULL);
+    g_vt_output[9]    = rt_alloc_dynamic_thunk("IDXGIOutput::FindClosestMatchingMode", output_FindClosestMatchingMode, NULL);
     g_vt_factory[7]   = rt_alloc_dynamic_thunk("IDXGIFactory::EnumAdapters", factory_EnumAdapters, NULL);
     g_vt_factory[10]  = rt_alloc_dynamic_thunk("IDXGIFactory::CreateSwapChain", factory_CreateSwapChain, NULL);
     g_vt_factory[12]  = rt_alloc_dynamic_thunk("IDXGIFactory1::EnumAdapters1", factory_EnumAdapters, NULL);

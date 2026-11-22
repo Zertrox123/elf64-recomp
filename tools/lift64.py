@@ -296,6 +296,32 @@ def disassemble_module(
         if r in addr_to_idx:
             root_set.add(r)
 
+    def build_funcs(roots: Set[int]) -> List[LiftedFunc]:
+        sorted_roots = sorted(r for r in roots if r in addr_to_idx)
+        out_funcs: List[LiftedFunc] = []
+        for i, start_addr in enumerate(sorted_roots):
+            start_idx = addr_to_idx[start_addr]
+            end_idx = addr_to_idx[sorted_roots[i + 1]] if i + 1 < len(sorted_roots) else len(all_insns)
+            jt_cutoff = all_insns[end_idx].addr if end_idx < len(all_insns) else hi_code
+            insns = []
+            for idx in range(start_idx, end_idx):
+                ins = all_insns[idx]
+                if ins.addr >= jt_cutoff:
+                    break
+                if insns and ins.addr > insns[-1].next_addr + 0x100:
+                    break
+                if is_pe and ins.mnemonic in ("mov", "movsxd", "movzx") and len(ins.ops) == 2 and "rip" not in ins.ops[1]:
+                    m_jt = re.search(r"\[[^\]]*\+[^\]]*\+\s*(0x[0-9a-fA-F]+)\s*\]", ins.ops[1])
+                    if m_jt:
+                        jt_va = base + int(m_jt.group(1), 16)
+                        if ins.next_addr <= jt_va < jt_cutoff:
+                            jt_cutoff = jt_va
+                insns.append(ins)
+            if insns:
+                name = sym_starts.get(start_addr, f"sub_{start_addr:x}")
+                out_funcs.append(LiftedFunc(start_addr, name, insns))
+        return out_funcs
+
     # Also add direct `call <imm>` and RIP-relative `lea reg, [rip + disp]` code targets
     # (discovers static leaf callbacks such as qsort comparators that lack .pdata entries).
     for insn in all_insns:
@@ -314,23 +340,6 @@ def disassemble_module(
                     prev_idx = addr_to_idx[t] - 1
                     if prev_idx < 0 or all_insns[prev_idx].mnemonic in ("ret", "jmp", "int3", "nop", "ud2"):
                         root_set.add(t)
-
-    def build_funcs(roots: Set[int]) -> List[LiftedFunc]:
-        sorted_roots = sorted(r for r in roots if r in addr_to_idx)
-        out_funcs: List[LiftedFunc] = []
-        for i, start_addr in enumerate(sorted_roots):
-            start_idx = addr_to_idx[start_addr]
-            end_idx = addr_to_idx[sorted_roots[i + 1]] if i + 1 < len(sorted_roots) else len(all_insns)
-            insns = []
-            for idx in range(start_idx, end_idx):
-                ins = all_insns[idx]
-                if insns and ins.addr > insns[-1].next_addr + 0x100:
-                    break
-                insns.append(ins)
-            if insns:
-                name = sym_starts.get(start_addr, f"sub_{start_addr:x}")
-                out_funcs.append(LiftedFunc(start_addr, name, insns))
-        return out_funcs
 
     # Close over cross-chunk direct jmp/jcc targets so split MSVC .pdata blocks never miss a root.
     funcs = build_funcs(root_set)

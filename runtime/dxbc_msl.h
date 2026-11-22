@@ -8,6 +8,7 @@ typedef struct {
     char     semantic[32];
     uint32_t semantic_index;
     uint32_t sys_val;
+    uint32_t comp_type; /* 1=uint32, 2=sint32, 3=float32 */
     uint32_t reg;
     uint8_t  mask;
 } DxbcSigElem;

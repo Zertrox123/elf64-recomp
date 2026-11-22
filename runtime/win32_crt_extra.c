@@ -985,8 +985,9 @@ static void w_GetSystemMetrics(CPU64 *c, void *ud) {
     int idx = (int)c->rcx;
     int dw = 1920, dh = 1080;
     win32_desktop_size(&dw, &dh);
-    if (idx == 0) c->rax = (uint64_t)dw;
-    else if (idx == 1) c->rax = (uint64_t)dh;
+    if (idx == 0 || idx == 16 || idx == 78) c->rax = (uint64_t)dw;
+    else if (idx == 1 || idx == 17 || idx == 79) c->rax = (uint64_t)dh;
+    else if (idx == 80) c->rax = 1; /* SM_CMONITORS */
     else c->rax = 0;
 }
 static void w_SystemFunction036(CPU64 *c, void *ud) {
@@ -1415,20 +1416,18 @@ static int wnd_slot(uint64_t hwnd) { return (hwnd >= 0x1000 && hwnd < 0x1040) ? 
 static int wnd_idx(int n) {
     if (n == -16) return 0; if (n == -20) return 1; if (n == -4) return 2; return 3;
 }
+extern uint32_t win32_get_hwnd_style(uint64_t hwnd);
+extern uint32_t win32_set_hwnd_style(uint64_t hwnd, uint32_t style);
 static void w_GetWindowLongPtr(CPU64 *c, void *ud) {
     (void)ud;
     if ((int)c->rdx == -4) { c->rax = win32_get_wndproc(c->rcx); return; }
+    if ((int)c->rdx == -16) { c->rax = win32_get_hwnd_style(c->rcx); return; }
     c->rax = g_wnd_long[wnd_slot(c->rcx)][wnd_idx((int)c->rdx)];
 }
 static void w_SetWindowLongPtr(CPU64 *c, void *ud) {
     (void)ud;
     if ((int)c->rdx == -4) { c->rax = win32_set_wndproc(c->rcx, c->r8); return; }
-    if ((int)c->rdx == -16) {
-        SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
-        if (win && !getenv("ELF64_HEADLESS")) {
-            SDL_SetWindowBordered(win, (c->r8 & 0x00C00000ULL) ? SDL_TRUE : SDL_FALSE);
-        }
-    }
+    if ((int)c->rdx == -16) { c->rax = win32_set_hwnd_style(c->rcx, (uint32_t)c->r8); return; }
     int s = wnd_slot(c->rcx), idx = wnd_idx((int)c->rdx);
     uint64_t prev = g_wnd_long[s][idx];
     g_wnd_long[s][idx] = c->r8;

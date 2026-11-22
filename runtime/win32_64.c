@@ -717,9 +717,18 @@ static void w_WriteFile(CPU64 *c, void *ud) {
     int fd = -1;
     if (c->rcx == 2) fd = STDOUT_FILENO;
     else if (c->rcx == 3) fd = STDERR_FILENO;
+    else if (c->rcx >= 0x20000ULL && c->rcx < 0x30000ULL) fd = (int)(c->rcx - 0x20000ULL);
     else { WinHandleObj *ho = wh_get(c->rcx); if (ho && ho->kind == WH_FILE) fd = ho->fd; }
     if (fd < 0) { c->rax = 0; return; }
-    ssize_t n = write(fd, (const void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8);
+    uint64_t ov = win64_arg_i(c, 4);
+    ssize_t n;
+    if (ov) {
+        uint64_t off = (uint64_t)R32(ov + 16) | ((uint64_t)R32(ov + 20) << 32);
+        n = pwrite(fd, (const void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8, (off_t)off);
+        if (n >= 0) { W64(ov + 0, 0); W64(ov + 8, (uint64_t)n); }
+    } else {
+        n = write(fd, (const void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8);
+    }
     if (c->r9) W32(c->r9, n >= 0 ? (uint32_t)n : 0);
     c->rax = (n >= 0) ? 1 : 0;
 }
@@ -812,6 +821,9 @@ extern void win32_poll_audio_callbacks(CPU64 *c);
 typedef struct {
     SDL_Window *sdl;
     int         w, h;
+    int         borderless;
+    int         borderless_fs;
+    uint32_t    style;
     uint64_t    wndproc;
 } WinHwndObj;
 
@@ -847,6 +859,7 @@ static int          g_last_wm_size_w = 0, g_last_wm_size_h = 0;
 void win32_desktop_size(int *w, int *h) {
     int dw = 1512, dh = 982;
     if (!getenv("ELF64_HEADLESS")) {
+        SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
         if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
         SDL_DisplayMode dm;
         if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w >= 640 && dm.h >= 480) {
@@ -859,9 +872,35 @@ void win32_desktop_size(int *w, int *h) {
     if (h) *h = dh;
 }
 
+static WinHwndObj *win32_find_hwnd_for_sdl(SDL_Window *win) {
+    for (int i = 0; i < 64; i++) {
+        if (g_hwnds[i] && g_hwnds[i]->sdl == win) return g_hwnds[i];
+    }
+    return NULL;
+}
+
 void win32_fit_window_size(SDL_Window *win, int req_w, int req_h) {
     if (!win || req_w < 64 || req_h < 64 || req_w > 8192 || req_h > 8192) return;
-    if (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) return;
+    WinHwndObj *o = win32_find_hwnd_for_sdl(win);
+    uint32_t wf = SDL_GetWindowFlags(win);
+    int is_fs = (wf & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+    int borderless = o ? o->borderless : ((wf & SDL_WINDOW_BORDERLESS) != 0);
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    if (!getenv("ELF64_HEADLESS") && borderless && req_w >= dw && req_h >= dh) {
+        if (!is_fs) SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+        if (o) o->borderless_fs = 1;
+        return;
+    }
+    if (o && o->borderless_fs) {
+        if (!getenv("ELF64_HEADLESS")) SDL_SetWindowFullscreen(win, 0);
+        o->borderless_fs = 0;
+        is_fs = 0;
+    }
+    if (is_fs) return;
+    if (!getenv("ELF64_HEADLESS")) {
+        SDL_SetWindowBordered(win, borderless ? SDL_FALSE : SDL_TRUE);
+    }
     int fw = req_w, fh = req_h;
     if (!getenv("ELF64_HEADLESS")) {
         SDL_Rect ub;
@@ -883,6 +922,29 @@ void win32_fit_window_size(SDL_Window *win, int req_w, int req_h) {
     if (!getenv("ELF64_HEADLESS")) {
         SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
+}
+
+uint32_t win32_get_hwnd_style(uint64_t hwnd) {
+    if (hwnd >= 0x1000 && hwnd < 0x1000 + 64 && g_hwnds[hwnd - 0x1000])
+        return g_hwnds[hwnd - 0x1000]->style;
+    return 0;
+}
+
+uint32_t win32_set_hwnd_style(uint64_t hwnd, uint32_t style) {
+    if (hwnd < 0x1000 || hwnd >= 0x1000 + 64 || !g_hwnds[hwnd - 0x1000]) return 0;
+    WinHwndObj *o = g_hwnds[hwnd - 0x1000];
+    uint32_t prev = o->style;
+    o->style = style;
+    o->borderless = (style & 0x00C00000U) == 0;
+    if (o->sdl && !getenv("ELF64_HEADLESS")) {
+        win32_fit_window_size(o->sdl, o->w, o->h);
+    }
+    return prev;
+}
+
+void win32_clear_borderless_fs(uint64_t hwnd) {
+    if (hwnd >= 0x1000 && hwnd < 0x1000 + 64 && g_hwnds[hwnd - 0x1000])
+        g_hwnds[hwnd - 0x1000]->borderless_fs = 0;
 }
 
 uint64_t win32_primary_hwnd(void);
@@ -1124,14 +1186,17 @@ static void create_window_common(CPU64 *c, const char *cls_name, const char *tit
     int h = (int)win64_arg_i(c, 7);
     if (w <= 0 || w > 8192) w = 1280;
     if (h <= 0 || h > 8192) h = 720;
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
     if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
-    uint32_t flags = SDL_WINDOW_METAL | ((style & 0x10000000U) ? 0 : SDL_WINDOW_HIDDEN);
+    int borderless = (style & 0x00C00000U) == 0;
+    uint32_t flags = SDL_WINDOW_METAL | ((style & 0x10000000U) ? 0 : SDL_WINDOW_HIDDEN)
+                   | (borderless ? SDL_WINDOW_BORDERLESS : 0);
     SDL_Window *win = SDL_CreateWindow((title && *title) ? title : "elf64-recomp",
                                        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                        w, h, flags);
     if (!win) { c->rax = 0; return; }
     WinHwndObj *o = (WinHwndObj *)calloc(1, sizeof(WinHwndObj));
-    o->sdl = win; o->w = w; o->h = h; o->wndproc = lookup_class_wndproc(cls_name);
+    o->sdl = win; o->w = w; o->h = h; o->borderless = borderless; o->style = style; o->wndproc = lookup_class_wndproc(cls_name);
     for (int i = 0; i < 64; i++) {
         if (!g_hwnds[i]) {
             g_hwnds[i] = o;

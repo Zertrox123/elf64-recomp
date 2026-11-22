@@ -1,12 +1,14 @@
 /* Standalone UBSan-clean test for the MSVC x64 V8 -> JavaScriptCore bridge. */
 #include "runtime64.h"
 #include "win64_abi.h"
+#include "dxbc_msl.h"
 
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void guest_add_cb(CPU64 *c);
 
@@ -275,6 +277,88 @@ int main(void) {
     assert(rt_invoke_win64(&g_cpu, R64(R64(sc) + 11 * 8), sc, (uint64_t)(uintptr_t)&is_fs, (uint64_t)(uintptr_t)&fs_tgt, 0, 0, 0) == 0);
     assert(is_fs == 1 && fs_tgt == 0);
 
-    printf("V8_JSC_TEST PASS (eval=42, ext=0xcafebabe, json=ok, trycatch=ok, cb=42, io+xa2+dxgi=ok)\n");
+    /* 10. IDXGIOutput::FindClosestMatchingMode, OMGetRenderTargets, WriteFile on CreateFileA, DXBC int VSIn */
+    uint32_t req_mode[7] = { 1280, 720, 60, 1, 28, 0, 0 }, got_mode[7] = {0};
+    assert(rt_invoke_win64(&g_cpu, R64(R64(outp) + 9 * 8), outp, (uint64_t)(uintptr_t)req_mode, (uint64_t)(uintptr_t)got_mode, 0, 0, 0) == 0);
+    assert(got_mode[0] == 1280 && got_mode[1] == 720 && got_mode[2] == 60);
+    memset(req_mode, 0, sizeof(req_mode));
+    memset(got_mode, 0, sizeof(got_mode));
+    assert(rt_invoke_win64(&g_cpu, R64(R64(outp) + 9 * 8), outp, (uint64_t)(uintptr_t)req_mode, (uint64_t)(uintptr_t)got_mode, 0, 0, 0) == 0);
+    assert(got_mode[0] >= 1280 && got_mode[1] >= 720);
+    uint64_t imm_ctx = 0, bb_tex = 0, rtv = 0, got_rtv = 0;
+    rt_invoke_win64(&g_cpu, R64(R64(dev_out) + 40 * 8), dev_out, (uint64_t)(uintptr_t)&imm_ctx, 0, 0, 0, 0);
+    assert(imm_ctx != 0);
+    assert(rt_invoke_win64(&g_cpu, R64(R64(sc) + 9 * 8), sc, 0, 0, (uint64_t)(uintptr_t)&bb_tex, 0, 0) == 0 && bb_tex != 0);
+    assert(rt_invoke_win64(&g_cpu, R64(R64(dev_out) + 9 * 8), dev_out, bb_tex, 0, (uint64_t)(uintptr_t)&rtv, 0, 0) == 0 && rtv != 0);
+    rt_invoke_win64(&g_cpu, R64(R64(imm_ctx) + 33 * 8), imm_ctx, 1, (uint64_t)(uintptr_t)&rtv, 0, 0, 0);
+    rt_invoke_win64(&g_cpu, R64(R64(imm_ctx) + 89 * 8), imm_ctx, 1, (uint64_t)(uintptr_t)&got_rtv, 0, 0, 0);
+    assert(got_rtv == rtv);
+
+    const char *tmpf = "/tmp/elf64_recomp_writefile_test.txt";
+    unlink(tmpf);
+    void *cf_ud = NULL;
+    RTShimFn cf_fn = rt_find_shim("CreateFileA", &cf_ud);
+    assert(cf_fn != NULL);
+    uint64_t cf_stk[16] = {0};
+    cf_stk[5] = 2; /* CREATE_ALWAYS */
+    cf_stk[6] = 0x80;
+    sp_save = g_cpu.rsp;
+    g_cpu.rsp = (uint64_t)(uintptr_t)cf_stk;
+    g_cpu.rcx = (uint64_t)(uintptr_t)tmpf; g_cpu.rdx = 0x40000000U; g_cpu.r8 = 3; g_cpu.r9 = 0;
+    cf_fn(&g_cpu, cf_ud);
+    g_cpu.rsp = sp_save;
+    uint64_t fh = g_cpu.rax;
+    assert(fh != (uint64_t)-1 && fh >= 0x20000ULL);
+    uint32_t nw = 0;
+    call_shim("WriteFile", fh, (uint64_t)(uintptr_t)"ok=1\n", 5, (uint64_t)(uintptr_t)&nw, 0);
+    assert(g_cpu.rax == 1 && nw == 5);
+    call_shim("CloseHandle", fh, 0, 0, 0, 0);
+    FILE *fp = fopen(tmpf, "rb");
+    assert(fp != NULL);
+    char rbuf[16] = {0};
+    assert(fread(rbuf, 1, 5, fp) == 5 && memcmp(rbuf, "ok=1\n", 5) == 0);
+    fclose(fp);
+    unlink(tmpf);
+
+    /* Minimal DXBC VS with SINT32 (v0), UINT32 (v1), FLOAT32 (v2) inputs */
+    uint8_t dxbc[256] = {0};
+    memcpy(dxbc, "DXBC", 4);
+    W32((uint64_t)(uintptr_t)dxbc + 28, 3); /* 3 chunks: ISGN, OSGN, SHDR */
+    uint32_t isgn_off = 44;
+    uint32_t isgn_sz = 8 + 3 * 24 + 24; /* header + 3 elems + names */
+    uint32_t osgn_off = isgn_off + 8 + isgn_sz;
+    uint32_t osgn_sz = 8 + 24 + 12;
+    uint32_t shdr_off = osgn_off + 8 + osgn_sz;
+    uint32_t shdr_sz = 12;
+    W32((uint64_t)(uintptr_t)dxbc + 32, isgn_off);
+    W32((uint64_t)(uintptr_t)dxbc + 36, osgn_off);
+    W32((uint64_t)(uintptr_t)dxbc + 40, shdr_off);
+    memcpy(dxbc + isgn_off, "ISGN", 4); W32((uint64_t)(uintptr_t)dxbc + isgn_off + 4, isgn_sz);
+    uint8_t *ip = dxbc + isgn_off + 8;
+    W32((uint64_t)(uintptr_t)ip, 3); W32((uint64_t)(uintptr_t)ip + 4, 8);
+    uint32_t name_base = 8 + 3 * 24;
+    memcpy(ip + name_base, "BW\0BI\0POS\0", 10);
+    W32((uint64_t)(uintptr_t)ip + 8 + 0,  name_base + 0); W32((uint64_t)(uintptr_t)ip + 8 + 12, 2); W32((uint64_t)(uintptr_t)ip + 8 + 16, 0);
+    W32((uint64_t)(uintptr_t)ip + 32 + 0, name_base + 3); W32((uint64_t)(uintptr_t)ip + 32 + 12, 1); W32((uint64_t)(uintptr_t)ip + 32 + 16, 1);
+    W32((uint64_t)(uintptr_t)ip + 56 + 0, name_base + 6); W32((uint64_t)(uintptr_t)ip + 56 + 12, 3); W32((uint64_t)(uintptr_t)ip + 56 + 16, 2);
+    memcpy(dxbc + osgn_off, "OSGN", 4); W32((uint64_t)(uintptr_t)dxbc + osgn_off + 4, osgn_sz);
+    uint8_t *op = dxbc + osgn_off + 8;
+    W32((uint64_t)(uintptr_t)op, 1); W32((uint64_t)(uintptr_t)op + 4, 8);
+    memcpy(op + 32, "SV_POSITION", 12);
+    W32((uint64_t)(uintptr_t)op + 8, 32); W32((uint64_t)(uintptr_t)op + 16, 1); W32((uint64_t)(uintptr_t)op + 20, 3);
+    memcpy(dxbc + shdr_off, "SHDR", 4); W32((uint64_t)(uintptr_t)dxbc + shdr_off + 4, shdr_sz);
+    W32((uint64_t)(uintptr_t)dxbc + shdr_off + 8,  0x00010040U); /* VS 4.0 */
+    W32((uint64_t)(uintptr_t)dxbc + shdr_off + 12, 3U);
+    W32((uint64_t)(uintptr_t)dxbc + shdr_off + 16, (1U << 24) | 62U); /* RET */
+    DxbcTranslated tr;
+    assert(dxbc_to_msl(dxbc, shdr_off + 8 + shdr_sz, &tr) == 0 && tr.msl_source != NULL);
+    assert(strstr(tr.msl_source, "int4 v0 [[attribute(0)]]") != NULL);
+    assert(strstr(tr.msl_source, "uint4 v1 [[attribute(1)]]") != NULL);
+    assert(strstr(tr.msl_source, "float4 v2 [[attribute(2)]]") != NULL);
+    assert(strstr(tr.msl_source, "as_type<float4>(in.v0)") != NULL);
+    assert(strstr(tr.msl_source, "as_type<float4>(in.v1)") != NULL);
+    free(tr.msl_source);
+
+    printf("V8_JSC_TEST PASS (eval=42, ext=0xcafebabe, json=ok, trycatch=ok, cb=42, io+xa2+dxgi+dxbc=ok)\n");
     return 0;
 }
