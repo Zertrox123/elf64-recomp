@@ -10,17 +10,6 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 
 <sub>*System libraries coverage measured against Portal: Revolution Win64 binaries (31 PE64 modules: `revolution.exe`, `launcher.dll`, `tier0.dll`, `vstdlib.dll`, `filesystem_stdio.dll`, `engine.dll`, `materialsystem.dll`, `shaderapidx11.dll`, `stdshader_dx11.dll`, `client.dll`, `server.dll`, `panorama.dll`, `panoramauiclient.dll`, `panorama_text_pango.dll`, etc.). Regenerated with <code>make status</code>.</sub>
 
-## What is this project for?
-
-**elf64-recomp** is an ahead-of-time (AOT) **static recompiler for macOS Apple Silicon (M1/M2/M3/M4)** that turns 64-bit x86_64 Windows (`.exe`/`.dll`) and Linux (ELF64/PIE/``.so``) binaries directly into **native ARM64 macOS executables** — with **no Rosetta, no Wine, no JIT, and no virtualization**.
-
-### What it lets you do
-
-- **Run x86_64 PC games natively on Apple Silicon**: Statically lifts x86_64 machine code into portable C, compiles it with Clang `-O2` directly to ARM64 Mach-O instructions, and bridges OS + GPU calls straight to native macOS frameworks.
-- **Direct3D 11 & DXGI -> Apple Metal**: Translates Windows x64 Direct3D 11 COM calls and DXBC (SM4/SM5) shader bytecode live into Apple Metal Shading Language (MSL) running directly on the Apple Silicon GPU.
-- **Linux Vulkan -> MoltenVK**: Bridges 865+ Vulkan commands (generated from Khronos `vk.xml`) directly to `libMoltenVK.dylib` in a unified 64-bit address space (zero pointer/struct marshalling).
-- **Primary target & roadmap**: Built first to bring **Portal: Revolution** (Strata Source, Windows x64 + Direct3D 11) natively to macOS Apple Silicon, and designed as a reusable engine to port other 64-bit Windows/Linux PC games (64-bit Source / Strata Source titles and beyond) one by one.
-
 ## Portal Revolution
 
 *MacBook Pro M4 Pro — native ARM64 Metal view*
@@ -32,6 +21,17 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 ![Portal: Revolution running natively on macOS with live Steam Cloud, playtime, and achievements via native libsteam_api.dylib bridge](docs/portal_revolution_steam_macos.jpg)
 
 <sub>Native macOS Steam integration — Steam detects **Portal: Revolution** as running on macOS with Cloud sync, playtime tracking, and Steam achievements active through the native `libsteam_api.dylib` pass-through bridge.</sub>
+
+## What is this project for?
+
+**elf64-recomp** is an ahead-of-time (AOT) **static recompiler for macOS Apple Silicon (M1/M2/M3/M4)** that turns 64-bit x86_64 Windows (`.exe`/`.dll`) and Linux (ELF64/PIE/``.so``) binaries directly into **native ARM64 macOS executables** — with **no Rosetta, no Wine, no JIT, and no virtualization**.
+
+### What it lets you do
+
+- **Run x86_64 PC games natively on Apple Silicon**: Statically lifts x86_64 machine code into portable C, compiles it with Clang `-O2` directly to ARM64 Mach-O instructions, and bridges OS + GPU calls straight to native macOS frameworks.
+- **Direct3D 11 & DXGI -> Apple Metal**: Translates Windows x64 Direct3D 11 COM calls and DXBC (SM4/SM5) shader bytecode live into Apple Metal Shading Language (MSL) running directly on the Apple Silicon GPU.
+- **Linux Vulkan -> MoltenVK**: Bridges 865+ Vulkan commands (generated from Khronos `vk.xml`) directly to `libMoltenVK.dylib` in a unified 64-bit address space (zero pointer/struct marshalling).
+- **Primary target & roadmap**: Built first to bring **Portal: Revolution** (Strata Source, Windows x64 + Direct3D 11) natively to macOS Apple Silicon, and designed as a reusable engine to port other 64-bit Windows/Linux PC games (64-bit Source / Strata Source titles and beyond) one by one.
 
 ## Architecture
 
