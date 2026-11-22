@@ -25,9 +25,9 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 
 *MacBook Pro M4 Pro — native ARM64 Metal view*
 
-![Portal: Revolution main menu running natively on Apple Silicon Metal](docs/portal_revolution_menu.png)
+![Portal: Revolution menu, options, loading, and 3D gameplay running natively on Apple Silicon Metal](docs/portal_revolution_demo.gif)
 
-<sub>Live native ARM64 Apple Metal render of **Portal: Revolution**'s Panorama main menu + 3D `menu_act1` background map (31 Windows x64 PE32+ modules statically recompiled to ARM64 Mach-O, Direct3D 11 / DXBC SM5 -> Apple Metal, Panorama UI + V8 -> JavaScriptCore + Cairo/Pango/FreeType — zero Rosetta, zero Wine, zero JIT).</sub>
+<sub>Live native ARM64 Apple Metal capture of **Portal: Revolution** — interactive Panorama main menu, Options (showing `Apple Silicon Audio` via XAudio2 -> CoreAudio), Chapter 1 loading, live 1280x720 3D Aperture room with free FPS mouse look, and blurred pause menu (31 Windows x64 PE32+ modules statically recompiled to ARM64 Mach-O, Direct3D 11 / DXBC SM5 -> Apple Metal, Panorama UI + V8 -> JavaScriptCore + Cairo/Pango/FreeType — zero Rosetta, zero Wine, zero JIT).</sub>
 
 ## Architecture
 

@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,11 +66,15 @@ static void *resolve_spec(CpSpec *sp) {
     return sp->fn;
 }
 
+static _Thread_local CPU64 *g_cp_cpu = NULL;
+
 /* Signature-driven Win64 -> ARM64 C trampoline covering all 139 Cairo/Pango/FT/FC/GLib shapes. */
 static void cp_trampoline(CPU64 *c, void *ud) {
     CpSpec *sp = (CpSpec *)ud;
     void *fn = resolve_spec(sp);
     if (!fn) { c->rax = 0; return; }
+    CPU64 *prev_cpu = g_cp_cpu;
+    g_cp_cpu = c;
     const char *s = sp->sig;
 
     if (strcmp(s, "p") == 0) {
@@ -134,6 +139,96 @@ static void cp_trampoline(CPU64 *c, void *ud) {
             win64_arg_i(c, 0), win64_arg_i(c, 1), win64_arg_i(c, 2),
             win64_arg_i(c, 3), win64_arg_i(c, 4), win64_arg_i(c, 5));
     }
+    g_cp_cpu = prev_cpu;
+}
+
+/* Custom guest PangoAttribute classes hold x86_64 copy/destroy/equal pointers. */
+typedef struct HostPangoAttrClass HostPangoAttrClass;
+typedef struct {
+    const HostPangoAttrClass *klass;
+    uint32_t start_index;
+    uint32_t end_index;
+} HostPangoAttr;
+
+struct HostPangoAttrClass {
+    int type;
+    HostPangoAttr *(*copy)(const HostPangoAttr *attr);
+    void           (*destroy)(HostPangoAttr *attr);
+    int            (*equal)(const HostPangoAttr *a, const HostPangoAttr *b);
+};
+
+typedef struct {
+    HostPangoAttrClass host;
+    uint64_t           guest_klass_va;
+    uint64_t           guest_copy;
+    uint64_t           guest_destroy;
+    uint64_t           guest_equal;
+} WrappedPangoClass;
+
+static WrappedPangoClass g_pango_classes[32];
+static int               g_pango_class_count = 0;
+static pthread_mutex_t   g_pango_class_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static HostPangoAttr *host_pango_copy(const HostPangoAttr *attr) {
+    if (!attr || !attr->klass) return NULL;
+    const WrappedPangoClass *w = (const WrappedPangoClass *)attr->klass;
+    if (g_cp_cpu && w->guest_copy > 0x10000ULL) {
+        HostPangoAttr *dup = (HostPangoAttr *)(uintptr_t)rt_invoke_win64(
+            g_cp_cpu, w->guest_copy, (uint64_t)(uintptr_t)attr, 0, 0, 0, 0, 0);
+        if (dup) dup->klass = &w->host;
+        return dup;
+    }
+    HostPangoAttr *dup = (HostPangoAttr *)calloc(1, 64);
+    if (dup) { memcpy(dup, attr, 64); dup->klass = &w->host; }
+    return dup;
+}
+
+static void host_pango_destroy(HostPangoAttr *attr) {
+    if (!attr || !attr->klass) return;
+    const WrappedPangoClass *w = (const WrappedPangoClass *)attr->klass;
+    if (g_cp_cpu && w->guest_destroy > 0x10000ULL) {
+        rt_invoke_win64(g_cp_cpu, w->guest_destroy, (uint64_t)(uintptr_t)attr, 0, 0, 0, 0, 0);
+    }
+}
+
+static int host_pango_equal(const HostPangoAttr *a, const HostPangoAttr *b) {
+    if (!a || !b || !a->klass) return a == b;
+    const WrappedPangoClass *w = (const WrappedPangoClass *)a->klass;
+    if (g_cp_cpu && w->guest_equal > 0x10000ULL) {
+        return (int)rt_invoke_win64(g_cp_cpu, w->guest_equal,
+                                    (uint64_t)(uintptr_t)a, (uint64_t)(uintptr_t)b, 0, 0, 0, 0);
+    }
+    return a == b;
+}
+
+static void w_pango_attribute_init(CPU64 *c, void *ud) {
+    (void)ud;
+    ensure_dls();
+    typedef void (*InitFn)(void *, const void *);
+    InitFn fn = g_dl_pango ? (InitFn)dlsym(g_dl_pango, "pango_attribute_init") : NULL;
+    uint64_t attr_va  = c->rcx;
+    uint64_t klass_va = c->rdx;
+    if (!fn || !attr_va || !klass_va) return;
+
+    pthread_mutex_lock(&g_pango_class_mu);
+    WrappedPangoClass *w = NULL;
+    for (int i = 0; i < g_pango_class_count; i++) {
+        if (g_pango_classes[i].guest_klass_va == klass_va) { w = &g_pango_classes[i]; break; }
+    }
+    if (!w && g_pango_class_count < 32) {
+        w = &g_pango_classes[g_pango_class_count++];
+        w->guest_klass_va = klass_va;
+        w->host.type      = (int)R32(klass_va + 0);
+        w->guest_copy     = R64(klass_va + 8);
+        w->guest_destroy  = R64(klass_va + 16);
+        w->guest_equal    = R64(klass_va + 24);
+        w->host.copy      = host_pango_copy;
+        w->host.destroy   = host_pango_destroy;
+        w->host.equal     = host_pango_equal;
+    }
+    pthread_mutex_unlock(&g_pango_class_mu);
+
+    fn((void *)(uintptr_t)attr_va, w ? (const void *)&w->host : (const void *)(uintptr_t)klass_va);
 }
 
 static void win_to_px_path(const char *in, char *out, size_t cap) {
@@ -307,6 +402,7 @@ void rt_register_cairo_pango_64(void) {
     }
     rt_register_shim("FcConfigAppFontAddDir", w_FcConfigAppFontAdd, (void *)"FcConfigAppFontAddDir");
     rt_register_shim("FcConfigAppFontAddFile", w_FcConfigAppFontAdd, (void *)"FcConfigAppFontAddFile");
+    rt_register_shim("pango_attribute_init", w_pango_attribute_init, NULL);
     /* Valve-custom hooks absent from upstream Pango/Fontconfig */
     rt_register_shim("pango_ft2_new_face_substitute", w_noop_zero, NULL);
     rt_register_shim("fontconfig_ft2_new_face_substitute", w_noop_zero, NULL);

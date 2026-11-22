@@ -447,7 +447,13 @@ static void w_GetTickCount64(CPU64 *c, void *ud) {
     c->rax = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 static void w_GetTickCount(CPU64 *c, void *ud) { w_GetTickCount64(c, ud); SET32(c->rax, c->rax); }
-static void w_Sleep(CPU64 *c, void *ud) { (void)ud; usleep((useconds_t)c->rcx * 1000U); }
+extern void win32_poll_audio_callbacks(CPU64 *c);
+static void w_Sleep(CPU64 *c, void *ud) {
+    (void)ud;
+    win32_poll_audio_callbacks(c);
+    usleep((useconds_t)c->rcx * 1000U);
+    win32_poll_audio_callbacks(c);
+}
 static void w_GetCurrentThreadId(CPU64 *c, void *ud) {
     (void)ud;
     uint64_t tid = 0;
@@ -801,17 +807,95 @@ static void w_qsort(CPU64 *c, void *ud) {
 }
 
 /* ---- User32 -> SDL2 Windowing & Input ---- */
+extern void win32_poll_audio_callbacks(CPU64 *c);
+
 typedef struct {
     SDL_Window *sdl;
     int         w, h;
     uint64_t    wndproc;
 } WinHwndObj;
 
-static WinHwndObj *g_hwnds[64];
-static uint64_t    g_last_class_wndproc = 0;
-static uint8_t     g_vk_down[256];
-static int         g_mouse_x = 640, g_mouse_y = 360;
+typedef struct {
+    char     name[64];
+    uint64_t wndproc;
+} WinClassObj;
 
+typedef struct {
+    uint64_t hwnd;
+    uint32_t wm;
+    uint64_t wp;
+    uint64_t lp;
+    int      mx, my;
+} WinQueuedMsg;
+
+static WinHwndObj  *g_hwnds[64];
+static WinClassObj  g_wndclasses[32];
+static int          g_wndclass_count = 0;
+static uint64_t     g_last_class_wndproc = 0;
+static uint64_t     g_primary_hwnd = 0x1000ULL;
+static uint8_t      g_vk_down[256];
+static int          g_mouse_x = 640, g_mouse_y = 360;
+static WinQueuedMsg g_msg_q[64];
+static int          g_msg_head = 0, g_msg_tail = 0;
+static int          g_sendmsg_depth = 0;
+static uint8_t      g_raw_ring[64][48];
+static uint32_t     g_raw_seq = 0;
+static int          g_cursor_count = 0;
+
+void win32_set_mouse_xy(int x, int y) { g_mouse_x = x; g_mouse_y = y; }
+
+int win32_show_cursor(int show) {
+    if (show) g_cursor_count++; else g_cursor_count--;
+    if (!getenv("ELF64_HEADLESS")) {
+        SDL_SetRelativeMouseMode(g_cursor_count < 0 ? SDL_TRUE : SDL_FALSE);
+    }
+    return g_cursor_count;
+}
+
+uint32_t win32_get_raw_input_data(uint64_t hraw, uint32_t cmd, uint64_t pdata, uint64_t pcb_va) {
+    uint32_t need = (cmd == 0x10000005U /* RID_HEADER */) ? 24U : 48U;
+    if (!pcb_va) return (uint32_t)-1;
+    if (!pdata) { W32(pcb_va, need); return 0; }
+    uint32_t cap = R32(pcb_va);
+    if (cap < need) { W32(pcb_va, need); return (uint32_t)-1; }
+    uint32_t idx = (uint32_t)(hraw - 0x7A0000ULL);
+    if (hraw < 0x7A0000ULL || idx >= 64U) return (uint32_t)-1;
+    memcpy((void *)(uintptr_t)pdata, g_raw_ring[idx], need);
+    W32(pcb_va, need);
+    return need;
+}
+
+static uint64_t push_raw_mouse(int dx, int dy, uint16_t btn_flags, uint16_t btn_data) {
+    uint32_t idx = (g_raw_seq++) & 63U;
+    uint8_t *p = g_raw_ring[idx];
+    memset(p, 0, 48);
+    uint32_t dwType = 0, dwSize = 48;
+    uint64_t hDev = 0x10001ULL;
+    memcpy(p + 0,  &dwType, 4);
+    memcpy(p + 4,  &dwSize, 4);
+    memcpy(p + 8,  &hDev, 8);
+    memcpy(p + 28, &btn_flags, 2);
+    memcpy(p + 30, &btn_data, 2);
+    int32_t lx = dx, ly = dy;
+    memcpy(p + 36, &lx, 4);
+    memcpy(p + 40, &ly, 4);
+    return 0x7A0000ULL + idx;
+}
+
+static int io_log_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (getenv("ELF64_IO_LOG") != NULL) ? 1 : 0;
+    return cached;
+}
+
+uint64_t win32_primary_hwnd(void) {
+    if (g_primary_hwnd >= 0x1000 && g_primary_hwnd < 0x1000 + 64 && g_hwnds[g_primary_hwnd - 0x1000])
+        return g_primary_hwnd;
+    for (int i = 63; i >= 0; i--) {
+        if (g_hwnds[i]) return (uint64_t)(0x1000 + i);
+    }
+    return 0x1000ULL;
+}
 SDL_Window *win32_hwnd_to_sdl(uint64_t hwnd) {
     if (hwnd < 0x1000 || hwnd >= 0x1000 + 64) return NULL;
     WinHwndObj *o = g_hwnds[hwnd - 0x1000];
@@ -825,44 +909,126 @@ uint64_t win32_set_wndproc(uint64_t hwnd, uint64_t fn) {
     if (hwnd < 0x1000 || hwnd >= 0x1000 + 64 || !g_hwnds[hwnd - 0x1000]) return 0;
     uint64_t prev = g_hwnds[hwnd - 0x1000]->wndproc;
     g_hwnds[hwnd - 0x1000]->wndproc = fn;
+    if (io_log_enabled())
+        fprintf(stderr, "[io] SetWndProc hwnd=0x%llx prev=0x%llx new=0x%llx\n",
+                (unsigned long long)hwnd, (unsigned long long)prev, (unsigned long long)fn);
     return prev;
 }
 int  win32_vk_is_down(int vk) { return (vk >= 0 && vk < 256) ? (int)g_vk_down[vk] : 0; }
 void win32_get_mouse_xy(int *x, int *y) { if (x) *x = g_mouse_x; if (y) *y = g_mouse_y; }
 
-static int sdl_key_to_vk(SDL_Keycode sym) {
-    if (sym >= 'a' && sym <= 'z') return (int)(sym - 'a' + 'A');
-    if (sym >= '0' && sym <= '9') return (int)sym;
-    if (sym >= SDLK_F1 && sym <= SDLK_F12) return 0x70 + (int)(sym - SDLK_F1);
-    switch (sym) {
-        case SDLK_BACKSPACE: return 0x08;
-        case SDLK_TAB:       return 0x09;
-        case SDLK_RETURN:    return 0x0D;
-        case SDLK_LSHIFT: case SDLK_RSHIFT: return 0x10;
-        case SDLK_LCTRL:  case SDLK_RCTRL:  return 0x11;
-        case SDLK_LALT:   case SDLK_RALT:   return 0x12;
-        case SDLK_ESCAPE:    return 0x1B;
-        case SDLK_SPACE:     return 0x20;
-        case SDLK_LEFT:      return 0x25;
-        case SDLK_UP:        return 0x26;
-        case SDLK_RIGHT:     return 0x27;
-        case SDLK_DOWN:      return 0x28;
-        case SDLK_DELETE:    return 0x2E;
-        case SDLK_BACKQUOTE: return 0xC0;
-        default:             return 0;
+/* Bidirectional VK <-> Windows PS/2 Set-1 scancode table for InputSystem. */
+static const struct { SDL_Scancode sdl; uint8_t vk; uint8_t vsc; } g_keymap[] = {
+    {SDL_SCANCODE_ESCAPE, 0x1B, 0x01}, {SDL_SCANCODE_1, '1', 0x02}, {SDL_SCANCODE_2, '2', 0x03},
+    {SDL_SCANCODE_3, '3', 0x04}, {SDL_SCANCODE_4, '4', 0x05}, {SDL_SCANCODE_5, '5', 0x06},
+    {SDL_SCANCODE_6, '6', 0x07}, {SDL_SCANCODE_7, '7', 0x08}, {SDL_SCANCODE_8, '8', 0x09},
+    {SDL_SCANCODE_9, '9', 0x0A}, {SDL_SCANCODE_0, '0', 0x0B}, {SDL_SCANCODE_MINUS, 0xBD, 0x0C},
+    {SDL_SCANCODE_EQUALS, 0xBB, 0x0D}, {SDL_SCANCODE_BACKSPACE, 0x08, 0x0E},
+    {SDL_SCANCODE_TAB, 0x09, 0x0F}, {SDL_SCANCODE_Q, 'Q', 0x10}, {SDL_SCANCODE_W, 'W', 0x11},
+    {SDL_SCANCODE_E, 'E', 0x12}, {SDL_SCANCODE_R, 'R', 0x13}, {SDL_SCANCODE_T, 'T', 0x14},
+    {SDL_SCANCODE_Y, 'Y', 0x15}, {SDL_SCANCODE_U, 'U', 0x16}, {SDL_SCANCODE_I, 'I', 0x17},
+    {SDL_SCANCODE_O, 'O', 0x18}, {SDL_SCANCODE_P, 'P', 0x19}, {SDL_SCANCODE_LEFTBRACKET, 0xDB, 0x1A},
+    {SDL_SCANCODE_RIGHTBRACKET, 0xDD, 0x1B}, {SDL_SCANCODE_RETURN, 0x0D, 0x1C},
+    {SDL_SCANCODE_LCTRL, 0x11, 0x1D}, {SDL_SCANCODE_A, 'A', 0x1E}, {SDL_SCANCODE_S, 'S', 0x1F},
+    {SDL_SCANCODE_D, 'D', 0x20}, {SDL_SCANCODE_F, 'F', 0x21}, {SDL_SCANCODE_G, 'G', 0x22},
+    {SDL_SCANCODE_H, 'H', 0x23}, {SDL_SCANCODE_J, 'J', 0x24}, {SDL_SCANCODE_K, 'K', 0x25},
+    {SDL_SCANCODE_L, 'L', 0x26}, {SDL_SCANCODE_SEMICOLON, 0xBA, 0x27},
+    {SDL_SCANCODE_APOSTROPHE, 0xDE, 0x28}, {SDL_SCANCODE_GRAVE, 0xC0, 0x29},
+    {SDL_SCANCODE_LSHIFT, 0x10, 0x2A}, {SDL_SCANCODE_BACKSLASH, 0xDC, 0x2B},
+    {SDL_SCANCODE_Z, 'Z', 0x2C}, {SDL_SCANCODE_X, 'X', 0x2D}, {SDL_SCANCODE_C, 'C', 0x2E},
+    {SDL_SCANCODE_V, 'V', 0x2F}, {SDL_SCANCODE_B, 'B', 0x30}, {SDL_SCANCODE_N, 'N', 0x31},
+    {SDL_SCANCODE_M, 'M', 0x32}, {SDL_SCANCODE_COMMA, 0xBC, 0x33}, {SDL_SCANCODE_PERIOD, 0xBE, 0x34},
+    {SDL_SCANCODE_SLASH, 0xBF, 0x35}, {SDL_SCANCODE_RSHIFT, 0x10, 0x36},
+    {SDL_SCANCODE_LALT, 0x12, 0x38}, {SDL_SCANCODE_SPACE, 0x20, 0x39},
+    {SDL_SCANCODE_CAPSLOCK, 0x14, 0x3A},
+    {SDL_SCANCODE_F1, 0x70, 0x3B}, {SDL_SCANCODE_F2, 0x71, 0x3C}, {SDL_SCANCODE_F3, 0x72, 0x3D},
+    {SDL_SCANCODE_F4, 0x73, 0x3E}, {SDL_SCANCODE_F5, 0x74, 0x3F}, {SDL_SCANCODE_F6, 0x75, 0x40},
+    {SDL_SCANCODE_F7, 0x76, 0x41}, {SDL_SCANCODE_F8, 0x77, 0x42}, {SDL_SCANCODE_F9, 0x78, 0x43},
+    {SDL_SCANCODE_F10, 0x79, 0x44}, {SDL_SCANCODE_F11, 0x7A, 0x57}, {SDL_SCANCODE_F12, 0x7B, 0x58},
+    {SDL_SCANCODE_UP, 0x26, 0x48}, {SDL_SCANCODE_LEFT, 0x25, 0x4B},
+    {SDL_SCANCODE_RIGHT, 0x27, 0x4D}, {SDL_SCANCODE_DOWN, 0x28, 0x50},
+    {SDL_SCANCODE_DELETE, 0x2E, 0x53}, {SDL_SCANCODE_RCTRL, 0x11, 0x1D}, {SDL_SCANCODE_RALT, 0x12, 0x38},
+};
+
+uint32_t win32_map_virtual_key(uint32_t code, uint32_t map_type) {
+    size_t n = sizeof(g_keymap) / sizeof(g_keymap[0]);
+    if (map_type == 0 || map_type == 4) { /* MAPVK_VK_TO_VSC(_EX) */
+        for (size_t i = 0; i < n; i++) if (g_keymap[i].vk == code) return g_keymap[i].vsc;
+    } else if (map_type == 1 || map_type == 3) { /* MAPVK_VSC_TO_VK(_EX) */
+        for (size_t i = 0; i < n; i++) if (g_keymap[i].vsc == (code & 0xFF)) return g_keymap[i].vk;
+    } else if (map_type == 2) { /* MAPVK_VK_TO_CHAR */
+        if ((code >= 'A' && code <= 'Z') || (code >= '0' && code <= '9') || code == ' ') return code;
     }
+    return 0;
 }
 
-static void w_RegisterClassExA(CPU64 *c, void *ud) {
-    (void)ud;
-    /* WNDCLASSEX: cbSize(0), style(4), lpfnWndProc(8) */
+static void sdl_key_to_vk_vsc(SDL_Keysym ks, int *out_vk, int *out_vsc) {
+    size_t n = sizeof(g_keymap) / sizeof(g_keymap[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (g_keymap[i].sdl == ks.scancode) { *out_vk = g_keymap[i].vk; *out_vsc = g_keymap[i].vsc; return; }
+    }
+    if (ks.sym >= 'a' && ks.sym <= 'z') { *out_vk = (int)(ks.sym - 'a' + 'A'); *out_vsc = (int)win32_map_virtual_key((uint32_t)*out_vk, 0); return; }
+    if (ks.sym >= '0' && ks.sym <= '9') { *out_vk = (int)ks.sym; *out_vsc = (int)win32_map_virtual_key((uint32_t)*out_vk, 0); return; }
+    *out_vk = 0; *out_vsc = 0;
+}
+
+static void msg_push(uint64_t hwnd, uint32_t wm, uint64_t wp, uint64_t lp) {
+    int next = (g_msg_tail + 1) & 63;
+    if (next == g_msg_head) g_msg_head = (g_msg_head + 1) & 63;
+    g_msg_q[g_msg_tail] = (WinQueuedMsg){ hwnd, wm, wp, lp, g_mouse_x, g_mouse_y };
+    g_msg_tail = next;
+}
+
+static uint64_t hwnd_for_sdl_id(Uint32 win_id) {
+    for (int i = 0; i < 64; i++) {
+        if (g_hwnds[i] && g_hwnds[i]->sdl && SDL_GetWindowID(g_hwnds[i]->sdl) == win_id)
+            return (uint64_t)(0x1000 + i);
+    }
+    return win32_primary_hwnd();
+}
+
+static void register_class_common(CPU64 *c, int wide) {
+    /* Both WNDCLASS and WNDCLASSEX have lpfnWndProc at +8 and lpszClassName at +64 on Win64. */
     if (c->rcx) {
         uint64_t wp = R64(c->rcx + 8);
-        if (wp) g_last_class_wndproc = wp;
+        uint64_t cn_va = R64(c->rcx + 64);
+        char cname[64] = {0};
+        if (cn_va > 0xFFFFULL) {
+            if (wide) utf16_to_utf8((const uint16_t *)(uintptr_t)cn_va, cname, sizeof(cname));
+            else      snprintf(cname, sizeof(cname), "%s", (const char *)(uintptr_t)cn_va);
+        }
+        if (wp) {
+            g_last_class_wndproc = wp;
+            if (cname[0]) {
+                int slot = -1;
+                for (int i = 0; i < g_wndclass_count; i++) {
+                    if (strcasecmp(g_wndclasses[i].name, cname) == 0) { slot = i; break; }
+                }
+                if (slot < 0 && g_wndclass_count < 32) slot = g_wndclass_count++;
+                if (slot >= 0) {
+                    snprintf(g_wndclasses[slot].name, sizeof(g_wndclasses[slot].name), "%s", cname);
+                    g_wndclasses[slot].wndproc = wp;
+                }
+            }
+            if (io_log_enabled())
+                fprintf(stderr, "[io] RegisterClass(%s) wp=0x%llx\n", cname, (unsigned long long)wp);
+        }
     }
     c->rax = 0xC001;
 }
-static void create_window_common(CPU64 *c, const char *title) {
+static void w_RegisterClassA(CPU64 *c, void *ud) { (void)ud; register_class_common(c, 0); }
+static void w_RegisterClassW(CPU64 *c, void *ud) { (void)ud; register_class_common(c, 1); }
+
+static uint64_t lookup_class_wndproc(const char *cname) {
+    if (cname && cname[0]) {
+        for (int i = 0; i < g_wndclass_count; i++) {
+            if (strcasecmp(g_wndclasses[i].name, cname) == 0) return g_wndclasses[i].wndproc;
+        }
+    }
+    return g_last_class_wndproc;
+}
+
+static void create_window_common(CPU64 *c, const char *cls_name, const char *title) {
     uint32_t style = (uint32_t)c->r9;
     int w = (int)win64_arg_i(c, 6);
     int h = (int)win64_arg_i(c, 7);
@@ -875,26 +1041,48 @@ static void create_window_common(CPU64 *c, const char *title) {
                                        w, h, flags);
     if (!win) { c->rax = 0; return; }
     WinHwndObj *o = (WinHwndObj *)calloc(1, sizeof(WinHwndObj));
-    o->sdl = win; o->w = w; o->h = h; o->wndproc = g_last_class_wndproc;
+    o->sdl = win; o->w = w; o->h = h; o->wndproc = lookup_class_wndproc(cls_name);
     for (int i = 0; i < 64; i++) {
-        if (!g_hwnds[i]) { g_hwnds[i] = o; c->rax = (uint64_t)(0x1000 + i); return; }
+        if (!g_hwnds[i]) {
+            g_hwnds[i] = o;
+            uint64_t hwnd = (uint64_t)(0x1000 + i);
+            if (w >= 320 && h >= 200) g_primary_hwnd = hwnd;
+            if (io_log_enabled())
+                fprintf(stderr, "[io] CreateWindow hwnd=0x%llx cls='%s' title='%s' %dx%d wp=0x%llx\n",
+                        (unsigned long long)hwnd, cls_name ? cls_name : "", title ? title : "",
+                        w, h, (unsigned long long)o->wndproc);
+            c->rax = hwnd;
+            return;
+        }
     }
     SDL_DestroyWindow(win); free(o); c->rax = 0;
 }
 static void w_CreateWindowExA(CPU64 *c, void *ud) {
     (void)ud;
-    create_window_common(c, (const char *)(uintptr_t)c->r8);
+    const char *cls = (c->rdx > 0xFFFFULL) ? (const char *)(uintptr_t)c->rdx : "";
+    create_window_common(c, cls, c->r8 ? (const char *)(uintptr_t)c->r8 : "");
 }
 static void w_CreateWindowExW(CPU64 *c, void *ud) {
     (void)ud;
-    char title[256] = {0};
+    char cls[64] = {0}, title[256] = {0};
+    if (c->rdx > 0xFFFFULL) utf16_to_utf8((const uint16_t *)(uintptr_t)c->rdx, cls, sizeof(cls));
     if (c->r8) utf16_to_utf8((const uint16_t *)(uintptr_t)c->r8, title, sizeof(title));
-    create_window_common(c, title);
+    create_window_common(c, cls, title);
 }
 static void w_ShowWindow(CPU64 *c, void *ud) {
     (void)ud;
     SDL_Window *w = win32_hwnd_to_sdl(c->rcx);
-    if (w) { if (c->rdx) SDL_ShowWindow(w); else SDL_HideWindow(w); }
+    if (w) {
+        if (c->rdx && !getenv("ELF64_HEADLESS")) {
+            SDL_ShowWindow(w);
+            g_primary_hwnd = c->rcx;
+            msg_push(c->rcx, 0x001C /* WM_ACTIVATEAPP */, 1, 0);
+            msg_push(c->rcx, 0x0006 /* WM_ACTIVATE */, 1, 0);
+            msg_push(c->rcx, 0x0007 /* WM_SETFOCUS */, 0, 0);
+        } else if (!c->rdx) {
+            SDL_HideWindow(w);
+        }
+    }
     c->rax = 1;
 }
 static void w_DestroyWindow(CPU64 *c, void *ud) {
@@ -910,61 +1098,112 @@ static void w_DestroyWindow(CPU64 *c, void *ud) {
 static void w_GetClientRect(CPU64 *c, void *ud) {
     (void)ud;
     if (!c->rdx) { c->rax = 0; return; }
-    int w = 800, h = 600;
+    int w = 1280, h = 720;
     SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
     if (win) SDL_GetWindowSize(win, &w, &h);
     W32(c->rdx + 0, 0); W32(c->rdx + 4, 0);
     W32(c->rdx + 8, (uint32_t)w); W32(c->rdx + 12, (uint32_t)h);
     c->rax = 1;
 }
-static void w_PeekMessageA(CPU64 *c, void *ud) {
-    (void)ud;
-    uint64_t msg_va = c->rcx;
+
+static uint64_t mouse_mk_flags(void) {
+    uint64_t f = 0;
+    if (g_vk_down[0x01]) f |= 0x0001; /* MK_LBUTTON */
+    if (g_vk_down[0x02]) f |= 0x0002; /* MK_RBUTTON */
+    if (g_vk_down[0x10]) f |= 0x0004; /* MK_SHIFT */
+    if (g_vk_down[0x11]) f |= 0x0008; /* MK_CONTROL */
+    if (g_vk_down[0x04]) f |= 0x0010; /* MK_MBUTTON */
+    return f;
+}
+
+static void pump_sdl_to_msgq(void) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        uint32_t wm = 0;
-        uint64_t wp = 0, lp = 0;
         if (ev.type == SDL_QUIT) {
-            wm = 0x0012; /* WM_QUIT */
+            msg_push(win32_primary_hwnd(), 0x0012 /* WM_QUIT */, 0, 0);
         } else if (ev.type == SDL_MOUSEMOTION) {
-            g_mouse_x = ev.motion.x; g_mouse_y = ev.motion.y;
-            wm = 0x0200; /* WM_MOUSEMOVE */
-            lp = ((uint64_t)(uint16_t)ev.motion.y << 16) | (uint16_t)ev.motion.x;
+            uint64_t h = hwnd_for_sdl_id(ev.motion.windowID);
+            if (SDL_GetRelativeMouseMode()) {
+                g_mouse_x += ev.motion.xrel;
+                g_mouse_y += ev.motion.yrel;
+            } else {
+                g_mouse_x = ev.motion.x; g_mouse_y = ev.motion.y;
+            }
+            if (ev.motion.xrel || ev.motion.yrel) {
+                uint64_t hraw = push_raw_mouse(ev.motion.xrel, ev.motion.yrel, 0, 0);
+                msg_push(h, 0x00FF /* WM_INPUT */, 0, hraw);
+            }
+            uint64_t lp = ((uint64_t)(uint16_t)g_mouse_y << 16) | (uint16_t)g_mouse_x;
+            msg_push(h, 0x0200 /* WM_MOUSEMOVE */, mouse_mk_flags(), lp);
         } else if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) {
+            uint64_t h = hwnd_for_sdl_id(ev.button.windowID);
             int dn = (ev.type == SDL_MOUSEBUTTONDOWN);
             g_mouse_x = ev.button.x; g_mouse_y = ev.button.y;
-            lp = ((uint64_t)(uint16_t)ev.button.y << 16) | (uint16_t)ev.button.x;
+            uint64_t lp = ((uint64_t)(uint16_t)ev.button.y << 16) | (uint16_t)ev.button.x;
+            uint32_t wm = 0;
             if (ev.button.button == SDL_BUTTON_LEFT)       { wm = dn ? 0x0201 : 0x0202; g_vk_down[0x01] = (uint8_t)dn; }
             else if (ev.button.button == SDL_BUTTON_RIGHT) { wm = dn ? 0x0204 : 0x0205; g_vk_down[0x02] = (uint8_t)dn; }
             else if (ev.button.button == SDL_BUTTON_MIDDLE){ wm = dn ? 0x0207 : 0x0208; g_vk_down[0x04] = (uint8_t)dn; }
+            if (wm) {
+                if (io_log_enabled())
+                    fprintf(stderr, "[io] mouse btn=%d dn=%d xy=(%d,%d) hwnd=0x%llx\n",
+                            ev.button.button, dn, g_mouse_x, g_mouse_y, (unsigned long long)h);
+                msg_push(h, wm, mouse_mk_flags(), lp);
+            }
         } else if (ev.type == SDL_MOUSEWHEEL) {
-            wm = 0x020A; /* WM_MOUSEWHEEL */
-            wp = (uint64_t)(uint16_t)(int16_t)(ev.wheel.y * 120) << 16;
-            lp = ((uint64_t)(uint16_t)g_mouse_y << 16) | (uint16_t)g_mouse_x;
+            uint64_t h = hwnd_for_sdl_id(ev.wheel.windowID);
+            uint64_t wp = ((uint64_t)(uint16_t)(int16_t)(ev.wheel.y * 120) << 16) | mouse_mk_flags();
+            uint64_t lp = ((uint64_t)(uint16_t)g_mouse_y << 16) | (uint16_t)g_mouse_x;
+            msg_push(h, 0x020A /* WM_MOUSEWHEEL */, wp, lp);
         } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+            uint64_t h = hwnd_for_sdl_id(ev.key.windowID);
             int dn = (ev.type == SDL_KEYDOWN);
-            int vk = sdl_key_to_vk(ev.key.keysym.sym);
+            int vk = 0, vsc = 0;
+            sdl_key_to_vk_vsc(ev.key.keysym, &vk, &vsc);
             if (vk) {
                 g_vk_down[vk] = (uint8_t)dn;
-                wm = dn ? 0x0100 : 0x0101; /* WM_KEYDOWN / WM_KEYUP */
-                wp = (uint64_t)vk;
-                lp = 1ULL | ((uint64_t)(ev.key.keysym.scancode & 0xFF) << 16);
+                uint32_t wm = dn ? 0x0100 : 0x0101;
+                uint64_t lp = 1ULL | ((uint64_t)(vsc & 0xFF) << 16) | (dn ? 0ULL : (3ULL << 30));
+                if (io_log_enabled())
+                    fprintf(stderr, "[io] key vk=0x%02x vsc=0x%02x dn=%d hwnd=0x%llx\n",
+                            vk, vsc, dn, (unsigned long long)h);
+                msg_push(h, wm, (uint64_t)vk, lp);
             }
         } else if (ev.type == SDL_TEXTINPUT && ev.text.text[0]) {
-            wm = 0x0102; /* WM_CHAR */
-            wp = (uint8_t)ev.text.text[0];
+            uint64_t h = hwnd_for_sdl_id(ev.text.windowID);
+            msg_push(h, 0x0102 /* WM_CHAR */, (uint8_t)ev.text.text[0], 1ULL);
+        } else if (ev.type == SDL_WINDOWEVENT) {
+            uint64_t h = hwnd_for_sdl_id(ev.window.windowID);
+            if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                msg_push(h, 0x001C /* WM_ACTIVATEAPP */, 1, 0);
+                msg_push(h, 0x0006 /* WM_ACTIVATE */, 1, 0);
+                msg_push(h, 0x0007 /* WM_SETFOCUS */, 0, 0);
+            } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                msg_push(h, 0x001C /* WM_ACTIVATEAPP */, 0, 0);
+                msg_push(h, 0x0008 /* WM_KILLFOCUS */, 0, 0);
+            }
         }
-        if (wm && msg_va) {
-            memset((void *)(uintptr_t)msg_va, 0, 48);
-            W64(msg_va + 0, 0x1000ULL);
-            W32(msg_va + 8, wm);
-            W64(msg_va + 16, wp);
-            W64(msg_va + 24, lp);
-            W32(msg_va + 36, (uint32_t)g_mouse_x);
-            W32(msg_va + 40, (uint32_t)g_mouse_y);
-            c->rax = 1;
-            return;
-        }
+    }
+}
+
+static void w_PeekMessageA(CPU64 *c, void *ud) {
+    (void)ud;
+    win32_poll_audio_callbacks(c);
+    pump_sdl_to_msgq();
+    uint64_t msg_va = c->rcx;
+    uint32_t remove = (uint32_t)win64_arg_i(c, 4);
+    if (g_msg_head != g_msg_tail && msg_va) {
+        WinQueuedMsg m = g_msg_q[g_msg_head];
+        if (remove & 1U) g_msg_head = (g_msg_head + 1) & 63;
+        memset((void *)(uintptr_t)msg_va, 0, 48);
+        W64(msg_va + 0, m.hwnd);
+        W32(msg_va + 8, m.wm);
+        W64(msg_va + 16, m.wp);
+        W64(msg_va + 24, m.lp);
+        W32(msg_va + 36, (uint32_t)m.mx);
+        W32(msg_va + 40, (uint32_t)m.my);
+        c->rax = 1;
+        return;
     }
     c->rax = 0;
 }
@@ -979,7 +1218,32 @@ static void w_DispatchMessageA(CPU64 *c, void *ud) {
     uint64_t lp   = R64(msg_va + 24);
     uint64_t fn   = win32_get_wndproc(hwnd);
     if (fn && wm && wm != 0x0012) {
+        if (io_log_enabled() && wm != 0x0200 && wm != 0x00FF)
+            fprintf(stderr, "[io] Dispatch hwnd=0x%llx wm=0x%x fn=0x%llx\n",
+                    (unsigned long long)hwnd, wm, (unsigned long long)fn);
         c->rax = rt_invoke_win64(c, fn, hwnd, (uint64_t)wm, wp, lp, 0, 0);
+        return;
+    }
+    c->rax = 0;
+}
+static void w_CallWindowProc(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t fn = c->rcx;
+    if (fn > 0x10000ULL && g_sendmsg_depth < 16) {
+        g_sendmsg_depth++;
+        c->rax = rt_invoke_win64(c, fn, c->rdx, c->r8, c->r9, win64_arg_i(c, 4), 0, 0);
+        g_sendmsg_depth--;
+        return;
+    }
+    c->rax = 0;
+}
+static void w_SendMessage(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t fn = win32_get_wndproc(c->rcx);
+    if (fn > 0x10000ULL && g_sendmsg_depth < 16) {
+        g_sendmsg_depth++;
+        c->rax = rt_invoke_win64(c, fn, c->rcx, c->rdx, c->r8, c->r9, 0, 0);
+        g_sendmsg_depth--;
         return;
     }
     c->rax = 0;
@@ -1032,12 +1296,15 @@ void rt_register_win32_64(void) {
     REG("qsort", w_qsort); REG("exit", w_ExitProcess); REG("_exit", w_ExitProcess);
 
     /* User32 */
-    REG("RegisterClassExA", w_RegisterClassExA); REG("RegisterClassExW", w_RegisterClassExA);
+    REG("RegisterClassA", w_RegisterClassA); REG("RegisterClassW", w_RegisterClassW);
+    REG("RegisterClassExA", w_RegisterClassA); REG("RegisterClassExW", w_RegisterClassW);
     REG("CreateWindowExA", w_CreateWindowExA); REG("CreateWindowExW", w_CreateWindowExW);
     REG("ShowWindow", w_ShowWindow); REG("DestroyWindow", w_DestroyWindow);
     REG("GetClientRect", w_GetClientRect); REG("PeekMessageA", w_PeekMessageA); REG("PeekMessageW", w_PeekMessageA);
     REG("TranslateMessage", w_TranslateMessage); REG("DispatchMessageA", w_DispatchMessageA);
     REG("DispatchMessageW", w_DispatchMessageA); REG("DefWindowProcA", w_DefWindowProcA);
     REG("DefWindowProcW", w_DefWindowProcA);
+    REG("CallWindowProcA", w_CallWindowProc); REG("CallWindowProcW", w_CallWindowProc);
+    REG("SendMessageA", w_SendMessage); REG("SendMessageW", w_SendMessage);
     #undef REG
 }

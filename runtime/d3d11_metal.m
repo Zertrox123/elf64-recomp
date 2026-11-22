@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define S_OK_HR        0x00000000U
 #define E_FAIL_HR      0x80004005U
@@ -1497,6 +1498,85 @@ static void sc_ResizeBuffers(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
+static FILE    *g_rec_fp = NULL;
+static uint8_t *g_rec_buf = NULL;
+static uint32_t g_rec_w = 0, g_rec_h = 0;
+
+static void rec_close_atexit(void) {
+    if (g_rec_fp) { pclose(g_rec_fp); g_rec_fp = NULL; }
+    free(g_rec_buf); g_rec_buf = NULL;
+}
+
+static void rec_draw_cursor(uint8_t *px, uint32_t w, uint32_t h, int mx, int my) {
+    static const char *arrow[14] = {
+        "X           ",
+        "XX          ",
+        "X.X         ",
+        "X..X        ",
+        "X...X       ",
+        "X....X      ",
+        "X.....X     ",
+        "X......X    ",
+        "X.......X   ",
+        "X....XXXX   ",
+        "X..X..X     ",
+        "X.X X..X    ",
+        "XX   X..X   ",
+        "     XXXX   ",
+    };
+    for (int dy = 0; dy < 14; dy++) {
+        int y = my + dy;
+        if (y < 0 || y >= (int)h) continue;
+        for (int dx = 0; dx < 12; dx++) {
+            char ch = arrow[dy][dx];
+            if (ch == ' ') continue;
+            int x = mx + dx;
+            if (x < 0 || x >= (int)w) continue;
+            uint8_t *p = px + ((size_t)y * w + (size_t)x) * 4;
+            uint8_t v = (ch == '.') ? 255 : 15;
+            p[0] = v; p[1] = v; p[2] = v; p[3] = 255;
+        }
+    }
+}
+
+static void rec_capture_frame(D3D11Texture2DObj *bb) {
+    const char *rec_path = getenv("ELF64_RECORD_MP4");
+    if (!rec_path || !*rec_path || !bb || !bb->mtl_tex) return;
+    static uint64_t last_ns = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    if (last_ns && now_ns - last_ns < 33333333ULL) return;
+    uint32_t w = bb->width, h = bb->height;
+    if (!g_rec_fp) {
+        const char *pix = (bb->mtl_fmt == MTLPixelFormatBGRA8Unorm) ? "bgra" : "rgba";
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -y -loglevel error -f rawvideo -pix_fmt %s -s %ux%u -r 30 -i - "
+                 "-c:v libx264 -preset ultrafast -crf 20 -pix_fmt yuv420p "
+                 "-movflags +frag_keyframe+empty_moov+default_base_moof '%s'",
+                 pix, w, h, rec_path);
+        g_rec_fp = popen(cmd, "w");
+        g_rec_buf = (uint8_t *)malloc((size_t)w * h * 4);
+        g_rec_w = w; g_rec_h = h;
+        atexit(rec_close_atexit);
+        fprintf(stderr, "[d3d11_metal] recording %ux%u@30fps -> %s\n", w, h, rec_path);
+    }
+    if (!g_rec_fp || !g_rec_buf || w != g_rec_w || h != g_rec_h) return;
+    [bb->mtl_tex getBytes:g_rec_buf bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    if (!SDL_GetRelativeMouseMode()) {
+        int mx = 0, my = 0;
+        win32_get_mouse_xy(&mx, &my);
+        rec_draw_cursor(g_rec_buf, w, h, mx, my);
+    }
+    int reps = last_ns ? (int)((now_ns - last_ns) / 33333333ULL) : 1;
+    if (reps < 1) reps = 1;
+    if (reps > 3) reps = 3;
+    last_ns = now_ns;
+    for (int i = 0; i < reps; i++) fwrite(g_rec_buf, 1, (size_t)w * h * 4, g_rec_fp);
+    fflush(g_rec_fp);
+}
+
 static void sc_Present(CPU64 *c, void *ud) {
     (void)ud;
     static uint32_t g_present_frames = 0;
@@ -1530,6 +1610,7 @@ static void sc_Present(CPU64 *c, void *ud) {
                 free(px);
             }
         }
+        rec_capture_frame(sc->backbuffer);
         if (exit_frame && g_present_frames >= exit_frame) {
             fprintf(stderr, "[d3d11_metal] exiting cleanly at frame %u\n", g_present_frames);
             _exit(0);
@@ -1642,6 +1723,7 @@ static void factory_CreateSwapChain(CPU64 *c, void *ud) {
     }
     if (win) {
         if (!getenv("ELF64_HEADLESS")) {
+            SDL_SetWindowSize(win, (int)w, (int)h);
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
             SDL_ShowWindow(win);
             SDL_RaiseWindow(win);
@@ -1872,6 +1954,7 @@ static void w_D3D11CreateDeviceAndSwapChain(CPU64 *c, void *ud) {
     }
     if (win) {
         if (!getenv("ELF64_HEADLESS")) {
+            SDL_SetWindowSize(win, (int)w, (int)h);
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
             SDL_ShowWindow(win);
             SDL_RaiseWindow(win);

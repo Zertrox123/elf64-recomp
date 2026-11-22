@@ -204,6 +204,28 @@ int main(void) {
     assert((maybe_cb[0] & 0xFF) == 1 && (int32_t)(maybe_cb[0] >> 32) == 42);
 
     call_shim("??1HandleScope@v8@@QEAA@XZ", (uint64_t)(uintptr_t)hscope, 0, 0, 0, 0);
-    printf("V8_JSC_TEST PASS (eval=42, ext=0xcafebabe, json=ok, trycatch=ok, cb=42)\n");
+
+    /* 8. Win32 keymap + IMMDeviceEnumerator + XAudio2Create (headless) */
+    setenv("ELF64_HEADLESS", "1", 1);
+    call_shim("MapVirtualKeyExA", 'W', 0, 0, 0, 0);
+    assert(g_cpu.rax == 0x11);
+    call_shim("MapVirtualKeyExA", 0x01, 1, 0, 0, 0);
+    assert(g_cpu.rax == 0x1B);
+    static const uint8_t k_mmdev[16] = {
+        0x95,0x03,0xDE,0xBC, 0x2F,0xE5, 0x7C,0x46, 0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E
+    };
+    uint64_t mm_enum = 0, xa2 = 0, mv = 0;
+    call_shim("CoCreateInstance", (uint64_t)(uintptr_t)k_mmdev, 0, 1, 0, (uint64_t)(uintptr_t)&mm_enum);
+    assert(g_cpu.rax == 0 && mm_enum != 0);
+    call_shim("XAudio2Create", (uint64_t)(uintptr_t)&xa2, 0, 0, 0, 0);
+    assert(g_cpu.rax == 0 && xa2 != 0);
+    uint64_t xa2_vt = R64(xa2);
+    assert(rt_invoke_win64(&g_cpu, R64(xa2_vt + 7 * 8), xa2, (uint64_t)(uintptr_t)&mv, 2, 44100, 0, 0) == 0);
+    assert(mv != 0);
+    uint32_t vdet[4] = {0};
+    rt_invoke_win64(&g_cpu, R64(R64(mv)), mv, (uint64_t)(uintptr_t)vdet, 0, 0, 0, 0);
+    assert(vdet[2] == 2 && vdet[3] == 44100);
+
+    printf("V8_JSC_TEST PASS (eval=42, ext=0xcafebabe, json=ok, trycatch=ok, cb=42, io+xa2=ok)\n");
     return 0;
 }

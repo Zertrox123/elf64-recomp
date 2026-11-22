@@ -1424,7 +1424,31 @@ static void w_SetWindowLongPtr(CPU64 *c, void *ud) {
 }
 static void w_GetWindowRect(CPU64 *c, void *ud) {
     (void)ud;
-    if (c->rdx) { W32(c->rdx, 0); W32(c->rdx + 4, 0); W32(c->rdx + 8, 1280); W32(c->rdx + 12, 720); }
+    int w = 1280, h = 720;
+    SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
+    if (win) SDL_GetWindowSize(win, &w, &h);
+    if (c->rdx) { W32(c->rdx, 0); W32(c->rdx + 4, 0); W32(c->rdx + 8, (uint32_t)w); W32(c->rdx + 12, (uint32_t)h); }
+    c->rax = 1;
+}
+static void w_SetWindowPos(CPU64 *c, void *ud) {
+    (void)ud;
+    int cx = (int)win64_arg_i(c, 4);
+    int cy = (int)win64_arg_i(c, 5);
+    uint32_t flags = (uint32_t)win64_arg_i(c, 6);
+    SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
+    if (win && !(flags & 0x0001U /* SWP_NOSIZE */) && cx > 64 && cy > 64 && cx <= 8192 && cy <= 8192) {
+        SDL_SetWindowSize(win, cx, cy);
+    }
+    c->rax = 1;
+}
+static void w_MoveWindow(CPU64 *c, void *ud) {
+    (void)ud;
+    int w = (int)c->r9;
+    int h = (int)win64_arg_i(c, 4);
+    SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
+    if (win && w > 64 && h > 64 && w <= 8192 && h <= 8192) {
+        SDL_SetWindowSize(win, w, h);
+    }
     c->rax = 1;
 }
 static void w_EnumDisplaySettingsA(CPU64 *c, void *ud) {
@@ -1761,17 +1785,38 @@ static void w_GetCursorPos(CPU64 *c, void *ud) {
     if (c->rcx) { W32(c->rcx, (uint32_t)x); W32(c->rcx + 4, (uint32_t)y); }
     c->rax = 1;
 }
+extern uint64_t win32_primary_hwnd(void);
+extern uint32_t win32_map_virtual_key(uint32_t code, uint32_t map_type);
+extern void     win32_set_mouse_xy(int x, int y);
+extern int      win32_show_cursor(int show);
+extern uint32_t win32_get_raw_input_data(uint64_t hraw, uint32_t cmd, uint64_t pdata, uint64_t pcb_va);
+
 static void w_SetCursorPos(CPU64 *c, void *ud) {
     (void)ud;
-    SDL_Window *w = win32_hwnd_to_sdl(0x1000ULL);
-    if (w && !getenv("ELF64_HEADLESS")) SDL_WarpMouseInWindow(w, (int)c->rcx, (int)c->rdx);
+    win32_set_mouse_xy((int)c->rcx, (int)c->rdx);
+    if (!SDL_GetRelativeMouseMode() && !getenv("ELF64_HEADLESS")) {
+        SDL_Window *w = win32_hwnd_to_sdl(win32_primary_hwnd());
+        if (w) SDL_WarpMouseInWindow(w, (int)c->rcx, (int)c->rdx);
+    }
     c->rax = 1;
+}
+static void w_ShowCursor(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)(int64_t)win32_show_cursor((int)c->rcx);
+}
+static void w_GetRawInputData(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = win32_get_raw_input_data(c->rcx, (uint32_t)c->rdx, c->r8, c->r9);
 }
 static void w_GetKeyState(CPU64 *c, void *ud) {
     (void)ud;
     c->rax = win32_vk_is_down((int)c->rcx) ? 0x8000ULL : 0ULL;
 }
-static void w_GetForegroundWindow(CPU64 *c, void *ud) { (void)ud; c->rax = 0x1000ULL; }
+static void w_MapVirtualKey(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = win32_map_virtual_key((uint32_t)c->rcx, (uint32_t)c->rdx);
+}
+static void w_GetForegroundWindow(CPU64 *c, void *ud) { (void)ud; c->rax = win32_primary_hwnd(); }
 
 static SDL_AudioDeviceID g_sdl_audio_dev = 0;
 static void w_waveOutOpen(CPU64 *c, void *ud) {
@@ -1817,9 +1862,402 @@ static void w_waveOutGetPosition(CPU64 *c, void *ud) {
     if (c->rdx) W32(c->rdx + 4, 0);
     c->rax = 0;
 }
-static void w_CoCreateInstance(CPU64 *c, void *ud) {
+
+/* ---- MMDeviceEnumerator + XAudio2 2.9 -> SDL2 Audio Bridge ---- */
+typedef struct { const uint64_t *lpVtbl; } AudioComObj;
+
+typedef struct {
+    const uint64_t *lpVtbl;
+    uint32_t        channels;
+    uint32_t        sample_rate;
+} XA2MasterVoice;
+
+typedef struct {
+    uint64_t end_byte;
+    uint64_t ctx_va;
+} XA2PendingBuf;
+
+typedef struct {
+    const uint64_t   *lpVtbl;
+    SDL_AudioDeviceID dev;
+    uint32_t          channels;
+    uint32_t          sample_rate;
+    uint32_t          bits;
+    int               is_float;
+    float             volume;
+    uint64_t          cb_va;
+    uint64_t          total_submitted;
+    uint64_t          samples_played;
+    XA2PendingBuf     pend[32];
+    int               pend_head;
+    int               pend_tail;
+    int               pend_count;
+} XA2SourceVoice;
+
+static uint64_t g_vt_mm_enum[8], g_vt_mm_coll[8], g_vt_mm_dev[8], g_vt_prop_store[8];
+static uint64_t g_vt_xa2[16], g_vt_xa2_master[24], g_vt_xa2_source[32];
+static int      g_audio_vt_ready = 0;
+static AudioComObj g_mm_enum_obj, g_mm_coll_obj, g_mm_dev_obj, g_prop_store_obj;
+static XA2SourceVoice *g_active_xa2_voice = NULL;
+static pthread_mutex_t g_xa2_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t alloc_utf16_ascii(const char *s) {
+    size_t n = strlen(s);
+    uint16_t *w = (uint16_t *)calloc(n + 1, sizeof(uint16_t));
+    if (!w) return 0;
+    for (size_t i = 0; i < n; i++) w[i] = (uint8_t)s[i];
+    return (uint64_t)(uintptr_t)w;
+}
+
+static void ac_qi(CPU64 *c, void *ud)  { (void)ud; if (c->r8) W64(c->r8, c->rcx); c->rax = 0; }
+static void ac_add(CPU64 *c, void *ud) { (void)ud; c->rax = 1; }
+static void ac_rel(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
+static void ac_ok(CPU64 *c, void *ud)  { (void)ud; c->rax = 0; }
+static void ac_void(CPU64 *c, void *ud){ (void)ud; }
+
+static void mme_EnumAudioEndpoints(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r9) W64(c->r9, (uint64_t)(uintptr_t)&g_mm_coll_obj);
+    c->rax = 0;
+}
+static void mme_GetDefaultAudioEndpoint(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r9) W64(c->r9, (uint64_t)(uintptr_t)&g_mm_dev_obj);
+    c->rax = 0;
+}
+static void mme_GetDevice(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r8) W64(c->r8, (uint64_t)(uintptr_t)&g_mm_dev_obj);
+    c->rax = 0;
+}
+static void mmc_GetCount(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx, 1);
+    c->rax = 0;
+}
+static void mmc_Item(CPU64 *c, void *ud) {
+    (void)ud;
+    if ((uint32_t)c->rdx == 0 && c->r8) { W64(c->r8, (uint64_t)(uintptr_t)&g_mm_dev_obj); c->rax = 0; }
+    else c->rax = 0x80070057ULL;
+}
+static void mmd_Activate(CPU64 *c, void *ud) {
     (void)ud;
     uint64_t ppv = win64_arg_i(c, 4);
+    if (ppv) W64(ppv, 0);
+    c->rax = 0x80004002ULL; /* E_NOINTERFACE */
+}
+static void mmd_OpenPropertyStore(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r8) W64(c->r8, (uint64_t)(uintptr_t)&g_prop_store_obj);
+    c->rax = 0;
+}
+static void mmd_GetId(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W64(c->rdx, alloc_utf16_ascii("default"));
+    c->rax = 0;
+}
+static void mmd_GetState(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx, 1); /* DEVICE_STATE_ACTIVE */
+    c->rax = 0;
+}
+static void ps_GetCount(CPU64 *c, void *ud) { (void)ud; if (c->rdx) W32(c->rdx, 1); c->rax = 0; }
+static void ps_GetValue(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->r8) {
+        memset((void *)(uintptr_t)c->r8, 0, 24);
+        W16(c->r8 + 0, 31 /* VT_LPWSTR */);
+        W64(c->r8 + 8, alloc_utf16_ascii("Apple Silicon Audio"));
+    }
+    c->rax = 0;
+}
+
+static void xa2_fire_buf_end(CPU64 *c, XA2SourceVoice *v, uint64_t ctx_va) {
+    if (!v || !v->cb_va) return;
+    uint64_t vt = R64(v->cb_va);
+    if (!vt) return;
+    uint64_t fn = R64(vt + 0x20); /* IXAudio2VoiceCallback::OnBufferEnd */
+    if (fn > 0x10000ULL) rt_invoke_win64(c, fn, v->cb_va, ctx_va, 0, 0, 0, 0);
+}
+
+static void xa2_drain_voice(CPU64 *c, XA2SourceVoice *v, int force_all) {
+    if (!v) return;
+    uint64_t done_ctx[32];
+    int n_done = 0;
+    pthread_mutex_lock(&g_xa2_mu);
+    if (v->pend_count > 0) {
+        uint32_t queued = v->dev ? SDL_GetQueuedAudioSize(v->dev) : 0;
+        uint64_t played = (v->total_submitted > queued) ? (v->total_submitted - queued) : 0;
+        while (v->pend_count > 0 && n_done < 32) {
+            XA2PendingBuf top = v->pend[v->pend_head];
+            /* Keep ~93ms (16 KiB) pre-buffered in CoreAudio to prevent underrun crackle. */
+            if (!force_all && v->dev && top.end_byte > played + 16384ULL) break;
+            v->pend_head = (v->pend_head + 1) & 31;
+            v->pend_count--;
+            done_ctx[n_done++] = top.ctx_va;
+        }
+    }
+    pthread_mutex_unlock(&g_xa2_mu);
+    for (int i = 0; i < n_done; i++) xa2_fire_buf_end(c, v, done_ctx[i]);
+}
+
+void win32_poll_audio_callbacks(CPU64 *c) {
+    XA2SourceVoice *v = g_active_xa2_voice;
+    if (v) xa2_drain_voice(c, v, 0);
+}
+
+static void xa2_CreateMasteringVoice(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t pp = c->rdx;
+    uint32_t ch = (uint32_t)c->r8;
+    uint32_t hz = (uint32_t)c->r9;
+    XA2MasterVoice *mv = (XA2MasterVoice *)calloc(1, sizeof(XA2MasterVoice));
+    mv->lpVtbl = g_vt_xa2_master;
+    mv->channels = ch ? ch : 2;
+    mv->sample_rate = hz ? hz : 44100;
+    if (pp) W64(pp, (uint64_t)(uintptr_t)mv);
+    c->rax = 0;
+}
+static void xa2_CreateSourceVoice(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t pp = c->rdx;
+    uint64_t wfx = c->r8;
+    uint64_t cb_va = win64_arg_i(c, 5);
+    XA2SourceVoice *sv = (XA2SourceVoice *)calloc(1, sizeof(XA2SourceVoice));
+    sv->lpVtbl = g_vt_xa2_source;
+    sv->volume = 1.0f;
+    sv->cb_va = cb_va;
+    uint16_t tag = wfx ? R16(wfx + 0) : 1;
+    uint16_t ch  = wfx ? R16(wfx + 2) : 2;
+    uint32_t hz  = wfx ? R32(wfx + 4) : 44100;
+    uint16_t bits = wfx ? R16(wfx + 14) : 16;
+    int is_flt = (tag == 3) || (tag == 0xFFFE && bits == 32 && wfx && R32(wfx + 24) == 3);
+    sv->channels = (ch >= 1 && ch <= 6) ? ch : 2;
+    sv->sample_rate = (hz >= 8000 && hz <= 96000) ? hz : 44100;
+    sv->bits = (bits == 8 || bits == 16 || bits == 32) ? bits : 16;
+    sv->is_float = is_flt;
+    if (!getenv("ELF64_HEADLESS")) {
+        if (!SDL_WasInit(SDL_INIT_AUDIO)) SDL_InitSubSystem(SDL_INIT_AUDIO);
+        SDL_AudioSpec want;
+        SDL_zero(want);
+        want.freq = (int)sv->sample_rate;
+        want.channels = (Uint8)sv->channels;
+        want.format = is_flt ? AUDIO_F32LSB : ((sv->bits == 8) ? AUDIO_U8 : AUDIO_S16LSB);
+        want.samples = 512;
+        sv->dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+        if (getenv("ELF64_IO_LOG"))
+            fprintf(stderr, "[audio] XAudio2 CreateSourceVoice %uHz %uch %ubit flt=%d dev=%u cb=0x%llx\n",
+                    sv->sample_rate, sv->channels, sv->bits, is_flt, (unsigned)sv->dev, (unsigned long long)cb_va);
+    }
+    g_active_xa2_voice = sv;
+    if (pp) W64(pp, (uint64_t)(uintptr_t)sv);
+    c->rax = 0;
+}
+static void xa2_GetPerfData(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) memset((void *)(uintptr_t)c->rdx, 0, 64);
+}
+static void xa2m_GetVoiceDetails(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2MasterVoice *mv = (XA2MasterVoice *)(uintptr_t)c->rcx;
+    if (c->rdx && mv) {
+        W32(c->rdx + 0, 0); W32(c->rdx + 4, 0);
+        W32(c->rdx + 8, mv->channels); W32(c->rdx + 12, mv->sample_rate);
+    }
+}
+static void xa2m_GetChannelMask(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx, 3 /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT */);
+    c->rax = 0;
+}
+static void xa2s_GetVoiceDetails(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (c->rdx && sv) {
+        W32(c->rdx + 0, 0); W32(c->rdx + 4, 0);
+        W32(c->rdx + 8, sv->channels); W32(c->rdx + 12, sv->sample_rate);
+    }
+}
+static void xa2s_SetVolume(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (sv) { float v; memcpy(&v, &c->xmm[1], 4); sv->volume = v; }
+    c->rax = 0;
+}
+static void xa2s_GetVolume(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (c->rdx && sv) { uint32_t u; memcpy(&u, &sv->volume, 4); W32(c->rdx, u); }
+}
+static void xa2s_DestroyVoice(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (sv) {
+        if (sv->dev) { SDL_CloseAudioDevice(sv->dev); sv->dev = 0; }
+        if (g_active_xa2_voice == sv) g_active_xa2_voice = NULL;
+    }
+}
+static void xa2s_Start(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (sv && sv->dev) SDL_PauseAudioDevice(sv->dev, 0);
+    c->rax = 0;
+}
+static void xa2s_Stop(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (sv && sv->dev) SDL_PauseAudioDevice(sv->dev, 1);
+    c->rax = 0;
+}
+static void xa2s_SubmitSourceBuffer(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    uint64_t buf_va = c->rdx;
+    if (sv && buf_va) {
+        xa2_drain_voice(c, sv, 0);
+        uint32_t bytes  = R32(buf_va + 4);
+        uint64_t data   = R64(buf_va + 8);
+        uint64_t ctx_va = R64(buf_va + 40);
+        pthread_mutex_lock(&g_xa2_mu);
+        if (sv->dev && data && bytes > 0) {
+            if (!sv->is_float && sv->bits == 16 && sv->volume >= 0.0f && sv->volume < 0.999f) {
+                int16_t tmp[2048];
+                uint32_t n = bytes / 2;
+                const int16_t *src = (const int16_t *)(uintptr_t)data;
+                uint32_t pos = 0;
+                while (pos < n) {
+                    uint32_t chunk = (n - pos > 2048) ? 2048 : (n - pos);
+                    for (uint32_t i = 0; i < chunk; i++) tmp[i] = (int16_t)(src[pos + i] * sv->volume);
+                    SDL_QueueAudio(sv->dev, tmp, chunk * 2);
+                    pos += chunk;
+                }
+            } else {
+                SDL_QueueAudio(sv->dev, (const void *)(uintptr_t)data, bytes);
+            }
+            sv->total_submitted += bytes;
+        }
+        uint32_t bpf = (sv->channels ? sv->channels : 2) * ((sv->bits ? sv->bits : 16) / 8);
+        if (bpf) sv->samples_played += bytes / bpf;
+        if (sv->pend_count < 32) {
+            sv->pend[sv->pend_tail] = (XA2PendingBuf){ sv->total_submitted, ctx_va };
+            sv->pend_tail = (sv->pend_tail + 1) & 31;
+            sv->pend_count++;
+        }
+        int headless = (sv->dev == 0);
+        pthread_mutex_unlock(&g_xa2_mu);
+        xa2_drain_voice(c, sv, headless);
+    }
+    c->rax = 0;
+}
+static void xa2s_FlushSourceBuffers(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (sv) {
+        if (sv->dev) SDL_ClearQueuedAudio(sv->dev);
+        xa2_drain_voice(c, sv, 1);
+    }
+    c->rax = 0;
+}
+static void xa2s_GetState(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2SourceVoice *sv = (XA2SourceVoice *)(uintptr_t)c->rcx;
+    if (sv) xa2_drain_voice(c, sv, 0);
+    if (c->rdx && sv) {
+        W64(c->rdx + 0, 0);
+        W32(c->rdx + 8, (uint32_t)sv->pend_count);
+        W64(c->rdx + 16, sv->samples_played);
+    }
+}
+static void xa2s_GetFreqRatio(CPU64 *c, void *ud) { (void)ud; if (c->rdx) W32(c->rdx, 0x3F800000U); }
+
+static void init_audio_vtables(void) {
+    if (g_audio_vt_ready) return;
+    g_audio_vt_ready = 1;
+    uint64_t t_qi   = rt_alloc_dynamic_thunk("Audio::QI", ac_qi, NULL);
+    uint64_t t_add  = rt_alloc_dynamic_thunk("Audio::AddRef", ac_add, NULL);
+    uint64_t t_rel  = rt_alloc_dynamic_thunk("Audio::Release", ac_rel, NULL);
+    uint64_t t_ok   = rt_alloc_dynamic_thunk("Audio::OK", ac_ok, NULL);
+    uint64_t t_void = rt_alloc_dynamic_thunk("Audio::Void", ac_void, NULL);
+    for (int i = 0; i < 8; i++)  { g_vt_mm_enum[i] = t_ok; g_vt_mm_coll[i] = t_ok; g_vt_mm_dev[i] = t_ok; g_vt_prop_store[i] = t_ok; }
+    for (int i = 0; i < 16; i++) g_vt_xa2[i] = t_ok;
+    for (int i = 0; i < 24; i++) g_vt_xa2_master[i] = t_ok;
+    for (int i = 0; i < 32; i++) g_vt_xa2_source[i] = t_ok;
+    #define IUNK(vt) do { (vt)[0]=t_qi; (vt)[1]=t_add; (vt)[2]=t_rel; } while(0)
+    IUNK(g_vt_mm_enum); IUNK(g_vt_mm_coll); IUNK(g_vt_mm_dev); IUNK(g_vt_prop_store); IUNK(g_vt_xa2);
+    #undef IUNK
+    g_vt_mm_enum[3] = rt_alloc_dynamic_thunk("IMMDeviceEnumerator::EnumAudioEndpoints", mme_EnumAudioEndpoints, NULL);
+    g_vt_mm_enum[4] = rt_alloc_dynamic_thunk("IMMDeviceEnumerator::GetDefaultAudioEndpoint", mme_GetDefaultAudioEndpoint, NULL);
+    g_vt_mm_enum[5] = rt_alloc_dynamic_thunk("IMMDeviceEnumerator::GetDevice", mme_GetDevice, NULL);
+    g_vt_mm_coll[3] = rt_alloc_dynamic_thunk("IMMDeviceCollection::GetCount", mmc_GetCount, NULL);
+    g_vt_mm_coll[4] = rt_alloc_dynamic_thunk("IMMDeviceCollection::Item", mmc_Item, NULL);
+    g_vt_mm_dev[3]  = rt_alloc_dynamic_thunk("IMMDevice::Activate", mmd_Activate, NULL);
+    g_vt_mm_dev[4]  = rt_alloc_dynamic_thunk("IMMDevice::OpenPropertyStore", mmd_OpenPropertyStore, NULL);
+    g_vt_mm_dev[5]  = rt_alloc_dynamic_thunk("IMMDevice::GetId", mmd_GetId, NULL);
+    g_vt_mm_dev[6]  = rt_alloc_dynamic_thunk("IMMDevice::GetState", mmd_GetState, NULL);
+    g_vt_prop_store[3] = rt_alloc_dynamic_thunk("IPropertyStore::GetCount", ps_GetCount, NULL);
+    g_vt_prop_store[5] = rt_alloc_dynamic_thunk("IPropertyStore::GetValue", ps_GetValue, NULL);
+    g_mm_enum_obj.lpVtbl = g_vt_mm_enum; g_mm_coll_obj.lpVtbl = g_vt_mm_coll;
+    g_mm_dev_obj.lpVtbl  = g_vt_mm_dev;  g_prop_store_obj.lpVtbl = g_vt_prop_store;
+
+    g_vt_xa2[4]  = t_void;
+    g_vt_xa2[5]  = rt_alloc_dynamic_thunk("IXAudio2::CreateSourceVoice", xa2_CreateSourceVoice, NULL);
+    g_vt_xa2[7]  = rt_alloc_dynamic_thunk("IXAudio2::CreateMasteringVoice", xa2_CreateMasteringVoice, NULL);
+    g_vt_xa2[9]  = t_void;
+    g_vt_xa2[11] = rt_alloc_dynamic_thunk("IXAudio2::GetPerformanceData", xa2_GetPerfData, NULL);
+    g_vt_xa2[12] = t_void;
+
+    g_vt_xa2_master[0]  = rt_alloc_dynamic_thunk("IXAudio2MasteringVoice::GetVoiceDetails", xa2m_GetVoiceDetails, NULL);
+    g_vt_xa2_master[18] = t_void;
+    g_vt_xa2_master[19] = rt_alloc_dynamic_thunk("IXAudio2MasteringVoice::GetChannelMask", xa2m_GetChannelMask, NULL);
+
+    g_vt_xa2_source[0]  = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::GetVoiceDetails", xa2s_GetVoiceDetails, NULL);
+    g_vt_xa2_source[12] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::SetVolume", xa2s_SetVolume, NULL);
+    g_vt_xa2_source[13] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::GetVolume", xa2s_GetVolume, NULL);
+    g_vt_xa2_source[18] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::DestroyVoice", xa2s_DestroyVoice, NULL);
+    g_vt_xa2_source[19] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::Start", xa2s_Start, NULL);
+    g_vt_xa2_source[20] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::Stop", xa2s_Stop, NULL);
+    g_vt_xa2_source[21] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::SubmitSourceBuffer", xa2s_SubmitSourceBuffer, NULL);
+    g_vt_xa2_source[22] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::FlushSourceBuffers", xa2s_FlushSourceBuffers, NULL);
+    g_vt_xa2_source[25] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::GetState", xa2s_GetState, NULL);
+    g_vt_xa2_source[27] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::GetFrequencyRatio", xa2s_GetFreqRatio, NULL);
+}
+
+static void w_XAudio2Create(CPU64 *c, void *ud) {
+    (void)ud;
+    init_audio_vtables();
+    AudioComObj *xa = (AudioComObj *)calloc(1, sizeof(AudioComObj));
+    xa->lpVtbl = g_vt_xa2;
+    if (c->rcx) W64(c->rcx, (uint64_t)(uintptr_t)xa);
+    if (getenv("ELF64_IO_LOG")) fprintf(stderr, "[audio] XAudio2Create -> %p\n", (void *)xa);
+    c->rax = 0;
+}
+
+static void w_PropVariantClear(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) {
+        if (R16(c->rcx) == 31 /* VT_LPWSTR */) {
+            uint64_t p = R64(c->rcx + 8);
+            if (p) free((void *)(uintptr_t)p);
+        }
+        memset((void *)(uintptr_t)c->rcx, 0, 24);
+    }
+    c->rax = 0;
+}
+
+static void w_CoCreateInstance(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t clsid_va = c->rcx;
+    uint64_t ppv = win64_arg_i(c, 4);
+    /* CLSID_MMDeviceEnumerator = {BCDE0395-E52F-467C-8E3D-C4579291692E} */
+    static const uint8_t k_mmdev[16] = {
+        0x95,0x03,0xDE,0xBC, 0x2F,0xE5, 0x7C,0x46, 0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E
+    };
+    if (clsid_va && memcmp((const void *)(uintptr_t)clsid_va, k_mmdev, 16) == 0) {
+        init_audio_vtables();
+        if (ppv) W64(ppv, (uint64_t)(uintptr_t)&g_mm_enum_obj);
+        c->rax = 0; /* S_OK */
+        return;
+    }
     if (ppv) W64(ppv, 0);
     c->rax = 0x80004002ULL; /* E_NOINTERFACE */
 }
@@ -1979,7 +2417,10 @@ static void w_CompareStringEx(CPU64 *c, void *ud) {
 }
 static void w_GetKeyboardState(CPU64 *c, void *ud) {
     (void)ud;
-    if (c->rcx) memset((void *)(uintptr_t)c->rcx, 0, 256);
+    if (c->rcx) {
+        uint8_t *buf = (uint8_t *)(uintptr_t)c->rcx;
+        for (int i = 0; i < 256; i++) buf[i] = win32_vk_is_down(i) ? 0x80 : 0;
+    }
     c->rax = 1;
 }
 static void w_GetWindowInfo(CPU64 *c, void *ud) {
@@ -2155,11 +2596,11 @@ void rt_register_win32_extra(void) {
     REG("ClientToScreen", w_ret_1); REG("ScreenToClient", w_ret_1);
     REG("BeginPaint", w_ret_1); REG("EndPaint", w_ret_1); REG("GetDC", w_ret_1); REG("ReleaseDC", w_ret_1);
     REG("InvalidateRect", w_ret_1); REG("IsIconic", w_ret_0); REG("IsWindowVisible", w_ret_1);
-    REG("MoveWindow", w_ret_1); REG("SetWindowPos", w_ret_1); REG("SetWindowTextA", w_ret_1);
-    REG("SetForegroundWindow", w_ret_1); REG("ShowCursor", w_ret_1); REG("ReleaseCapture", w_ret_1);
+    REG("MoveWindow", w_MoveWindow); REG("SetWindowPos", w_SetWindowPos); REG("SetWindowTextA", w_ret_1);
+    REG("SetForegroundWindow", w_ret_1); REG("ShowCursor", w_ShowCursor); REG("ReleaseCapture", w_ret_1);
     REG("LoadCursorA", w_ret_1); REG("LoadIconA", w_ret_1); REG("LoadImageA", w_ret_1);
-    REG("RegisterClassW", w_ret_1); REG("UnregisterClassW", w_ret_1);
-    REG("CallWindowProcA", w_ret_0); REG("SendMessageA", w_ret_0); REG("GetKeyState", w_GetKeyState);
+    REG("UnregisterClassW", w_ret_1);
+    REG("GetKeyState", w_GetKeyState);
     REG("EnumWindows", w_ret_1); REG("DialogBoxParamA", w_ret_0); REG("EndDialog", w_ret_1);
     REG("GetDlgItemInt", w_ret_0); REG("SetDlgItemInt", w_ret_1); REG("SetDlgItemTextA", w_ret_1);
     REG("ImmIsUIMessageA", w_ret_0);
@@ -2230,8 +2671,9 @@ void rt_register_win32_extra(void) {
     REG("GetWindowLongPtrA", w_GetWindowLongPtr); REG("SetWindowLongPtrA", w_SetWindowLongPtr);
     REG("GetKeyboardLayout", w_GetKeyboardLayout); REG("GetKeyboardLayoutList", w_GetKeyboardLayoutList);
     REG("ActivateKeyboardLayout", w_GetKeyboardLayout); REG("LoadKeyboardLayoutA", w_GetKeyboardLayout);
-    REG("UnloadKeyboardLayout", w_ret_1); REG("MapVirtualKeyExA", w_ret_0);
-    REG("RegisterClassA", w_ret_1); REG("UnregisterClassA", w_ret_1);
+    REG("UnloadKeyboardLayout", w_ret_1); REG("MapVirtualKeyExA", w_MapVirtualKey);
+    REG("MapVirtualKeyA", w_MapVirtualKey); REG("MapVirtualKeyExW", w_MapVirtualKey);
+    REG("UnregisterClassA", w_ret_1);
     REG("RegisterWindowMessageA", w_RegisterWindowMessageA);
     REG("GetCursorPos", w_GetCursorPos); REG("SetCursorPos", w_SetCursorPos);
     REG("GetFocus", w_GetForegroundWindow); REG("SetFocus", w_GetForegroundWindow);
@@ -2240,7 +2682,7 @@ void rt_register_win32_extra(void) {
     REG("IsWindowEnabled", w_ret_1); REG("ValidateRect", w_ret_1); REG("FlashWindow", w_ret_1);
     REG("SetWindowTextW", w_ret_1); REG("SetCapture", w_ret_0); REG("SetCursor", w_ret_1);
     REG("SetTimer", w_ret_1); REG("GetMessageA", w_ret_0); REG("GetGUIThreadInfo", w_ret_0);
-    REG("SystemParametersInfoA", w_ret_0); REG("RegisterRawInputDevices", w_ret_1); REG("GetRawInputData", w_ret_0);
+    REG("SystemParametersInfoA", w_ret_0); REG("RegisterRawInputDevices", w_ret_1); REG("GetRawInputData", w_GetRawInputData);
     REG("CopyIcon", w_ret_1); REG("CreateIconIndirect", w_ret_1); REG("DestroyCursor", w_ret_1);
     REG("DestroyIcon", w_ret_1); REG("DrawIconEx", w_ret_1); REG("GetIconInfo", w_ret_0);
     REG("LoadCursorFromFileA", w_ret_1);
@@ -2266,7 +2708,7 @@ void rt_register_win32_extra(void) {
     REG("SysAllocStringLen", w_SysAllocStringLen); REG("SysFreeString", w_SysFreeString);
     REG("SysReAllocString", w_SysReAllocString); REG("SysReAllocStringLen", w_SysReAllocStringLen);
     REG("SysStringByteLen", w_SysStringByteLen); REG("SysStringLen", w_SysStringLen);
-    REG("PropVariantClear", w_ret_0); REG("RegisterDragDrop", w_ret_0);
+    REG("PropVariantClear", w_PropVariantClear); REG("RegisterDragDrop", w_ret_0);
     REG("RevokeDragDrop", w_ret_0); REG("ReleaseStgMedium", w_ret_0);
     REG("oleaut32.dll!#9", w_ret_0);
     REG("DragQueryFileA", w_ret_0); REG("SHGetFileInfoA", w_ret_0);
@@ -2275,7 +2717,7 @@ void rt_register_win32_extra(void) {
     REG("CompareStringEx", w_CompareStringEx);
     REG("RegOpenKeyExW", w_ret_err2); REG("RegQueryInfoKeyW", w_ret_err2); REG("RegQueryValueExW", w_ret_err2);
     REG("GetAsyncKeyState", w_GetKeyState); REG("GetKeyboardState", w_GetKeyboardState);
-    REG("GetWindowInfo", w_GetWindowInfo); REG("MapVirtualKeyW", w_ret_0);
+    REG("GetWindowInfo", w_GetWindowInfo); REG("MapVirtualKeyW", w_MapVirtualKey);
     REG("PostQuitMessage", w_ret_0); REG("SendInput", w_ret_0); REG("ToUnicodeEx", w_ret_0);
     REG("ImmAssociateContextEx", w_ret_1); REG("ImmGetIMEFileNameA", w_ret_0);
     REG("ImmGetOpenStatus", w_ret_0); REG("ImmGetVirtualKey", w_ret_0);
@@ -2296,7 +2738,7 @@ void rt_register_win32_extra(void) {
     REG("mixerGetLineControlsA", w_ret_err2); REG("mixerGetControlDetailsA", w_ret_err2);
     REG("mixerSetControlDetails", w_ret_err2);
     REG("dsound.dll!#11", w_ret_err2); REG("dsound.dll!#12", w_ret_err2);
-    REG("xaudio2_9redist.dll!#1", w_CoCreateInstance);
+    REG("xaudio2_9redist.dll!#1", w_XAudio2Create); REG("XAudio2Create", w_XAudio2Create);
     REG("iplContextCreate", w_ret_err2); REG("iplHRTFCreate", w_ret_err2);
     REG("iplBinauralEffectCreate", w_ret_err2); REG("iplBinauralEffectApply", w_ret_0);
     REG("iplBinauralEffectRelease", w_ret_0); REG("iplDirectEffectCreate", w_ret_err2);
