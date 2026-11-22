@@ -2116,6 +2116,10 @@ static D3D11DeviceObj *create_device_internal(void) {
     dsd.sAddressMode = MTLSamplerAddressModeRepeat;
     dsd.tAddressMode = MTLSamplerAddressModeRepeat;
     dev->default_sampler = [mdev newSamplerStateWithDescriptor:dsd];
+    MTLDepthStencilDescriptor *ddss = [[MTLDepthStencilDescriptor alloc] init];
+    ddss.depthCompareFunction = MTLCompareFunctionLess;
+    ddss.depthWriteEnabled = YES;
+    dev->default_dss = [mdev newDepthStencilStateWithDescriptor:ddss];
     dev->zero_vb = [mdev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
     if (dev->zero_vb) memset([dev->zero_vb contents], 0, 4096);
 
