@@ -231,6 +231,50 @@ int main(void) {
     assert(plat != 0 && R64(R64(plat) + 16) != 0);
     rt_invoke_win64(&g_cpu, R64(R64(plat) + 16), plat, 0, 0, 0, 0, 0);
 
-    printf("V8_JSC_TEST PASS (eval=42, ext=0xcafebabe, json=ok, trycatch=ok, cb=42, io+xa2=ok)\n");
+    /* 9. Video/display settings: EnumDisplaySettingsA, SwapChain ResizeBuffers(0,0), Fullscreen, MSAA */
+    uint8_t dm[160] = {0};
+    call_shim("EnumDisplaySettingsA", 0, 0, (uint64_t)(uintptr_t)dm, 0, 0);
+    assert(g_cpu.rax == 1 && R32((uint64_t)(uintptr_t)dm + 108) == 800);
+    uint64_t fac = 0, ad = 0, outp = 0, dev = 0, sc = 0;
+    call_shim("CreateDXGIFactory", 0, (uint64_t)(uintptr_t)&fac, 0, 0, 0);
+    assert(fac != 0);
+    assert(rt_invoke_win64(&g_cpu, R64(R64(fac) + 7 * 8), fac, 0, (uint64_t)(uintptr_t)&ad, 0, 0, 0) == 0 && ad != 0);
+    assert(rt_invoke_win64(&g_cpu, R64(R64(ad) + 7 * 8), ad, 0, (uint64_t)(uintptr_t)&outp, 0, 0, 0) == 0 && outp != 0);
+    uint32_t nmodes = 0;
+    assert(rt_invoke_win64(&g_cpu, R64(R64(outp) + 8 * 8), outp, 28, 0, (uint64_t)(uintptr_t)&nmodes, 0, 0) == 0);
+    assert(nmodes >= 8);
+    uint64_t sc_desc[10] = {0};
+    W32((uint64_t)(uintptr_t)sc_desc + 0, 1280);
+    W32((uint64_t)(uintptr_t)sc_desc + 4, 720);
+    W32((uint64_t)(uintptr_t)sc_desc + 16, 28);
+    void *d3d_ud = NULL;
+    RTShimFn d3d_create = rt_find_shim("D3D11CreateDevice", &d3d_ud);
+    assert(d3d_create != NULL);
+    (void)dev;
+    /* Direct CreateSwapChain + ResizeBuffers + SetFullscreenState/GetFullscreenState check */
+    uint64_t dev_out = 0;
+    uint64_t sp_save = g_cpu.rsp;
+    uint64_t stk[16] = {0};
+    stk[8] = (uint64_t)(uintptr_t)&dev_out;
+    g_cpu.rsp = (uint64_t)(uintptr_t)stk;
+    g_cpu.rcx = 0; g_cpu.rdx = 1; g_cpu.r8 = 0; g_cpu.r9 = 0;
+    d3d_create(&g_cpu, d3d_ud);
+    g_cpu.rsp = sp_save;
+    assert(dev_out != 0);
+    uint32_t q1 = 0, q4 = 99;
+    rt_invoke_win64(&g_cpu, R64(R64(dev_out) + 30 * 8), dev_out, 28, 1, (uint64_t)(uintptr_t)&q1, 0, 0);
+    rt_invoke_win64(&g_cpu, R64(R64(dev_out) + 30 * 8), dev_out, 28, 4, (uint64_t)(uintptr_t)&q4, 0, 0);
+    assert(q1 == 1 && q4 == 0);
+    assert(rt_invoke_win64(&g_cpu, R64(R64(fac) + 10 * 8), fac, dev_out, (uint64_t)(uintptr_t)sc_desc, (uint64_t)(uintptr_t)&sc, 0, 0) == 0 && sc != 0);
+    assert(rt_invoke_win64(&g_cpu, R64(R64(sc) + 13 * 8), sc, 2, 1600, 900, 87, 0) == 0);
+    uint8_t got_desc[72] = {0};
+    assert(rt_invoke_win64(&g_cpu, R64(R64(sc) + 12 * 8), sc, (uint64_t)(uintptr_t)got_desc, 0, 0, 0, 0) == 0);
+    assert(R32((uint64_t)(uintptr_t)got_desc + 0) == 1600 && R32((uint64_t)(uintptr_t)got_desc + 4) == 900);
+    assert(rt_invoke_win64(&g_cpu, R64(R64(sc) + 10 * 8), sc, 1, 0, 0, 0, 0) == 0);
+    uint32_t is_fs = 0; uint64_t fs_tgt = 0xDEAD;
+    assert(rt_invoke_win64(&g_cpu, R64(R64(sc) + 11 * 8), sc, (uint64_t)(uintptr_t)&is_fs, (uint64_t)(uintptr_t)&fs_tgt, 0, 0, 0) == 0);
+    assert(is_fs == 1 && fs_tgt == 0);
+
+    printf("V8_JSC_TEST PASS (eval=42, ext=0xcafebabe, json=ok, trycatch=ok, cb=42, io+xa2+dxgi=ok)\n");
     return 0;
 }

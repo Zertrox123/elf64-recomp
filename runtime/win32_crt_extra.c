@@ -976,11 +976,17 @@ static void w_MessageBoxW(CPU64 *c, void *ud) {
     fprintf(stderr, "[MessageBoxW] %s: %s\n", t, m);
     c->rax = 1;
 }
+extern void win32_desktop_size(int *w, int *h);
+extern void win32_fit_window_size(SDL_Window *win, int req_w, int req_h);
+extern void win32_post_size(uint64_t hwnd, int w, int h);
+
 static void w_GetSystemMetrics(CPU64 *c, void *ud) {
     (void)ud;
     int idx = (int)c->rcx;
-    if (idx == 0) c->rax = 1920;
-    else if (idx == 1) c->rax = 1080;
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    if (idx == 0) c->rax = (uint64_t)dw;
+    else if (idx == 1) c->rax = (uint64_t)dh;
     else c->rax = 0;
 }
 static void w_SystemFunction036(CPU64 *c, void *ud) {
@@ -1417,21 +1423,24 @@ static void w_GetWindowLongPtr(CPU64 *c, void *ud) {
 static void w_SetWindowLongPtr(CPU64 *c, void *ud) {
     (void)ud;
     if ((int)c->rdx == -4) { c->rax = win32_set_wndproc(c->rcx, c->r8); return; }
+    if ((int)c->rdx == -16) {
+        SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
+        if (win && !getenv("ELF64_HEADLESS")) {
+            SDL_SetWindowBordered(win, (c->r8 & 0x00C00000ULL) ? SDL_TRUE : SDL_FALSE);
+        }
+    }
     int s = wnd_slot(c->rcx), idx = wnd_idx((int)c->rdx);
     uint64_t prev = g_wnd_long[s][idx];
     g_wnd_long[s][idx] = c->r8;
     c->rax = prev;
 }
 extern void win32_get_backbuffer_size(int *w, int *h);
+extern void win32_set_hwnd_size(uint64_t hwnd, int w, int h);
+extern void win32_get_hwnd_size(uint64_t hwnd, int *w, int *h);
 static void w_GetWindowRect(CPU64 *c, void *ud) {
     (void)ud;
     int w = 1280, h = 720;
-    win32_get_backbuffer_size(&w, &h);
-    if (w <= 0 || h <= 0) {
-        w = 1280; h = 720;
-        SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
-        if (win) SDL_GetWindowSize(win, &w, &h);
-    }
+    win32_get_hwnd_size(c->rcx, &w, &h);
     if (c->rdx) { W32(c->rdx, 0); W32(c->rdx + 4, 0); W32(c->rdx + 8, (uint32_t)w); W32(c->rdx + 12, (uint32_t)h); }
     c->rax = 1;
 }
@@ -1442,7 +1451,12 @@ static void w_SetWindowPos(CPU64 *c, void *ud) {
     uint32_t flags = (uint32_t)win64_arg_i(c, 6);
     SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
     if (win && !(flags & 0x0001U /* SWP_NOSIZE */) && cx > 64 && cy > 64 && cx <= 8192 && cy <= 8192) {
-        SDL_SetWindowSize(win, cx, cy);
+        if (getenv("ELF64_IO_LOG"))
+            fprintf(stderr, "[io] SetWindowPos hwnd=0x%llx %dx%d flags=0x%x\n",
+                    (unsigned long long)c->rcx, cx, cy, flags);
+        win32_set_hwnd_size(c->rcx, cx, cy);
+        win32_fit_window_size(win, cx, cy);
+        win32_post_size(c->rcx, cx, cy);
     }
     c->rax = 1;
 }
@@ -1452,7 +1466,11 @@ static void w_MoveWindow(CPU64 *c, void *ud) {
     int h = (int)win64_arg_i(c, 4);
     SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
     if (win && w > 64 && h > 64 && w <= 8192 && h <= 8192) {
-        SDL_SetWindowSize(win, w, h);
+        if (getenv("ELF64_IO_LOG"))
+            fprintf(stderr, "[io] MoveWindow hwnd=0x%llx %dx%d\n", (unsigned long long)c->rcx, w, h);
+        win32_set_hwnd_size(c->rcx, w, h);
+        win32_fit_window_size(win, w, h);
+        win32_post_size(c->rcx, w, h);
     }
     c->rax = 1;
 }
@@ -1461,11 +1479,22 @@ static void w_EnumDisplaySettingsA(CPU64 *c, void *ud) {
     uint32_t mode = (uint32_t)c->rdx;
     uint64_t dm = c->r8;
     if (!dm) { c->rax = 0; return; }
-    static const struct { uint32_t w, h; } modes[] = { {1280, 720}, {1920, 1080}, {1600, 900}, {1024, 768} };
-    uint32_t w = 1280, h = 720;
-    if (mode == 0xFFFFFFFFU || mode == 0xFFFFFFFEU) { w = 1920; h = 1080; }
-    else if (mode < 4) { w = modes[mode].w; h = modes[mode].h; }
-    else { c->rax = 0; return; }
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    static const struct { uint32_t w, h; } modes[] = {
+        {800, 600}, {1024, 768}, {1280, 720}, {1280, 800},
+        {1440, 900}, {1600, 900}, {1680, 1050}, {1920, 1080}
+    };
+    uint32_t w = (uint32_t)dw, h = (uint32_t)dh;
+    if (mode == 0xFFFFFFFFU || mode == 0xFFFFFFFEU) {
+        w = (uint32_t)dw; h = (uint32_t)dh;
+    } else if (mode < 8) {
+        w = modes[mode].w; h = modes[mode].h;
+    } else if (mode == 8) {
+        w = (uint32_t)dw; h = (uint32_t)dh;
+    } else {
+        c->rax = 0; return;
+    }
     memset((void *)(uintptr_t)dm, 0, 156);
     W16(dm + 36, 156);   /* dmSize */
     W32(dm + 40, 0x001C0000U); /* DM_BITSPERPEL|DM_PELSWIDTH|DM_PELSHEIGHT|DM_DISPLAYFREQUENCY */
@@ -1478,8 +1507,10 @@ static void w_EnumDisplaySettingsA(CPU64 *c, void *ud) {
 static void w_GetDeviceCaps(CPU64 *c, void *ud) {
     (void)ud;
     int idx = (int)c->rdx;
-    if (idx == 8) c->rax = 1920;        /* HORZRES */
-    else if (idx == 10) c->rax = 1080;  /* VERTRES */
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    if (idx == 8) c->rax = (uint64_t)dw;        /* HORZRES */
+    else if (idx == 10) c->rax = (uint64_t)dh;  /* VERTRES */
     else if (idx == 12) c->rax = 32;    /* BITSPIXEL */
     else if (idx == 88 || idx == 90) c->rax = 96; /* LOGPIXELSX/Y */
     else if (idx == 116) c->rax = 60;   /* VREFRESH */

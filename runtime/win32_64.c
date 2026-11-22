@@ -842,7 +842,73 @@ static uint8_t      g_raw_ring[64][48];
 static uint32_t     g_raw_seq = 0;
 static int          g_cursor_count = 0;
 static int          g_bb_w = 0, g_bb_h = 0;
+static int          g_last_wm_size_w = 0, g_last_wm_size_h = 0;
 
+void win32_desktop_size(int *w, int *h) {
+    int dw = 1512, dh = 982;
+    if (!getenv("ELF64_HEADLESS")) {
+        if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
+        SDL_DisplayMode dm;
+        if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w >= 640 && dm.h >= 480) {
+            dw = dm.w; dh = dm.h;
+        }
+    } else {
+        dw = 1920; dh = 1080;
+    }
+    if (w) *w = dw;
+    if (h) *h = dh;
+}
+
+void win32_fit_window_size(SDL_Window *win, int req_w, int req_h) {
+    if (!win || req_w < 64 || req_h < 64 || req_w > 8192 || req_h > 8192) return;
+    if (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) return;
+    int fw = req_w, fh = req_h;
+    if (!getenv("ELF64_HEADLESS")) {
+        SDL_Rect ub;
+        if (SDL_GetDisplayUsableBounds(0, &ub) == 0 && ub.w >= 320 && ub.h >= 240) {
+            int max_w = ub.w;
+            int max_h = (ub.h > 40) ? (ub.h - 36) : ub.h;
+            if (fw > max_w || fh > max_h) {
+                double sx = (double)max_w / (double)fw;
+                double sy = (double)max_h / (double)fh;
+                double sc = sx < sy ? sx : sy;
+                fw = (int)(fw * sc);
+                fh = (int)(fh * sc);
+            }
+        }
+    }
+    if (fw < 320) fw = 320;
+    if (fh < 200) fh = 200;
+    SDL_SetWindowSize(win, fw, fh);
+    if (!getenv("ELF64_HEADLESS")) {
+        SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
+}
+
+uint64_t win32_primary_hwnd(void);
+static void msg_push(uint64_t hwnd, uint32_t wm, uint64_t wp, uint64_t lp);
+
+void win32_post_size(uint64_t hwnd, int w, int h) {
+    if (w < 64 || h < 64) return;
+    if (w == g_last_wm_size_w && h == g_last_wm_size_h) return;
+    g_last_wm_size_w = w; g_last_wm_size_h = h;
+    uint64_t lp = ((uint64_t)(uint16_t)h << 16) | (uint16_t)w;
+    msg_push(hwnd ? hwnd : win32_primary_hwnd(), 0x0005 /* WM_SIZE */, 0, lp);
+}
+
+void win32_set_hwnd_size(uint64_t hwnd, int w, int h) {
+    if (hwnd < 0x1000 || hwnd >= 0x1000 + 64 || !g_hwnds[hwnd - 0x1000]) return;
+    if (w > 0 && h > 0) { g_hwnds[hwnd - 0x1000]->w = w; g_hwnds[hwnd - 0x1000]->h = h; }
+}
+void win32_get_hwnd_size(uint64_t hwnd, int *w, int *h) {
+    if (hwnd >= 0x1000 && hwnd < 0x1000 + 64 && g_hwnds[hwnd - 0x1000]) {
+        if (w) *w = g_hwnds[hwnd - 0x1000]->w;
+        if (h) *h = g_hwnds[hwnd - 0x1000]->h;
+        return;
+    }
+    if (w) *w = g_bb_w > 0 ? g_bb_w : 1280;
+    if (h) *h = g_bb_h > 0 ? g_bb_h : 720;
+}
 void win32_set_backbuffer_size(int w, int h) {
     if (w > 0 && h > 0) { g_bb_w = w; g_bb_h = h; }
 }
@@ -1123,12 +1189,7 @@ static void w_GetClientRect(CPU64 *c, void *ud) {
     (void)ud;
     if (!c->rdx) { c->rax = 0; return; }
     int w = 1280, h = 720;
-    if (g_bb_w > 0 && g_bb_h > 0) {
-        w = g_bb_w; h = g_bb_h;
-    } else {
-        SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
-        if (win) SDL_GetWindowSize(win, &w, &h);
-    }
+    win32_get_hwnd_size(c->rcx, &w, &h);
     W32(c->rdx + 0, 0); W32(c->rdx + 4, 0);
     W32(c->rdx + 8, (uint32_t)w); W32(c->rdx + 12, (uint32_t)h);
     c->rax = 1;

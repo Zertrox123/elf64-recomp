@@ -212,17 +212,26 @@ struct D3D11DeviceObj {
 };
 
 extern void win32_set_backbuffer_size(int w, int h);
+extern void win32_set_hwnd_size(uint64_t hwnd, int w, int h);
+extern void win32_get_hwnd_size(uint64_t hwnd, int *w, int *h);
+extern void win32_fit_window_size(SDL_Window *win, int req_w, int req_h);
+extern void win32_desktop_size(int *w, int *h);
 
 typedef struct {
     ComBase            base;
     D3D11DeviceObj    *dev;
     D3D11Texture2DObj *backbuffer;
     SDL_Window        *sdl_win;
+    uint64_t           hwnd;
     SDL_MetalView      metal_view;
     CAMetalLayer      *metal_layer;
     uint32_t           width;
     uint32_t           height;
+    int                is_fullscreen;
 } DXGISwapChainObj;
+
+static SDL_Window   *g_shared_metal_win  = NULL;
+static SDL_MetalView g_shared_metal_view = NULL;
 
 typedef struct {
     ComBase        base;
@@ -1445,6 +1454,33 @@ static void ctx_GenerateMips(CPU64 *c, void *ud) {
     }
 }
 
+static void ctx_ResolveSubresource(CPU64 *c, void *ud) {
+    (void)ud;
+    D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
+    ComBase *dst = (ComBase *)(uintptr_t)c->rdx;
+    uint32_t dst_sub = (uint32_t)c->r8;
+    ComBase *src = (ComBase *)(uintptr_t)c->r9;
+    uint32_t src_sub = (uint32_t)win64_arg_i(c, 4);
+    if (!ctx || !dst || !src || dst->kind != COM_TEXTURE2D || src->kind != COM_TEXTURE2D) return;
+    D3D11Texture2DObj *dt = (D3D11Texture2DObj *)dst;
+    D3D11Texture2DObj *st = (D3D11Texture2DObj *)src;
+    if (!dt->mtl_tex || !st->mtl_tex) return;
+    uint32_t dmip = dst_sub < dt->mip_levels ? dst_sub : 0;
+    uint32_t smip = src_sub < st->mip_levels ? src_sub : 0;
+    uint32_t w = dt->width < st->width ? dt->width : st->width;
+    uint32_t h = dt->height < st->height ? dt->height : st->height;
+    @autoreleasepool {
+        ctx_end_pass(ctx);
+        id<MTLCommandBuffer> cb = ctx_ensure_cb(ctx);
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:st->mtl_tex sourceSlice:0 sourceLevel:smip
+                 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:dt->mtl_tex destinationSlice:0 destinationLevel:dmip
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+    }
+}
+
 static void ctx_Flush(CPU64 *c, void *ud) {
     (void)ud;
     ctx_flush_gpu((D3D11ContextObj *)(uintptr_t)c->rcx, 0);
@@ -1690,14 +1726,30 @@ static void sc_GetDesc(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
+static uint64_t g_vt_output[16];
+
 static void sc_SetFullscreenState(CPU64 *c, void *ud) {
     (void)ud;
     DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
     int fs = (c->rdx != 0);
-    if (sc && sc->sdl_win && !getenv("ELF64_HEADLESS")) {
-        SDL_SetWindowFullscreen(sc->sdl_win, fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-        if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
+    if (sc) {
+        sc->is_fullscreen = fs;
+        if (getenv("ELF64_IO_LOG"))
+            fprintf(stderr, "[d3d11_metal] SetFullscreenState fs=%d\n", fs);
+        if (sc->sdl_win && !getenv("ELF64_HEADLESS")) {
+            SDL_SetWindowFullscreen(sc->sdl_win, fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+            if (!fs) win32_fit_window_size(sc->sdl_win, (int)sc->width, (int)sc->height);
+            if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
+        }
     }
+    c->rax = S_OK_HR;
+}
+
+static void sc_GetFullscreenState(CPU64 *c, void *ud) {
+    (void)ud;
+    DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
+    if (c->rdx) W32(c->rdx, sc ? (uint32_t)sc->is_fullscreen : 0U);
+    if (c->r8)  W64(c->r8, 0);
     c->rax = S_OK_HR;
 }
 
@@ -1708,15 +1760,29 @@ static void sc_ResizeBuffers(CPU64 *c, void *ud) {
     uint32_t h = (uint32_t)c->r9;
     uint32_t fmt = (uint32_t)win64_arg_i(c, 4);
     if (!sc) { c->rax = E_INVALIDARG_H; return; }
-    if (w == 0) w = sc->width;
-    if (h == 0) h = sc->height;
+    /* DXGI spec: 0 width/height queries the OutputWindow's current client rect. */
+    if (w == 0 || h == 0) {
+        int hw = (int)sc->width, hh = (int)sc->height;
+        if (sc->hwnd) win32_get_hwnd_size(sc->hwnd, &hw, &hh);
+        if (w == 0) w = hw > 0 ? (uint32_t)hw : sc->width;
+        if (h == 0) h = hh > 0 ? (uint32_t)hh : sc->height;
+    }
     if (fmt == 0 && sc->backbuffer) fmt = sc->backbuffer->dxgi_fmt;
-    if (sc->dev && sc->dev->imm_ctx) ctx_flush_gpu(sc->dev->imm_ctx, 1);
-    if (w != sc->width || h != sc->height) {
+    if (getenv("ELF64_IO_LOG"))
+        fprintf(stderr, "[d3d11_metal] ResizeBuffers %ux%u -> %ux%u fmt=%u\n", sc->width, sc->height, w, h, fmt);
+    if (sc->dev && sc->dev->imm_ctx) {
+        ctx_flush_gpu(sc->dev->imm_ctx, 1);
+        for (int i = 0; i < 8; i++) {
+            if (sc->dev->imm_ctx->rtvs[i] && sc->dev->imm_ctx->rtvs[i]->tex == sc->backbuffer)
+                sc->dev->imm_ctx->rtvs[i] = NULL;
+        }
+    }
+    if (w != sc->width || h != sc->height || (fmt && sc->backbuffer && fmt != sc->backbuffer->dxgi_fmt)) {
         sc->width = w; sc->height = h;
         sc->backbuffer = create_tex2d_internal(sc->dev, w, h, fmt ? fmt : 28, 0, 1, 0);
         win32_set_backbuffer_size((int)w, (int)h);
-        if (sc->sdl_win) SDL_SetWindowSize(sc->sdl_win, (int)w, (int)h);
+        if (sc->hwnd) win32_set_hwnd_size(sc->hwnd, (int)w, (int)h);
+        if (sc->sdl_win && !sc->is_fullscreen) win32_fit_window_size(sc->sdl_win, (int)w, (int)h);
         if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(w, h);
     }
     c->rax = S_OK_HR;
@@ -1726,13 +1792,25 @@ static void sc_ResizeTarget(CPU64 *c, void *ud) {
     (void)ud;
     DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
     uint64_t mode_va = c->rdx;
-    if (sc && mode_va && sc->sdl_win) {
+    if (sc && mode_va) {
         uint32_t w = R32(mode_va + 0), h = R32(mode_va + 4);
-        if (w >= 320 && h >= 200 && w <= 8192 && h <= 8192) {
-            SDL_SetWindowSize(sc->sdl_win, (int)w, (int)h);
+        if (getenv("ELF64_IO_LOG"))
+            fprintf(stderr, "[d3d11_metal] ResizeTarget %ux%u\n", w, h);
+        if (sc->sdl_win && !sc->is_fullscreen && w >= 320 && h >= 200 && w <= 8192 && h <= 8192) {
+            win32_fit_window_size(sc->sdl_win, (int)w, (int)h);
             if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
         }
     }
+    c->rax = S_OK_HR;
+}
+
+static void sc_GetContainingOutput(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t out_va = c->rdx;
+    if (!out_va) { c->rax = E_INVALIDARG_H; return; }
+    ComBase *o = (ComBase *)calloc(1, sizeof(ComBase));
+    o->lpVtbl = g_vt_output; o->kind = COM_GENERIC_STATE; o->refcount = 1;
+    W64(out_va, (uint64_t)(uintptr_t)o);
     c->rax = S_OK_HR;
 }
 
@@ -1865,6 +1943,7 @@ static void sc_Present(CPU64 *c, void *ud) {
     if (sc && sc->metal_layer && sc->backbuffer) {
         SDL_PumpEvents();
         @autoreleasepool {
+            sc->metal_layer.displaySyncEnabled = ((uint32_t)c->rdx != 0) ? YES : NO;
             if (sc->metal_layer.drawableSize.width != sc->width || sc->metal_layer.drawableSize.height != sc->height) {
                 sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
             }
@@ -1909,16 +1988,17 @@ static void adapter_GetDesc(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
-static uint64_t g_vt_output[16];
 static void output_GetDesc(CPU64 *c, void *ud) {
     (void)ud;
     uint64_t dst = c->rdx;
     if (!dst) { c->rax = E_INVALIDARG_H; return; }
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
     memset((void *)(uintptr_t)dst, 0, 96);
     const char *dn = "\\\\.\\DISPLAY1";
     uint16_t *w = (uint16_t *)(uintptr_t)dst;
     for (size_t i = 0; dn[i]; i++) w[i] = (uint8_t)dn[i];
-    W32(dst + 64, 0); W32(dst + 68, 0); W32(dst + 72, 1920); W32(dst + 76, 1080);
+    W32(dst + 64, 0); W32(dst + 68, 0); W32(dst + 72, (uint32_t)dw); W32(dst + 76, (uint32_t)dh);
     W32(dst + 80, 1); /* AttachedToDesktop */
     W32(dst + 84, 1); /* DXGI_MODE_ROTATION_IDENTITY */
     W64(dst + 88, 0x1001ULL); /* Monitor */
@@ -1929,11 +2009,25 @@ static void output_GetDisplayModeList(CPU64 *c, void *ud) {
     uint32_t fmt = (uint32_t)c->rdx;
     uint64_t p_num = c->r9;
     uint64_t p_desc = win64_arg_i(c, 4);
-    static const struct { uint32_t w, h; } modes[] = { {1280, 720}, {1600, 900}, {1920, 1080} };
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    struct { uint32_t w, h; } modes[10] = {
+        {800, 600}, {1024, 768}, {1280, 720}, {1280, 800},
+        {1440, 900}, {1600, 900}, {1680, 1050}, {1920, 1080},
+    };
+    uint32_t count = 8;
+    int has_desk = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if ((int)modes[i].w == dw && (int)modes[i].h == dh) has_desk = 1;
+    }
+    if (!has_desk && dw >= 640 && dh >= 480) {
+        modes[count].w = (uint32_t)dw; modes[count].h = (uint32_t)dh;
+        count++;
+    }
     if (!p_num) { c->rax = E_INVALIDARG_H; return; }
-    if (!p_desc) { W32(p_num, 3); c->rax = S_OK_HR; return; }
+    if (!p_desc) { W32(p_num, count); c->rax = S_OK_HR; return; }
     uint32_t cap = R32(p_num);
-    uint32_t n = cap < 3 ? cap : 3;
+    uint32_t n = cap < count ? cap : count;
     for (uint32_t i = 0; i < n; i++) {
         uint64_t d = p_desc + i * 28ULL;
         memset((void *)(uintptr_t)d, 0, 28);
@@ -1964,11 +2058,18 @@ static void factory_CreateSwapChain(CPU64 *c, void *ud) {
     uint32_t h = sc_desc_va ? R32(sc_desc_va + 4) : 720;
     uint32_t fmt = sc_desc_va ? R32(sc_desc_va + 16) : 28;
     uint64_t hwnd = sc_desc_va ? R64(sc_desc_va + 48) : 0;
+    if ((w == 0 || h == 0) && hwnd) {
+        int hw = 1280, hh = 720;
+        win32_get_hwnd_size(hwnd, &hw, &hh);
+        if (w == 0) w = hw > 0 ? (uint32_t)hw : 1280;
+        if (h == 0) h = hh > 0 ? (uint32_t)hh : 720;
+    }
     if (w == 0) w = 1280;
     if (h == 0) h = 720;
     DXGISwapChainObj *sc = (DXGISwapChainObj *)calloc(1, sizeof(DXGISwapChainObj));
     sc->base.lpVtbl = g_vt_swapchain; sc->base.kind = COM_SWAPCHAIN; sc->base.refcount = 1;
-    sc->dev = dev; sc->width = w; sc->height = h;
+    sc->dev = dev; sc->width = w; sc->height = h; sc->hwnd = hwnd;
+    if (hwnd) win32_set_hwnd_size(hwnd, (int)w, (int)h);
     sc->backbuffer = create_tex2d_internal(dev, w, h, fmt, 0, 1, 0);
     SDL_Window *win = win32_hwnd_to_sdl(hwnd);
     if (!win && !getenv("ELF64_HEADLESS")) {
@@ -1979,14 +2080,20 @@ static void factory_CreateSwapChain(CPU64 *c, void *ud) {
     if (win) {
         sc->sdl_win = win;
         win32_set_backbuffer_size((int)w, (int)h);
-        SDL_SetWindowSize(win, (int)w, (int)h);
+        win32_fit_window_size(win, (int)w, (int)h);
         if (!getenv("ELF64_HEADLESS")) {
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
             SDL_ShowWindow(win);
             SDL_RaiseWindow(win);
             [NSApp activateIgnoringOtherApps:YES];
         }
-        sc->metal_view = SDL_Metal_CreateView(win);
+        if (g_shared_metal_win == win && g_shared_metal_view) {
+            sc->metal_view = g_shared_metal_view;
+        } else {
+            sc->metal_view = SDL_Metal_CreateView(win);
+            g_shared_metal_win = win;
+            g_shared_metal_view = sc->metal_view;
+        }
         if (sc->metal_view) {
             sc->metal_layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(sc->metal_view);
             sc->metal_layer.device = dev->mtl_dev;
@@ -2005,7 +2112,7 @@ static void dev_CheckFormatSupport(CPU64 *c, void *ud) {
 static void dev_CheckMultisampleQualityLevels(CPU64 *c, void *ud) {
     (void)ud;
     uint32_t samples = (uint32_t)c->r8;
-    if (c->r9) W32(c->r9, (samples <= 4) ? 1U : 0U);
+    if (c->r9) W32(c->r9, (samples == 1) ? 1U : 0U);
     c->rax = S_OK_HR;
 }
 
@@ -2113,6 +2220,7 @@ static void init_d3d11_vtables(void) {
     g_vt_context[50] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ClearRenderTargetView", ctx_ClearRenderTargetView, NULL);
     g_vt_context[53] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ClearDepthStencilView", ctx_ClearDepthStencilView, NULL);
     g_vt_context[54] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::GenerateMips", ctx_GenerateMips, NULL);
+    g_vt_context[57] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ResolveSubresource", ctx_ResolveSubresource, NULL);
     g_vt_context[111]= rt_alloc_dynamic_thunk("ID3D11DeviceContext::Flush", ctx_Flush, NULL);
 
     /* IDXGISwapChain / IDXGIAdapter / IDXGIOutput / IDXGIFactory slots */
@@ -2121,9 +2229,11 @@ static void init_d3d11_vtables(void) {
     g_vt_swapchain[8] = rt_alloc_dynamic_thunk("IDXGISwapChain::Present", sc_Present, NULL);
     g_vt_swapchain[9] = rt_alloc_dynamic_thunk("IDXGISwapChain::GetBuffer", sc_GetBuffer, NULL);
     g_vt_swapchain[10]= rt_alloc_dynamic_thunk("IDXGISwapChain::SetFullscreenState", sc_SetFullscreenState, NULL);
+    g_vt_swapchain[11]= rt_alloc_dynamic_thunk("IDXGISwapChain::GetFullscreenState", sc_GetFullscreenState, NULL);
     g_vt_swapchain[12]= rt_alloc_dynamic_thunk("IDXGISwapChain::GetDesc", sc_GetDesc, NULL);
     g_vt_swapchain[13]= rt_alloc_dynamic_thunk("IDXGISwapChain::ResizeBuffers", sc_ResizeBuffers, NULL);
     g_vt_swapchain[14]= rt_alloc_dynamic_thunk("IDXGISwapChain::ResizeTarget", sc_ResizeTarget, NULL);
+    g_vt_swapchain[15]= rt_alloc_dynamic_thunk("IDXGISwapChain::GetContainingOutput", sc_GetContainingOutput, NULL);
     g_vt_adapter[6]   = t_get_parent;
     g_vt_adapter[7]   = rt_alloc_dynamic_thunk("IDXGIAdapter::EnumOutputs", adapter_EnumOutputs, NULL);
     g_vt_adapter[8]   = rt_alloc_dynamic_thunk("IDXGIAdapter::GetDesc", adapter_GetDesc, NULL);
@@ -2220,14 +2330,20 @@ static void w_D3D11CreateDeviceAndSwapChain(CPU64 *c, void *ud) {
     if (win) {
         sc->sdl_win = win;
         win32_set_backbuffer_size((int)w, (int)h);
-        SDL_SetWindowSize(win, (int)w, (int)h);
+        win32_fit_window_size(win, (int)w, (int)h);
         if (!getenv("ELF64_HEADLESS")) {
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
             SDL_ShowWindow(win);
             SDL_RaiseWindow(win);
             [NSApp activateIgnoringOtherApps:YES];
         }
-        sc->metal_view = SDL_Metal_CreateView(win);
+        if (g_shared_metal_win == win && g_shared_metal_view) {
+            sc->metal_view = g_shared_metal_view;
+        } else {
+            sc->metal_view = SDL_Metal_CreateView(win);
+            g_shared_metal_win = win;
+            g_shared_metal_view = sc->metal_view;
+        }
         if (sc->metal_view) {
             sc->metal_layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(sc->metal_view);
             sc->metal_layer.device = dev->mtl_dev;
