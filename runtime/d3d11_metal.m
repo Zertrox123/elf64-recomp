@@ -93,6 +93,9 @@ typedef struct {
     uint32_t cull_mode;
     int      front_ccw;
     int      scissor_enable;
+    int32_t  depth_bias;
+    float    depth_bias_clamp;
+    float    slope_depth_bias;
 } D3D11RasterizerStateObj;
 
 typedef struct {
@@ -165,13 +168,21 @@ struct D3D11ContextObj {
     D3D11SamplerObj     *vs_samplers[16];
     D3D11SamplerObj     *ps_samplers[16];
     D3D11BlendStateObj  *blend_state;
+    float                blend_factor[4];
+    int                  has_blend_factor;
     D3D11DepthStencilStateObj *ds_state;
+    uint32_t             stencil_ref;
     D3D11RasterizerStateObj   *rs_state;
     uint32_t             topology;
     float                vp_x, vp_y, vp_w, vp_h, vp_minz, vp_maxz;
     int                  has_vp;
     int32_t              sc_l, sc_t, sc_r, sc_b;
     int                  has_scissor;
+    id<MTLCommandBuffer>        pending_cb;
+    id<MTLRenderCommandEncoder> active_enc;
+    D3D11Texture2DObj          *enc_rt[4];
+    int                         enc_nrt;
+    D3D11Texture2DObj          *enc_dt;
 };
 
 typedef struct {
@@ -179,7 +190,8 @@ typedef struct {
     D3D11ShaderObj      *ps;
     D3D11InputLayoutObj *layout;
     D3D11BlendStateObj  *blend;
-    MTLPixelFormat       color_fmt;
+    MTLPixelFormat       color_fmts[4];
+    int                  num_rts;
     MTLPixelFormat       depth_fmt;
     id<MTLRenderPipelineState> pso;
 } PsoCacheEntry;
@@ -895,6 +907,19 @@ static void dev_CreateBlendState(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
+static MTLStencilOperation d3d_to_mtl_stencil_op(uint32_t op) {
+    switch (op) {
+        case 2: return MTLStencilOperationZero;
+        case 3: return MTLStencilOperationReplace;
+        case 4: return MTLStencilOperationIncrementClamp;
+        case 5: return MTLStencilOperationDecrementClamp;
+        case 6: return MTLStencilOperationInvert;
+        case 7: return MTLStencilOperationIncrementWrap;
+        case 8: return MTLStencilOperationDecrementWrap;
+        case 1: default: return MTLStencilOperationKeep;
+    }
+}
+
 static void dev_CreateDepthStencilState(CPU64 *c, void *ud) {
     (void)ud;
     D3D11DeviceObj *dev = (D3D11DeviceObj *)(uintptr_t)c->rcx;
@@ -910,6 +935,26 @@ static void dev_CreateDepthStencilState(CPU64 *c, void *ud) {
         uint32_t dfunc = desc_va ? R32(desc_va + 8) : 2; /* LESS */
         d.depthCompareFunction = depth_en ? d3d_to_mtl_cmp(dfunc) : MTLCompareFunctionAlways;
         d.depthWriteEnabled = (depth_en && wmask != 0) ? YES : NO;
+        if (desc_va && R32(desc_va + 12) != 0 /* StencilEnable */) {
+            uint8_t rmask = R8(desc_va + 16);
+            uint8_t smask = R8(desc_va + 17);
+            MTLStencilDescriptor *f = [[MTLStencilDescriptor alloc] init];
+            f.stencilFailureOperation   = d3d_to_mtl_stencil_op(R32(desc_va + 20));
+            f.depthFailureOperation     = d3d_to_mtl_stencil_op(R32(desc_va + 24));
+            f.depthStencilPassOperation = d3d_to_mtl_stencil_op(R32(desc_va + 28));
+            f.stencilCompareFunction    = d3d_to_mtl_cmp(R32(desc_va + 32));
+            f.readMask  = rmask;
+            f.writeMask = smask;
+            MTLStencilDescriptor *b = [[MTLStencilDescriptor alloc] init];
+            b.stencilFailureOperation   = d3d_to_mtl_stencil_op(R32(desc_va + 36));
+            b.depthFailureOperation     = d3d_to_mtl_stencil_op(R32(desc_va + 40));
+            b.depthStencilPassOperation = d3d_to_mtl_stencil_op(R32(desc_va + 44));
+            b.stencilCompareFunction    = d3d_to_mtl_cmp(R32(desc_va + 48));
+            b.readMask  = rmask;
+            b.writeMask = smask;
+            d.frontFaceStencil = f;
+            d.backFaceStencil  = b;
+        }
         ds->mtl_dss = [dev->mtl_dev newDepthStencilStateWithDescriptor:d];
     }
     W64(out_va, (uint64_t)(uintptr_t)ds);
@@ -925,6 +970,12 @@ static void dev_CreateRasterizerState(CPU64 *c, void *ud) {
     rs->base.lpVtbl = g_vt_generic; rs->base.kind = COM_RASTERIZER_STATE; rs->base.refcount = 1;
     rs->cull_mode      = desc_va ? R32(desc_va + 4) : 3; /* D3D11_CULL_BACK */
     rs->front_ccw      = desc_va ? (R32(desc_va + 8) != 0) : 0;
+    if (desc_va) {
+        rs->depth_bias = (int32_t)R32(desc_va + 12);
+        uint32_t bc = R32(desc_va + 16), sb = R32(desc_va + 20);
+        memcpy(&rs->depth_bias_clamp, &bc, 4);
+        memcpy(&rs->slope_depth_bias, &sb, 4);
+    }
     rs->scissor_enable = desc_va ? (R32(desc_va + 28) != 0) : 0;
     W64(out_va, (uint64_t)(uintptr_t)rs);
     c->rax = S_OK_HR;
@@ -935,12 +986,20 @@ static void ctx_OMSetBlendState(CPU64 *c, void *ud) {
     D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
     ComBase *b = (ComBase *)(uintptr_t)c->rdx;
     ctx->blend_state = (b && b->kind == COM_BLEND_STATE) ? (D3D11BlendStateObj *)b : NULL;
+    if (c->r8) {
+        memcpy(ctx->blend_factor, (const void *)(uintptr_t)c->r8, 16);
+        ctx->has_blend_factor = 1;
+    } else {
+        ctx->blend_factor[0] = ctx->blend_factor[1] = ctx->blend_factor[2] = ctx->blend_factor[3] = 1.0f;
+        ctx->has_blend_factor = 0;
+    }
 }
 static void ctx_OMSetDepthStencilState(CPU64 *c, void *ud) {
     (void)ud;
     D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
     ComBase *b = (ComBase *)(uintptr_t)c->rdx;
     ctx->ds_state = (b && b->kind == COM_DEPTH_STENCIL_STATE) ? (D3D11DepthStencilStateObj *)b : NULL;
+    ctx->stencil_ref = (uint32_t)c->r8;
 }
 static void ctx_RSSetState(CPU64 *c, void *ud) {
     (void)ud;
@@ -986,6 +1045,31 @@ static void ctx_RSSetViewports(CPU64 *c, void *ud) {
     }
 }
 
+static void ctx_end_pass(D3D11ContextObj *ctx) {
+    if (!ctx || !ctx->active_enc) return;
+    [ctx->active_enc endEncoding];
+    ctx->active_enc = nil;
+    ctx->enc_nrt = 0;
+    ctx->enc_dt = NULL;
+    for (int i = 0; i < 4; i++) ctx->enc_rt[i] = NULL;
+}
+
+static id<MTLCommandBuffer> ctx_ensure_cb(D3D11ContextObj *ctx) {
+    if (!ctx->pending_cb) ctx->pending_cb = [ctx->dev->mtl_queue commandBuffer];
+    return ctx->pending_cb;
+}
+
+static void ctx_flush_gpu(D3D11ContextObj *ctx, int wait) {
+    if (!ctx) return;
+    ctx_end_pass(ctx);
+    if (ctx->pending_cb) {
+        id<MTLCommandBuffer> cb = ctx->pending_cb;
+        ctx->pending_cb = nil;
+        [cb commit];
+        if (wait) [cb waitUntilCompleted];
+    }
+}
+
 static void ctx_ClearRenderTargetView(CPU64 *c, void *ud) {
     (void)ud;
     D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
@@ -995,16 +1079,15 @@ static void ctx_ClearRenderTargetView(CPU64 *c, void *ud) {
     float rgba[4];
     memcpy(rgba, (const void *)(uintptr_t)col_va, 16);
     @autoreleasepool {
+        ctx_end_pass(ctx);
         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
         rpd.colorAttachments[0].texture = rtv->tex->mtl_tex;
         rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
         rpd.colorAttachments[0].clearColor = MTLClearColorMake(rgba[0], rgba[1], rgba[2], rgba[3]);
-        id<MTLCommandBuffer> cb = [ctx->dev->mtl_queue commandBuffer];
+        id<MTLCommandBuffer> cb = ctx_ensure_cb(ctx);
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
         [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
     }
 }
 
@@ -1020,6 +1103,7 @@ static void ctx_ClearDepthStencilView(CPU64 *c, void *ud) {
     uint8_t stencil = (uint8_t)win64_arg_i(c, 4);
     if (depth < 0.0f || depth > 1.0f) depth = 1.0f;
     @autoreleasepool {
+        ctx_end_pass(ctx);
         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
         if (flags & 1) {
             rpd.depthAttachment.texture = dsv->tex->mtl_tex;
@@ -1034,32 +1118,50 @@ static void ctx_ClearDepthStencilView(CPU64 *c, void *ud) {
             rpd.stencilAttachment.clearStencil = stencil;
         }
         if (flags & 3) {
-            id<MTLCommandBuffer> cb = [ctx->dev->mtl_queue commandBuffer];
+            id<MTLCommandBuffer> cb = ctx_ensure_cb(ctx);
             id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
             [enc endEncoding];
-            [cb commit];
         }
     }
 }
 
-static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count, uint32_t start, int32_t base_vtx) {
-    if (!ctx || !ctx->vs || !ctx->ps ||
-        ctx->num_rtvs <= 0 || !ctx->rtvs[0] || !ctx->rtvs[0]->tex) return;
+static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count,
+                            uint32_t start, int32_t base_vtx, uint32_t inst_cnt, uint32_t base_inst) {
+    if (!ctx || !ctx->vs || count == 0 || inst_cnt == 0) return;
+    D3D11Texture2DObj *rts[4] = {NULL, NULL, NULL, NULL};
+    int nrt = 0;
+    uint32_t ref_w = 0, ref_h = 0;
+    int max_rt = ctx->num_rtvs < 4 ? ctx->num_rtvs : 4;
+    for (int i = 0; i < max_rt; i++) {
+        if (ctx->rtvs[i] && ctx->rtvs[i]->tex && ctx->rtvs[i]->tex->mtl_tex) {
+            if (ref_w == 0) { ref_w = ctx->rtvs[i]->tex->width; ref_h = ctx->rtvs[i]->tex->height; }
+            if (ctx->rtvs[i]->tex->width == ref_w && ctx->rtvs[i]->tex->height == ref_h) {
+                rts[i] = ctx->rtvs[i]->tex;
+                nrt = i + 1;
+            }
+        }
+    }
+    D3D11Texture2DObj *dt = (ctx->dsv && ctx->dsv->tex && ctx->dsv->tex->mtl_tex) ? ctx->dsv->tex : NULL;
+    if (nrt > 0 && dt && (dt->width != ref_w || dt->height != ref_h)) dt = NULL;
+    if (nrt == 0 && !dt) return;
+    if (nrt == 0) { ref_w = dt->width; ref_h = dt->height; }
+    if (nrt > 0 && !ctx->ps) return;
+
     ensure_shader_compiled(ctx->dev, ctx->vs);
-    ensure_shader_compiled(ctx->dev, ctx->ps);
-    if (!ctx->vs->mtl_fn || !ctx->ps->mtl_fn) return;
+    if (ctx->ps) ensure_shader_compiled(ctx->dev, ctx->ps);
+    if (!ctx->vs->mtl_fn || (nrt > 0 && (!ctx->ps || !ctx->ps->mtl_fn))) return;
+
     @autoreleasepool {
-        D3D11Texture2DObj *rt = ctx->rtvs[0]->tex;
-        D3D11Texture2DObj *dt = (ctx->dsv && ctx->dsv->tex &&
-                                 ctx->dsv->tex->width == rt->width &&
-                                 ctx->dsv->tex->height == rt->height) ? ctx->dsv->tex : NULL;
         MTLPixelFormat dfmt = dt ? dt->mtl_fmt : MTLPixelFormatInvalid;
+        MTLPixelFormat cfmts[4] = { MTLPixelFormatInvalid, MTLPixelFormatInvalid, MTLPixelFormatInvalid, MTLPixelFormatInvalid };
+        for (int i = 0; i < nrt; i++) cfmts[i] = rts[i] ? rts[i]->mtl_fmt : MTLPixelFormatInvalid;
 
         id<MTLRenderPipelineState> pso = nil;
         for (int i = 0; i < ctx->dev->pso_count; i++) {
             PsoCacheEntry *e = &ctx->dev->pso_cache[i];
             if (e->vs == ctx->vs && e->ps == ctx->ps && e->layout == ctx->layout &&
-                e->blend == ctx->blend_state && e->color_fmt == rt->mtl_fmt && e->depth_fmt == dfmt) {
+                e->blend == ctx->blend_state && e->num_rts == nrt && e->depth_fmt == dfmt &&
+                memcmp(e->color_fmts, cfmts, sizeof(cfmts)) == 0) {
                 pso = e->pso;
                 break;
             }
@@ -1067,26 +1169,29 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count, u
         if (!pso) {
             MTLRenderPipelineDescriptor *ppd = [[MTLRenderPipelineDescriptor alloc] init];
             ppd.vertexFunction = ctx->vs->mtl_fn;
-            ppd.fragmentFunction = ctx->ps->mtl_fn;
-            ppd.colorAttachments[0].pixelFormat = rt->mtl_fmt;
-            if (ctx->blend_state) {
-                D3D11BlendStateObj *bs = ctx->blend_state;
-                MTLRenderPipelineColorAttachmentDescriptor *ca = ppd.colorAttachments[0];
-                ca.blendingEnabled = bs->blend_enable ? YES : NO;
-                if (bs->blend_enable) {
-                    ca.sourceRGBBlendFactor        = d3d_to_mtl_blend(bs->src_blend);
-                    ca.destinationRGBBlendFactor   = d3d_to_mtl_blend(bs->dst_blend);
-                    ca.rgbBlendOperation           = d3d_to_mtl_blend_op(bs->blend_op);
-                    ca.sourceAlphaBlendFactor      = d3d_to_mtl_blend(bs->src_blend_alpha);
-                    ca.destinationAlphaBlendFactor = d3d_to_mtl_blend(bs->dst_blend_alpha);
-                    ca.alphaBlendOperation         = d3d_to_mtl_blend_op(bs->blend_op_alpha);
+            ppd.fragmentFunction = (nrt > 0 && ctx->ps) ? ctx->ps->mtl_fn : nil;
+            for (int i = 0; i < nrt; i++) {
+                if (cfmts[i] == MTLPixelFormatInvalid) continue;
+                MTLRenderPipelineColorAttachmentDescriptor *ca = ppd.colorAttachments[i];
+                ca.pixelFormat = cfmts[i];
+                if (ctx->blend_state) {
+                    D3D11BlendStateObj *bs = ctx->blend_state;
+                    ca.blendingEnabled = bs->blend_enable ? YES : NO;
+                    if (bs->blend_enable) {
+                        ca.sourceRGBBlendFactor        = d3d_to_mtl_blend(bs->src_blend);
+                        ca.destinationRGBBlendFactor   = d3d_to_mtl_blend(bs->dst_blend);
+                        ca.rgbBlendOperation           = d3d_to_mtl_blend_op(bs->blend_op);
+                        ca.sourceAlphaBlendFactor      = d3d_to_mtl_blend(bs->src_blend_alpha);
+                        ca.destinationAlphaBlendFactor = d3d_to_mtl_blend(bs->dst_blend_alpha);
+                        ca.alphaBlendOperation         = d3d_to_mtl_blend_op(bs->blend_op_alpha);
+                    }
+                    MTLColorWriteMask wm = MTLColorWriteMaskNone;
+                    if (bs->write_mask & 1) wm |= MTLColorWriteMaskRed;
+                    if (bs->write_mask & 2) wm |= MTLColorWriteMaskGreen;
+                    if (bs->write_mask & 4) wm |= MTLColorWriteMaskBlue;
+                    if (bs->write_mask & 8) wm |= MTLColorWriteMaskAlpha;
+                    ca.writeMask = wm;
                 }
-                MTLColorWriteMask wm = MTLColorWriteMaskNone;
-                if (bs->write_mask & 1) wm |= MTLColorWriteMaskRed;
-                if (bs->write_mask & 2) wm |= MTLColorWriteMaskGreen;
-                if (bs->write_mask & 4) wm |= MTLColorWriteMaskBlue;
-                if (bs->write_mask & 8) wm |= MTLColorWriteMaskAlpha;
-                ca.writeMask = wm;
             }
             if (dfmt != MTLPixelFormatInvalid) {
                 ppd.depthAttachmentPixelFormat = dfmt;
@@ -1143,52 +1248,89 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count, u
             if (ctx->dev->pso_count < 512) {
                 PsoCacheEntry *e = &ctx->dev->pso_cache[ctx->dev->pso_count++];
                 e->vs = ctx->vs; e->ps = ctx->ps; e->layout = ctx->layout; e->blend = ctx->blend_state;
-                e->color_fmt = rt->mtl_fmt; e->depth_fmt = dfmt; e->pso = pso;
+                e->num_rts = nrt; memcpy(e->color_fmts, cfmts, sizeof(cfmts)); e->depth_fmt = dfmt; e->pso = pso;
             }
         }
 
-        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = rt->mtl_tex;
-        rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        if (dt) {
-            rpd.depthAttachment.texture = dt->mtl_tex;
-            rpd.depthAttachment.loadAction = MTLLoadActionLoad;
-            rpd.depthAttachment.storeAction = MTLStoreActionStore;
-            if (dfmt == MTLPixelFormatDepth32Float_Stencil8) {
-                rpd.stencilAttachment.texture = dt->mtl_tex;
-                rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
-                rpd.stencilAttachment.storeAction = MTLStoreActionStore;
+        int same_pass = (ctx->active_enc != nil && ctx->enc_nrt == nrt && ctx->enc_dt == dt);
+        for (int i = 0; same_pass && i < 4; i++) {
+            if (ctx->enc_rt[i] != rts[i]) same_pass = 0;
+        }
+        if (same_pass) {
+            for (int i = 0; i < 16; i++) {
+                D3D11Texture2DObj *st = (ctx->ps_srvs[i] && ctx->ps_srvs[i]->tex) ? ctx->ps_srvs[i]->tex : NULL;
+                if (!st) continue;
+                for (int j = 0; j < nrt; j++) if (st == rts[j]) { same_pass = 0; break; }
+                if (st == dt) same_pass = 0;
             }
         }
+        if (!same_pass) {
+            ctx_end_pass(ctx);
+            MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            for (int i = 0; i < nrt; i++) {
+                if (!rts[i]) continue;
+                rpd.colorAttachments[i].texture = rts[i]->mtl_tex;
+                rpd.colorAttachments[i].loadAction = MTLLoadActionLoad;
+                rpd.colorAttachments[i].storeAction = MTLStoreActionStore;
+            }
+            if (dt) {
+                rpd.depthAttachment.texture = dt->mtl_tex;
+                rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+                rpd.depthAttachment.storeAction = MTLStoreActionStore;
+                if (dfmt == MTLPixelFormatDepth32Float_Stencil8) {
+                    rpd.stencilAttachment.texture = dt->mtl_tex;
+                    rpd.stencilAttachment.loadAction = MTLLoadActionLoad;
+                    rpd.stencilAttachment.storeAction = MTLStoreActionStore;
+                }
+            }
+            id<MTLCommandBuffer> cb = ctx_ensure_cb(ctx);
+            ctx->active_enc = [cb renderCommandEncoderWithDescriptor:rpd];
+            ctx->enc_nrt = nrt;
+            ctx->enc_dt = dt;
+            for (int i = 0; i < 4; i++) ctx->enc_rt[i] = rts[i];
+        }
 
-        id<MTLCommandBuffer> cb = [ctx->dev->mtl_queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+        id<MTLRenderCommandEncoder> enc = ctx->active_enc;
         [enc setRenderPipelineState:pso];
         if (dt && ctx->ds_state && ctx->ds_state->mtl_dss) {
             [enc setDepthStencilState:ctx->ds_state->mtl_dss];
+            [enc setStencilReferenceValue:ctx->stencil_ref];
+        }
+        if (ctx->has_blend_factor) {
+            [enc setBlendColorRed:ctx->blend_factor[0] green:ctx->blend_factor[1]
+                             blue:ctx->blend_factor[2] alpha:ctx->blend_factor[3]];
         }
         if (ctx->rs_state) {
             MTLCullMode cm = (ctx->rs_state->cull_mode == 2) ? MTLCullModeFront
                            : (ctx->rs_state->cull_mode == 3) ? MTLCullModeBack : MTLCullModeNone;
             [enc setCullMode:cm];
             [enc setFrontFacingWinding:ctx->rs_state->front_ccw ? MTLWindingCounterClockwise : MTLWindingClockwise];
+            [enc setDepthBias:(float)ctx->rs_state->depth_bias
+                   slopeScale:ctx->rs_state->slope_depth_bias
+                        clamp:ctx->rs_state->depth_bias_clamp];
             if (ctx->rs_state->scissor_enable && ctx->has_scissor) {
                 int32_t l = ctx->sc_l < 0 ? 0 : ctx->sc_l;
                 int32_t t = ctx->sc_t < 0 ? 0 : ctx->sc_t;
-                int32_t r = ctx->sc_r > (int32_t)rt->width ? (int32_t)rt->width : ctx->sc_r;
-                int32_t b = ctx->sc_b > (int32_t)rt->height ? (int32_t)rt->height : ctx->sc_b;
+                int32_t r = ctx->sc_r > (int32_t)ref_w ? (int32_t)ref_w : ctx->sc_r;
+                int32_t b = ctx->sc_b > (int32_t)ref_h ? (int32_t)ref_h : ctx->sc_b;
                 if (r > l && b > t) {
                     [enc setScissorRect:(MTLScissorRect){(NSUInteger)l, (NSUInteger)t, (NSUInteger)(r - l), (NSUInteger)(b - t)}];
+                } else {
+                    [enc setScissorRect:(MTLScissorRect){0, 0, ref_w, ref_h}];
                 }
+            } else {
+                [enc setScissorRect:(MTLScissorRect){0, 0, ref_w, ref_h}];
             }
+        } else {
+            [enc setCullMode:MTLCullModeNone];
+            [enc setScissorRect:(MTLScissorRect){0, 0, ref_w, ref_h}];
         }
 
         MTLViewport vp;
         if (ctx->has_vp && ctx->vp_w > 0 && ctx->vp_h > 0) {
             vp = (MTLViewport){ ctx->vp_x, ctx->vp_y, ctx->vp_w, ctx->vp_h, ctx->vp_minz, ctx->vp_maxz };
         } else {
-            vp = (MTLViewport){ 0.0, 0.0, (double)rt->width, (double)rt->height, 0.0, 1.0 };
+            vp = (MTLViewport){ 0.0, 0.0, (double)ref_w, (double)ref_h, 0.0, 1.0 };
         }
         [enc setViewport:vp];
 
@@ -1201,10 +1343,18 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count, u
         }
         for (int i = 0; i < 14; i++) {
             if (ctx->vs_cbs[i] && ctx->vs_cbs[i]->mtl_buf) {
-                [enc setVertexBuffer:ctx->vs_cbs[i]->mtl_buf offset:0 atIndex:(NSUInteger)(16 + i)];
+                if (ctx->vs_cbs[i]->byte_width <= 4096) {
+                    [enc setVertexBytes:[ctx->vs_cbs[i]->mtl_buf contents] length:ctx->vs_cbs[i]->byte_width atIndex:(NSUInteger)(16 + i)];
+                } else {
+                    [enc setVertexBuffer:ctx->vs_cbs[i]->mtl_buf offset:0 atIndex:(NSUInteger)(16 + i)];
+                }
             }
             if (ctx->ps_cbs[i] && ctx->ps_cbs[i]->mtl_buf) {
-                [enc setFragmentBuffer:ctx->ps_cbs[i]->mtl_buf offset:0 atIndex:(NSUInteger)(16 + i)];
+                if (ctx->ps_cbs[i]->byte_width <= 4096) {
+                    [enc setFragmentBytes:[ctx->ps_cbs[i]->mtl_buf contents] length:ctx->ps_cbs[i]->byte_width atIndex:(NSUInteger)(16 + i)];
+                } else {
+                    [enc setFragmentBuffer:ctx->ps_cbs[i]->mtl_buf offset:0 atIndex:(NSUInteger)(16 + i)];
+                }
             }
         }
         for (int i = 0; i < 16; i++) {
@@ -1228,23 +1378,21 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count, u
             NSUInteger isz = (itype == MTLIndexTypeUInt16) ? 2 : 4;
             [enc drawIndexedPrimitives:prim indexCount:count indexType:itype
                            indexBuffer:ctx->ib->mtl_buf indexBufferOffset:(ctx->ib_offset + start * isz)
-                         instanceCount:1 baseVertex:base_vtx baseInstance:0];
-        } else if (count > 0) {
-            [enc drawPrimitives:prim vertexStart:start vertexCount:count];
+                         instanceCount:inst_cnt baseVertex:base_vtx baseInstance:base_inst];
+        } else {
+            [enc drawPrimitives:prim vertexStart:start vertexCount:count
+                  instanceCount:inst_cnt baseInstance:base_inst];
         }
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
     }
 }
 
 static void ctx_Draw(CPU64 *c, void *ud) {
     (void)ud;
-    ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 0, (uint32_t)c->rdx, (uint32_t)c->r8, 0);
+    ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 0, (uint32_t)c->rdx, (uint32_t)c->r8, 0, 1, 0);
 }
 static void ctx_DrawIndexed(CPU64 *c, void *ud) {
     (void)ud;
-    ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 1, (uint32_t)c->rdx, (uint32_t)c->r8, (int32_t)c->r9);
+    ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 1, (uint32_t)c->rdx, (uint32_t)c->r8, (int32_t)c->r9, 1, 0);
 }
 
 static void ctx_DrawIndexedInstanced(CPU64 *c, void *ud) {
@@ -1253,14 +1401,40 @@ static void ctx_DrawIndexedInstanced(CPU64 *c, void *ud) {
     uint32_t inst_cnt = (uint32_t)c->r8;
     uint32_t start_idx = (uint32_t)c->r9;
     int32_t  base_vtx = (int32_t)win64_arg_i(c, 4);
-    if (inst_cnt > 0) ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 1, idx_cnt, start_idx, base_vtx);
+    uint32_t start_inst = (uint32_t)win64_arg_i(c, 5);
+    if (inst_cnt > 0)
+        ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 1, idx_cnt, start_idx, base_vtx, inst_cnt, start_inst);
 }
 static void ctx_DrawInstanced(CPU64 *c, void *ud) {
     (void)ud;
     uint32_t vtx_cnt = (uint32_t)c->rdx;
     uint32_t inst_cnt = (uint32_t)c->r8;
     uint32_t start_vtx = (uint32_t)c->r9;
-    if (inst_cnt > 0) ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 0, vtx_cnt, start_vtx, 0);
+    uint32_t start_inst = (uint32_t)win64_arg_i(c, 4);
+    if (inst_cnt > 0)
+        ctx_draw_common((D3D11ContextObj *)(uintptr_t)c->rcx, 0, vtx_cnt, start_vtx, 0, inst_cnt, start_inst);
+}
+
+static void ctx_GenerateMips(CPU64 *c, void *ud) {
+    (void)ud;
+    D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
+    ComBase *b = (ComBase *)(uintptr_t)c->rdx;
+    if (!ctx || !b || b->kind != COM_SRV) return;
+    D3D11SRVObj *srv = (D3D11SRVObj *)b;
+    if (!srv->tex || !srv->tex->mtl_tex || srv->tex->mip_levels <= 1 ||
+        dxgi_is_bc(srv->tex->dxgi_fmt) || dxgi_is_depth(srv->tex->dxgi_fmt)) return;
+    @autoreleasepool {
+        ctx_end_pass(ctx);
+        id<MTLCommandBuffer> cb = ctx_ensure_cb(ctx);
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit generateMipmapsForTexture:srv->tex->mtl_tex];
+        [blit endEncoding];
+    }
+}
+
+static void ctx_Flush(CPU64 *c, void *ud) {
+    (void)ud;
+    ctx_flush_gpu((D3D11ContextObj *)(uintptr_t)c->rcx, 0);
 }
 
 static void ctx_CopyResource(CPU64 *c, void *ud) {
@@ -1273,7 +1447,8 @@ static void ctx_CopyResource(CPU64 *c, void *ud) {
         D3D11Texture2DObj *dt = (D3D11Texture2DObj *)dst;
         D3D11Texture2DObj *st = (D3D11Texture2DObj *)src;
         @autoreleasepool {
-            id<MTLCommandBuffer> cb = [ctx->dev->mtl_queue commandBuffer];
+            ctx_end_pass(ctx);
+            id<MTLCommandBuffer> cb = ctx_ensure_cb(ctx);
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             [blit copyFromTexture:st->mtl_tex sourceSlice:0 sourceLevel:0
                      sourceOrigin:MTLOriginMake(0, 0, 0)
@@ -1281,10 +1456,9 @@ static void ctx_CopyResource(CPU64 *c, void *ud) {
                         toTexture:dt->mtl_tex destinationSlice:0 destinationLevel:0
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [blit endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
         }
     } else if (dst->kind == COM_BUFFER && src->kind == COM_BUFFER) {
+        ctx_flush_gpu(ctx, 1);
         D3D11BufferObj *db = (D3D11BufferObj *)dst;
         D3D11BufferObj *sb = (D3D11BufferObj *)src;
         uint32_t n = db->byte_width < sb->byte_width ? db->byte_width : sb->byte_width;
@@ -1326,7 +1500,8 @@ static void ctx_CopySubresourceRegion(CPU64 *c, void *ud) {
         if (dst_x + cw > dw) cw = dw - dst_x;
         if (dst_y + ch > dh) ch = dh - dst_y;
         @autoreleasepool {
-            id<MTLCommandBuffer> cb = [ctx->dev->mtl_queue commandBuffer];
+            ctx_end_pass(ctx);
+            id<MTLCommandBuffer> cb = ctx_ensure_cb(ctx);
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             [blit copyFromTexture:st->mtl_tex sourceSlice:0 sourceLevel:smip
                      sourceOrigin:MTLOriginMake(sx, sy, 0)
@@ -1334,10 +1509,9 @@ static void ctx_CopySubresourceRegion(CPU64 *c, void *ud) {
                         toTexture:dt->mtl_tex destinationSlice:0 destinationLevel:dmip
                 destinationOrigin:MTLOriginMake(dst_x, dst_y, 0)];
             [blit endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
         }
     } else if (dst->kind == COM_BUFFER && src->kind == COM_BUFFER) {
+        ctx_flush_gpu(ctx, 1);
         D3D11BufferObj *db = (D3D11BufferObj *)dst;
         D3D11BufferObj *sb = (D3D11BufferObj *)src;
         uint32_t sx = src_box ? R32(src_box + 0) : 0;
@@ -1353,6 +1527,7 @@ static void ctx_CopySubresourceRegion(CPU64 *c, void *ud) {
 
 static void ctx_Map(CPU64 *c, void *ud) {
     (void)ud;
+    D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
     ComBase *res = (ComBase *)(uintptr_t)c->rdx;
     uint32_t subres = (uint32_t)c->r8;
     uint32_t map_type = (uint32_t)c->r9;
@@ -1360,6 +1535,10 @@ static void ctx_Map(CPU64 *c, void *ud) {
     if (!res || !mapped_va) { c->rax = E_INVALIDARG_H; return; }
     if (res->kind == COM_BUFFER) {
         D3D11BufferObj *b = (D3D11BufferObj *)res;
+        /* Flush GPU before overwriting large (>4 KiB) or readback buffers in-place. */
+        if (ctx && (map_type == 1 || map_type == 3 || (map_type == 4 && b->byte_width > 4096))) {
+            ctx_flush_gpu(ctx, 1);
+        }
         W64(mapped_va + 0, (uint64_t)(uintptr_t)[b->mtl_buf contents]);
         W32(mapped_va + 8, b->byte_width);
         W32(mapped_va + 12, b->byte_width);
@@ -1367,6 +1546,7 @@ static void ctx_Map(CPU64 *c, void *ud) {
         return;
     }
     if (res->kind == COM_TEXTURE2D) {
+        if (ctx && (map_type == 1 || map_type == 3)) ctx_flush_gpu(ctx, 1);
         D3D11Texture2DObj *t = (D3D11Texture2DObj *)res;
         uint32_t mip = subres < t->mip_levels ? subres : 0;
         uint32_t mw = t->width >> mip; if (mw == 0) mw = 1;
@@ -1394,11 +1574,13 @@ static void ctx_Map(CPU64 *c, void *ud) {
 
 static void ctx_Unmap(CPU64 *c, void *ud) {
     (void)ud;
+    D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
     ComBase *res = (ComBase *)(uintptr_t)c->rdx;
     if (res && res->kind == COM_TEXTURE2D) {
         D3D11Texture2DObj *t = (D3D11Texture2DObj *)res;
         if (t->mapped_cpu) {
             if (t->mapped_maptype != 1 && !dxgi_is_depth(t->dxgi_fmt) && t->mtl_tex) {
+                if (ctx) ctx_flush_gpu(ctx, 1);
                 uint32_t mip = t->mapped_mip < t->mip_levels ? t->mapped_mip : 0;
                 uint32_t mw = t->width >> mip; if (mw == 0) mw = 1;
                 uint32_t mh = t->height >> mip; if (mh == 0) mh = 1;
@@ -1413,6 +1595,7 @@ static void ctx_Unmap(CPU64 *c, void *ud) {
 
 static void ctx_UpdateSubresource(CPU64 *c, void *ud) {
     (void)ud;
+    D3D11ContextObj *ctx = (D3D11ContextObj *)(uintptr_t)c->rcx;
     ComBase *res = (ComBase *)(uintptr_t)c->rdx;
     uint32_t subres = (uint32_t)c->r8;
     uint64_t box_va = c->r9;
@@ -1421,11 +1604,13 @@ static void ctx_UpdateSubresource(CPU64 *c, void *ud) {
     if (!res || !src_va) return;
     if (res->kind == COM_BUFFER) {
         D3D11BufferObj *b = (D3D11BufferObj *)res;
+        if (ctx && b->byte_width > 4096) ctx_flush_gpu(ctx, 1);
         uint32_t off = box_va ? R32(box_va + 0) : 0;
         uint32_t end = box_va ? R32(box_va + 12) : b->byte_width;
         if (end > b->byte_width) end = b->byte_width;
         if (end > off) memcpy((uint8_t *)[b->mtl_buf contents] + off, (const void *)(uintptr_t)src_va, end - off);
     } else if (res->kind == COM_TEXTURE2D) {
+        if (ctx) ctx_flush_gpu(ctx, 1);
         D3D11Texture2DObj *t = (D3D11Texture2DObj *)res;
         if (!t->mtl_tex || dxgi_is_depth(t->dxgi_fmt)) return;
         uint32_t mips = t->mip_levels ? t->mip_levels : 1;
@@ -1581,6 +1766,14 @@ static void sc_Present(CPU64 *c, void *ud) {
     (void)ud;
     static uint32_t g_present_frames = 0;
     DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
+    if (sc && sc->dev && sc->dev->imm_ctx) {
+        int need_cpu = (getenv("ELF64_DUMP_FRAME") != NULL || getenv("ELF64_RECORD_MP4") != NULL);
+        if (need_cpu) {
+            ctx_flush_gpu(sc->dev->imm_ctx, 1);
+        } else {
+            ctx_end_pass(sc->dev->imm_ctx);
+        }
+    }
     if (sc && sc->backbuffer) {
         g_present_frames++;
         if (g_present_frames == 1 && (getenv("ELF64_TRACE") || getenv("ELF64_DUMP_FRAME"))) {
@@ -1621,7 +1814,9 @@ static void sc_Present(CPU64 *c, void *ud) {
         @autoreleasepool {
             id<CAMetalDrawable> drawable = [sc->metal_layer nextDrawable];
             if (drawable) {
-                id<MTLCommandBuffer> cb = [sc->dev->mtl_queue commandBuffer];
+                id<MTLCommandBuffer> cb = (sc->dev && sc->dev->imm_ctx && sc->dev->imm_ctx->pending_cb)
+                    ? sc->dev->imm_ctx->pending_cb : [sc->dev->mtl_queue commandBuffer];
+                if (sc->dev && sc->dev->imm_ctx) sc->dev->imm_ctx->pending_cb = nil;
                 id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
                 NSUInteger w = sc->backbuffer->width < drawable.texture.width ? sc->backbuffer->width : drawable.texture.width;
                 NSUInteger h = sc->backbuffer->height < drawable.texture.height ? sc->backbuffer->height : drawable.texture.height;
@@ -1632,8 +1827,12 @@ static void sc_Present(CPU64 *c, void *ud) {
                 [blit endEncoding];
                 [cb presentDrawable:drawable];
                 [cb commit];
+            } else if (sc->dev && sc->dev->imm_ctx) {
+                ctx_flush_gpu(sc->dev->imm_ctx, 0);
             }
         }
+    } else if (sc && sc->dev && sc->dev->imm_ctx) {
+        ctx_flush_gpu(sc->dev->imm_ctx, 0);
     }
     c->rax = S_OK_HR;
 }
@@ -1722,8 +1921,8 @@ static void factory_CreateSwapChain(CPU64 *c, void *ud) {
                                (int)w, (int)h, SDL_WINDOW_METAL | SDL_WINDOW_SHOWN);
     }
     if (win) {
+        SDL_SetWindowSize(win, (int)w, (int)h);
         if (!getenv("ELF64_HEADLESS")) {
-            SDL_SetWindowSize(win, (int)w, (int)h);
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
             SDL_ShowWindow(win);
             SDL_RaiseWindow(win);
@@ -1855,6 +2054,8 @@ static void init_d3d11_vtables(void) {
     g_vt_context[48] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::UpdateSubresource", ctx_UpdateSubresource, NULL);
     g_vt_context[50] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ClearRenderTargetView", ctx_ClearRenderTargetView, NULL);
     g_vt_context[53] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::ClearDepthStencilView", ctx_ClearDepthStencilView, NULL);
+    g_vt_context[54] = rt_alloc_dynamic_thunk("ID3D11DeviceContext::GenerateMips", ctx_GenerateMips, NULL);
+    g_vt_context[111]= rt_alloc_dynamic_thunk("ID3D11DeviceContext::Flush", ctx_Flush, NULL);
 
     /* IDXGISwapChain / IDXGIAdapter / IDXGIOutput / IDXGIFactory slots */
     uint64_t t_get_parent = rt_alloc_dynamic_thunk("IDXGIObject::GetParent", dxgi_GetParentFactory, NULL);
@@ -1953,8 +2154,8 @@ static void w_D3D11CreateDeviceAndSwapChain(CPU64 *c, void *ud) {
                                (int)w, (int)h, SDL_WINDOW_METAL | SDL_WINDOW_SHOWN);
     }
     if (win) {
+        SDL_SetWindowSize(win, (int)w, (int)h);
         if (!getenv("ELF64_HEADLESS")) {
-            SDL_SetWindowSize(win, (int)w, (int)h);
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
             SDL_ShowWindow(win);
             SDL_RaiseWindow(win);

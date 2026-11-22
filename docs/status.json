@@ -175,7 +175,7 @@
       36
     ],
     "DXBC SM4/5": [
-      52,
+      53,
       54
     ]
   },
@@ -186,8 +186,8 @@
     "isa_pct": 88.54,
     "isa_done": 278,
     "isa_total": 314,
-    "dxbc_pct": 96.3,
-    "dxbc_done": 52,
+    "dxbc_pct": 98.15,
+    "dxbc_done": 53,
     "dxbc_total": 54
   }
 }

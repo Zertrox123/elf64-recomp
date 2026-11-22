@@ -746,6 +746,12 @@ static void v8_NewDefaultPlatform(CPU64 *c, void *ud) {
     (void)ud;
     /* Static returning std::unique_ptr<Platform> via sret in rcx */
     static uint64_t dummy_platform_vt[16];
+    static int vt_init = 0;
+    if (!vt_init) {
+        vt_init = 1;
+        uint64_t noop = rt_alloc_dynamic_thunk("v8::Platform::noop", v8_Noop, NULL);
+        for (int i = 0; i < 16; i++) dummy_platform_vt[i] = noop;
+    }
     static uint64_t dummy_platform = (uint64_t)(uintptr_t)dummy_platform_vt;
     ret_sret64(c, c->rcx, (uint64_t)(uintptr_t)&dummy_platform);
 }

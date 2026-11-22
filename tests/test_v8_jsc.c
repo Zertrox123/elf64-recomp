@@ -225,6 +225,11 @@ int main(void) {
     uint32_t vdet[4] = {0};
     rt_invoke_win64(&g_cpu, R64(R64(mv)), mv, (uint64_t)(uintptr_t)vdet, 0, 0, 0, 0);
     assert(vdet[2] == 2 && vdet[3] == 44100);
+    uint64_t plat = 0;
+    call_shim("?NewDefaultPlatform@platform@v8@@YA?AV?$unique_ptr@VPlatform@v8@@U?$default_delete@VPlatform@v8@@@std@@@std@@HW4IdleTaskSupport@12@W4InProcessStackDumping@12@V?$unique_ptr@VTracingController@v8@@U?$default_delete@VTracingController@v8@@@std@@@4@@Z",
+              (uint64_t)(uintptr_t)&plat, 0, 0, 0, 0);
+    assert(plat != 0 && R64(R64(plat) + 16) != 0);
+    rt_invoke_win64(&g_cpu, R64(R64(plat) + 16), plat, 0, 0, 0, 0, 0);
 
     printf("V8_JSC_TEST PASS (eval=42, ext=0xcafebabe, json=ok, trycatch=ok, cb=42, io+xa2=ok)\n");
     return 0;

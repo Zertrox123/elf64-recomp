@@ -297,13 +297,15 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
     StrBuf sb = {0};
     sb_appendf(&sb, "#include <metal_stdlib>\nusing namespace metal;\n\n");
 
-    int has_vid = 0;
+    int has_vid = 0, has_iid = 0, clip_reg = -1, has_ff = 0, ps_rt_count = 0;
     if (!out->is_pixel) {
         int n_stage_in = 0;
         uint32_t seen_in = 0, seen_out = 0;
         for (int i = 0; i < out->num_inputs; i++) {
             if (out->inputs[i].sys_val == 6 || strcasecmp(out->inputs[i].semantic, "SV_VERTEXID") == 0) {
                 has_vid = 1;
+            } else if (out->inputs[i].sys_val == 8 || strcasecmp(out->inputs[i].semantic, "SV_INSTANCEID") == 0) {
+                has_iid = 1;
             } else if (!(seen_in & (1U << (out->inputs[i].reg & 31U)))) {
                 seen_in |= (1U << (out->inputs[i].reg & 31U));
                 n_stage_in++;
@@ -313,7 +315,8 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             seen_in = 0;
             sb_appendf(&sb, "struct VSIn {\n");
             for (int i = 0; i < out->num_inputs; i++) {
-                if (out->inputs[i].sys_val == 6 || strcasecmp(out->inputs[i].semantic, "SV_VERTEXID") == 0) continue;
+                if (out->inputs[i].sys_val == 6 || strcasecmp(out->inputs[i].semantic, "SV_VERTEXID") == 0 ||
+                    out->inputs[i].sys_val == 8 || strcasecmp(out->inputs[i].semantic, "SV_INSTANCEID") == 0) continue;
                 uint32_t r = out->inputs[i].reg & 31U;
                 if (seen_in & (1U << r)) continue;
                 seen_in |= (1U << r);
@@ -331,6 +334,14 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             if (out->outputs[i].sys_val == 1 || strcasecmp(out->outputs[i].semantic, "SV_POSITION") == 0) {
                 sb_appendf(&sb, "    float4 o%u [[position]];\n", r);
                 has_pos = 1;
+            } else if (out->outputs[i].sys_val == 2 || strncasecmp(out->outputs[i].semantic, "SV_CLIPDISTANCE", 15) == 0) {
+                if (clip_reg < 0) {
+                    clip_reg = (int)r;
+                    sb_appendf(&sb, "    float _clip [[clip_distance]];\n");
+                }
+                char sattr[48];
+                fmt_sem_attr(&out->outputs[i], sattr, sizeof(sattr));
+                sb_appendf(&sb, "    float4 o%u [[user(%s)]];\n", r, sattr);
             } else {
                 char sattr[48];
                 fmt_sem_attr(&out->outputs[i], sattr, sizeof(sattr));
@@ -342,6 +353,7 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
         int first_arg = 1;
         if (n_stage_in > 0) { sb_appendf(&sb, "VSIn in [[stage_in]]"); first_arg = 0; }
         if (has_vid) { sb_appendf(&sb, "%suint _vid [[vertex_id]]", first_arg ? "" : ", "); first_arg = 0; }
+        if (has_iid) { sb_appendf(&sb, "%suint _iid [[instance_id]]", first_arg ? "" : ", "); first_arg = 0; }
         for (uint32_t k = 0; k < 14; k++) {
             if (cb_mask & (1U << k)) { sb_appendf(&sb, "%sconstant float4 *cb%u [[buffer(%u)]]", first_arg ? "" : ", ", k, 16 + k); first_arg = 0; }
         }
@@ -363,6 +375,8 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             seen_in |= (1U << r);
             if (out->inputs[i].sys_val == 6 || strcasecmp(out->inputs[i].semantic, "SV_VERTEXID") == 0) {
                 sb_appendf(&sb, "    float4 v%u = as_type<float4>(uint4(_vid, 0u, 0u, 0u));\n", r);
+            } else if (out->inputs[i].sys_val == 8 || strcasecmp(out->inputs[i].semantic, "SV_INSTANCEID") == 0) {
+                sb_appendf(&sb, "    float4 v%u = as_type<float4>(uint4(_iid, 0u, 0u, 0u));\n", r);
             } else {
                 sb_appendf(&sb, "    float4 v%u = in.v%u;\n", r, r);
             }
@@ -378,13 +392,23 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
         uint32_t seen_in = 0, seen_out = 0;
         int n_ps_in = 0;
         for (int i = 0; i < out->num_inputs; i++) {
+            if (out->inputs[i].sys_val == 9 || strcasecmp(out->inputs[i].semantic, "SV_ISFRONTFACE") == 0) {
+                has_ff = 1;
+                continue;
+            }
             uint32_t r = out->inputs[i].reg & 31U;
             if (!(seen_in & (1U << r))) { seen_in |= (1U << r); n_ps_in++; }
         }
+        for (int i = 0; i < out->num_outputs; i++) {
+            uint32_t r = out->outputs[i].reg & 31U;
+            if (r < 4 && (int)(r + 1) > ps_rt_count) ps_rt_count = (int)(r + 1);
+        }
+        if (ps_rt_count <= 0) ps_rt_count = 1;
         if (n_ps_in > 0) {
             seen_in = 0;
             sb_appendf(&sb, "struct PSIn {\n");
             for (int i = 0; i < out->num_inputs; i++) {
+                if (out->inputs[i].sys_val == 9 || strcasecmp(out->inputs[i].semantic, "SV_ISFRONTFACE") == 0) continue;
                 uint32_t r = out->inputs[i].reg & 31U;
                 if (seen_in & (1U << r)) continue;
                 seen_in |= (1U << r);
@@ -398,9 +422,17 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             }
             sb_appendf(&sb, "};\n\n");
         }
-        sb_appendf(&sb, "fragment float4 fs_main(");
+        if (ps_rt_count > 1) {
+            sb_appendf(&sb, "struct PSOut {\n");
+            for (int i = 0; i < ps_rt_count; i++)
+                sb_appendf(&sb, "    float4 o%d [[color(%d)]];\n", i, i);
+            sb_appendf(&sb, "};\n\nfragment PSOut fs_main(");
+        } else {
+            sb_appendf(&sb, "fragment float4 fs_main(");
+        }
         int first_arg = 1;
         if (n_ps_in > 0) { sb_appendf(&sb, "PSIn in [[stage_in]]"); first_arg = 0; }
+        if (has_ff) { sb_appendf(&sb, "%sbool _ff [[front_facing]]", first_arg ? "" : ", "); first_arg = 0; }
         for (uint32_t k = 0; k < 14; k++) {
             if (cb_mask & (1U << k)) { sb_appendf(&sb, "%sconstant float4 *cb%u [[buffer(%u)]]", first_arg ? "" : ", ", k, 16 + k); first_arg = 0; }
         }
@@ -420,7 +452,11 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             uint32_t r = out->inputs[i].reg & 31U;
             if (seen_in & (1U << r)) continue;
             seen_in |= (1U << r);
-            sb_appendf(&sb, "    float4 v%u = in.v%u;\n", r, r);
+            if (out->inputs[i].sys_val == 9 || strcasecmp(out->inputs[i].semantic, "SV_ISFRONTFACE") == 0) {
+                sb_appendf(&sb, "    float4 v%u = as_type<float4>(uint4(_ff ? 0xFFFFFFFFu : 0u, 0u, 0u, 0u));\n", r);
+            } else {
+                sb_appendf(&sb, "    float4 v%u = in.v%u;\n", r, r);
+            }
         }
         sb_appendf(&sb, "    float4 o0 = float4(0.0);\n");
         seen_out = 1U;
@@ -429,6 +465,11 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             if (seen_out & (1U << r)) continue;
             seen_out |= (1U << r);
             sb_appendf(&sb, "    float4 o%u = float4(0.0);\n", r);
+        }
+        for (int i = 0; i < ps_rt_count; i++) {
+            if (seen_out & (1U << i)) continue;
+            seen_out |= (1U << i);
+            sb_appendf(&sb, "    float4 o%d = float4(0.0);\n", i);
         }
     }
 
@@ -461,7 +502,13 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
                     seen_out |= (1U << r);
                     sb_appendf(&sb, "    _out.o%u = o%u;\n", r, r);
                 }
+                if (clip_reg >= 0) sb_appendf(&sb, "    _out._clip = o%d.x;\n", clip_reg);
                 sb_appendf(&sb, "    return _out;\n");
+            } else if (ps_rt_count > 1) {
+                sb_appendf(&sb, "    PSOut _pout;\n");
+                for (int i = 0; i < ps_rt_count; i++)
+                    sb_appendf(&sb, "    _pout.o%d = o%d;\n", i, i);
+                sb_appendf(&sb, "    return _pout;\n");
             } else {
                 sb_appendf(&sb, "    return o0;\n");
             }
@@ -706,7 +753,12 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
             for (int i = 0; i < 4; i++) if (m & (1U << i)) proj[np++] = tsw[i];
             if (np == 0) strcpy(proj, tsw); else proj[np] = '\0';
             if (stex.idx[0] < 16 && ssamp.idx[0] < 16 && (tex_mask & (1U << stex.idx[0])) && (samp_mask & (1U << ssamp.idx[0]))) {
-                if (opc == 72) {
+                if (opc == 70 || opc == 71) { /* SAMPLE_C / SAMPLE_C_LZ */
+                    fmt_src(&s1, 0x1, a1, sizeof(a1));
+                    const char *lvl = (opc == 71) ? ", level(0.0)" : "";
+                    sb_appendf(&sb, "    %s = (float4(float((%s) <= (t%u.sample(s%u, %s%s)).x))).%s;\n",
+                               ds, a1, stex.idx[0], ssamp.idx[0], a0, lvl, proj);
+                } else if (opc == 72) {
                     fmt_src(&s1, 0x1, a1, sizeof(a1));
                     sb_appendf(&sb, "    %s = (t%u.sample(s%u, %s, level(%s))).%s;\n", ds, stex.idx[0], ssamp.idx[0], a0, a1, proj);
                 } else {
@@ -716,11 +768,12 @@ int dxbc_to_msl(const void *bytecode, size_t size, DxbcTranslated *out) {
                 sb_appendf(&sb, "    %s = (float4(1.0)).%s;\n", ds, proj);
             }
             wrote_dst = 1;
-        } else if (opc == 45) { /* LD */
+        } else if (opc == 45 || opc == 46) { /* LD / LD_MS */
             DxbcOp stex;
             cur = decode_operand(toks, cur, end, &d);
             cur = decode_operand(toks, cur, end, &s0);
             cur = decode_operand(toks, cur, end, &stex);
+            if (opc == 46) cur = decode_operand(toks, cur, end, &s1);
             uint32_t m = d.mask ? d.mask : 0xF;
             fmt_dst(&d, ds, sizeof(ds), dm);
             fmt_src(&s0, 0x3, a0, sizeof(a0));

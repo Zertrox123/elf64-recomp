@@ -201,6 +201,7 @@ def detect_dxbc_opcodes() -> set[str]:
         "opc == 72": ["sample_l"],
         "opc == 74": ["sample_b"],
         "opc == 45": ["ld"],
+        "opc == 46": ["ld_ms"],
         "opc == 13": ["discard"],
         "opc == 31": ["if"],
         "opc == 18": ["else"],
