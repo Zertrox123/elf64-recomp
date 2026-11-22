@@ -1422,11 +1422,16 @@ static void w_SetWindowLongPtr(CPU64 *c, void *ud) {
     g_wnd_long[s][idx] = c->r8;
     c->rax = prev;
 }
+extern void win32_get_backbuffer_size(int *w, int *h);
 static void w_GetWindowRect(CPU64 *c, void *ud) {
     (void)ud;
     int w = 1280, h = 720;
-    SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
-    if (win) SDL_GetWindowSize(win, &w, &h);
+    win32_get_backbuffer_size(&w, &h);
+    if (w <= 0 || h <= 0) {
+        w = 1280; h = 720;
+        SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
+        if (win) SDL_GetWindowSize(win, &w, &h);
+    }
     if (c->rdx) { W32(c->rdx, 0); W32(c->rdx + 4, 0); W32(c->rdx + 8, (uint32_t)w); W32(c->rdx + 12, (uint32_t)h); }
     c->rax = 1;
 }

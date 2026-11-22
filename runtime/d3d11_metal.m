@@ -211,10 +211,13 @@ struct D3D11DeviceObj {
     int                pso_count;
 };
 
+extern void win32_set_backbuffer_size(int w, int h);
+
 typedef struct {
     ComBase            base;
     D3D11DeviceObj    *dev;
     D3D11Texture2DObj *backbuffer;
+    SDL_Window        *sdl_win;
     SDL_MetalView      metal_view;
     CAMetalLayer      *metal_layer;
     uint32_t           width;
@@ -1687,6 +1690,17 @@ static void sc_GetDesc(CPU64 *c, void *ud) {
     c->rax = S_OK_HR;
 }
 
+static void sc_SetFullscreenState(CPU64 *c, void *ud) {
+    (void)ud;
+    DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
+    int fs = (c->rdx != 0);
+    if (sc && sc->sdl_win && !getenv("ELF64_HEADLESS")) {
+        SDL_SetWindowFullscreen(sc->sdl_win, fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
+    }
+    c->rax = S_OK_HR;
+}
+
 static void sc_ResizeBuffers(CPU64 *c, void *ud) {
     (void)ud;
     DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
@@ -1697,10 +1711,27 @@ static void sc_ResizeBuffers(CPU64 *c, void *ud) {
     if (w == 0) w = sc->width;
     if (h == 0) h = sc->height;
     if (fmt == 0 && sc->backbuffer) fmt = sc->backbuffer->dxgi_fmt;
+    if (sc->dev && sc->dev->imm_ctx) ctx_flush_gpu(sc->dev->imm_ctx, 1);
     if (w != sc->width || h != sc->height) {
         sc->width = w; sc->height = h;
         sc->backbuffer = create_tex2d_internal(sc->dev, w, h, fmt ? fmt : 28, 0, 1, 0);
+        win32_set_backbuffer_size((int)w, (int)h);
+        if (sc->sdl_win) SDL_SetWindowSize(sc->sdl_win, (int)w, (int)h);
         if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(w, h);
+    }
+    c->rax = S_OK_HR;
+}
+
+static void sc_ResizeTarget(CPU64 *c, void *ud) {
+    (void)ud;
+    DXGISwapChainObj *sc = (DXGISwapChainObj *)(uintptr_t)c->rcx;
+    uint64_t mode_va = c->rdx;
+    if (sc && mode_va && sc->sdl_win) {
+        uint32_t w = R32(mode_va + 0), h = R32(mode_va + 4);
+        if (w >= 320 && h >= 200 && w <= 8192 && h <= 8192) {
+            SDL_SetWindowSize(sc->sdl_win, (int)w, (int)h);
+            if (sc->metal_layer) sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
+        }
     }
     c->rax = S_OK_HR;
 }
@@ -1834,6 +1865,9 @@ static void sc_Present(CPU64 *c, void *ud) {
     if (sc && sc->metal_layer && sc->backbuffer) {
         SDL_PumpEvents();
         @autoreleasepool {
+            if (sc->metal_layer.drawableSize.width != sc->width || sc->metal_layer.drawableSize.height != sc->height) {
+                sc->metal_layer.drawableSize = CGSizeMake(sc->width, sc->height);
+            }
             id<CAMetalDrawable> drawable = [sc->metal_layer nextDrawable];
             if (drawable) {
                 id<MTLCommandBuffer> cb = (sc->dev && sc->dev->imm_ctx && sc->dev->imm_ctx->pending_cb)
@@ -1943,6 +1977,8 @@ static void factory_CreateSwapChain(CPU64 *c, void *ud) {
                                (int)w, (int)h, SDL_WINDOW_METAL | SDL_WINDOW_SHOWN);
     }
     if (win) {
+        sc->sdl_win = win;
+        win32_set_backbuffer_size((int)w, (int)h);
         SDL_SetWindowSize(win, (int)w, (int)h);
         if (!getenv("ELF64_HEADLESS")) {
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -2084,8 +2120,10 @@ static void init_d3d11_vtables(void) {
     g_vt_swapchain[6] = t_get_parent;
     g_vt_swapchain[8] = rt_alloc_dynamic_thunk("IDXGISwapChain::Present", sc_Present, NULL);
     g_vt_swapchain[9] = rt_alloc_dynamic_thunk("IDXGISwapChain::GetBuffer", sc_GetBuffer, NULL);
+    g_vt_swapchain[10]= rt_alloc_dynamic_thunk("IDXGISwapChain::SetFullscreenState", sc_SetFullscreenState, NULL);
     g_vt_swapchain[12]= rt_alloc_dynamic_thunk("IDXGISwapChain::GetDesc", sc_GetDesc, NULL);
     g_vt_swapchain[13]= rt_alloc_dynamic_thunk("IDXGISwapChain::ResizeBuffers", sc_ResizeBuffers, NULL);
+    g_vt_swapchain[14]= rt_alloc_dynamic_thunk("IDXGISwapChain::ResizeTarget", sc_ResizeTarget, NULL);
     g_vt_adapter[6]   = t_get_parent;
     g_vt_adapter[7]   = rt_alloc_dynamic_thunk("IDXGIAdapter::EnumOutputs", adapter_EnumOutputs, NULL);
     g_vt_adapter[8]   = rt_alloc_dynamic_thunk("IDXGIAdapter::GetDesc", adapter_GetDesc, NULL);
@@ -2180,6 +2218,8 @@ static void w_D3D11CreateDeviceAndSwapChain(CPU64 *c, void *ud) {
                                (int)w, (int)h, SDL_WINDOW_METAL | SDL_WINDOW_SHOWN);
     }
     if (win) {
+        sc->sdl_win = win;
+        win32_set_backbuffer_size((int)w, (int)h);
         SDL_SetWindowSize(win, (int)w, (int)h);
         if (!getenv("ELF64_HEADLESS")) {
             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];

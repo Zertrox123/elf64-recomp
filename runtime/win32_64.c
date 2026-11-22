@@ -841,6 +841,30 @@ static int          g_sendmsg_depth = 0;
 static uint8_t      g_raw_ring[64][48];
 static uint32_t     g_raw_seq = 0;
 static int          g_cursor_count = 0;
+static int          g_bb_w = 0, g_bb_h = 0;
+
+void win32_set_backbuffer_size(int w, int h) {
+    if (w > 0 && h > 0) { g_bb_w = w; g_bb_h = h; }
+}
+void win32_get_backbuffer_size(int *w, int *h) {
+    if (w) *w = g_bb_w;
+    if (h) *h = g_bb_h;
+}
+static void scale_sdl_mouse(Uint32 win_id, int sx, int sy, int *ox, int *oy) {
+    if (g_bb_w > 0 && g_bb_h > 0) {
+        SDL_Window *w = SDL_GetWindowFromID(win_id);
+        if (w) {
+            int ww = 0, wh = 0;
+            SDL_GetWindowSize(w, &ww, &wh);
+            if (ww > 0 && wh > 0 && (ww != g_bb_w || wh != g_bb_h)) {
+                *ox = (int)((int64_t)sx * g_bb_w / ww);
+                *oy = (int)((int64_t)sy * g_bb_h / wh);
+                return;
+            }
+        }
+    }
+    *ox = sx; *oy = sy;
+}
 
 void win32_set_mouse_xy(int x, int y) { g_mouse_x = x; g_mouse_y = y; }
 
@@ -1099,8 +1123,12 @@ static void w_GetClientRect(CPU64 *c, void *ud) {
     (void)ud;
     if (!c->rdx) { c->rax = 0; return; }
     int w = 1280, h = 720;
-    SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
-    if (win) SDL_GetWindowSize(win, &w, &h);
+    if (g_bb_w > 0 && g_bb_h > 0) {
+        w = g_bb_w; h = g_bb_h;
+    } else {
+        SDL_Window *win = win32_hwnd_to_sdl(c->rcx);
+        if (win) SDL_GetWindowSize(win, &w, &h);
+    }
     W32(c->rdx + 0, 0); W32(c->rdx + 4, 0);
     W32(c->rdx + 8, (uint32_t)w); W32(c->rdx + 12, (uint32_t)h);
     c->rax = 1;
@@ -1128,7 +1156,7 @@ static void pump_sdl_to_msgq(void) {
                 g_mouse_x += ev.motion.xrel;
                 g_mouse_y += ev.motion.yrel;
             } else {
-                g_mouse_x = ev.motion.x; g_mouse_y = ev.motion.y;
+                scale_sdl_mouse(ev.motion.windowID, ev.motion.x, ev.motion.y, &g_mouse_x, &g_mouse_y);
             }
             if (ev.motion.xrel || ev.motion.yrel) {
                 uint64_t hraw = push_raw_mouse(ev.motion.xrel, ev.motion.yrel, 0, 0);
@@ -1139,8 +1167,9 @@ static void pump_sdl_to_msgq(void) {
         } else if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) {
             uint64_t h = hwnd_for_sdl_id(ev.button.windowID);
             int dn = (ev.type == SDL_MOUSEBUTTONDOWN);
-            g_mouse_x = ev.button.x; g_mouse_y = ev.button.y;
-            uint64_t lp = ((uint64_t)(uint16_t)ev.button.y << 16) | (uint16_t)ev.button.x;
+            if (!SDL_GetRelativeMouseMode())
+                scale_sdl_mouse(ev.button.windowID, ev.button.x, ev.button.y, &g_mouse_x, &g_mouse_y);
+            uint64_t lp = ((uint64_t)(uint16_t)g_mouse_y << 16) | (uint16_t)g_mouse_x;
             uint32_t wm = 0;
             if (ev.button.button == SDL_BUTTON_LEFT)       { wm = dn ? 0x0201 : 0x0202; g_vk_down[0x01] = (uint8_t)dn; }
             else if (ev.button.button == SDL_BUTTON_RIGHT) { wm = dn ? 0x0204 : 0x0205; g_vk_down[0x02] = (uint8_t)dn; }
