@@ -1,4 +1,4 @@
-# x86-recomp
+# x64-mac-recomp
 
 Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 + Direct3D 11 -> Apple Metal) and Linux ELF64 (System V AMD64 + Vulkan -> MoltenVK) — no Rosetta, no Wine, no JIT.
 
@@ -22,7 +22,7 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 
 ## What is this project for?
 
-**x86-recomp** is an ahead-of-time (AOT) **static recompiler for macOS Apple Silicon (M1/M2/M3/M4)** that turns 64-bit x86_64 Windows (`.exe`/`.dll`) and Linux (ELF64/PIE/``.so``) binaries directly into **native ARM64 macOS executables** — with **no Rosetta, no Wine, no JIT, and no virtualization**.
+**x64-mac-recomp** is an ahead-of-time (AOT) **static recompiler for macOS Apple Silicon (M1/M2/M3/M4)** that turns 64-bit x86_64 Windows (`.exe`/`.dll`) and Linux (ELF64/PIE/``.so``) binaries directly into **native ARM64 macOS executables** — with **no Rosetta, no Wine, no JIT, and no virtualization**.
 
 ### What it lets you do
 
@@ -91,7 +91,7 @@ CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all" LDFLAGS="-fsanitize=unde
 
 ## Legal & Disclaimer
 
-- **Clean-room interoperability tool**: `x86-recomp` is an independent, MIT-licensed static recompiler and runtime bridge. It contains **no copyrighted game assets, binaries, source code, shaders, or proprietary SDK files** from Valve Corporation, Second Face Software, Microsoft, or any third party.
+- **Clean-room interoperability tool**: `x64-mac-recomp` is an independent, MIT-licensed static recompiler and runtime bridge. It contains **no copyrighted game assets, binaries, source code, shaders, or proprietary SDK files** from Valve Corporation, Second Face Software, Microsoft, or any third party.
 - **Legally owned copies only**: End users must supply their own legally obtained Steam copy of any game they recompile. The Steamworks bridge delegates authentication and initialization (`SteamAPI_InitSafe`) to the user's locally installed native macOS Steam client and does not bypass DRM or ownership checks.
 - **Third-party licenses**: The generated Vulkan bridge (`tools/gen_vulkan64.py`) parses Khronos `vk.xml` (Apache-2.0) at build time. When packaging a local `.app` with `tools/package_macos_app.py`, third-party libraries (SDL2/SDL3 under zlib; Cairo/Pango/GLib/FriBidi under LGPL-2.1; FreeType under FTL/GPL-2.0; HarfBuzz/Pixman/Fontconfig/libpng under MIT/BSD/zlib) are dynamically linked as separate `.dylib` files inside `Contents/Frameworks/` — do not redistribute bundles containing third-party copyrighted game files.
 - **Trademarks**: *Portal*, *Portal 2*, *Steam*, and *Source* are trademarks of Valve Corporation. *Portal: Revolution* and *Strata Source* are trademarks of their respective owners (Second Face Software / Strata Source team). *DirectX* and *Windows* are trademarks of Microsoft Corporation. *macOS*, *Apple Silicon*, and *Metal* are trademarks of Apple Inc. This project is unofficial and not affiliated with or endorsed by any of these entities.
