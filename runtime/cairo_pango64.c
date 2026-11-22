@@ -16,7 +16,13 @@
  */
 
 static void *dl_open_brew(const char *name) {
-    char p[256];
+    char p[512];
+    const char *ldir = getenv("ELF64_LIB_DIR");
+    if (ldir && *ldir) {
+        snprintf(p, sizeof(p), "%s/%s", ldir, name);
+        void *h = dlopen(p, RTLD_LAZY | RTLD_LOCAL);
+        if (h) return h;
+    }
     snprintf(p, sizeof(p), "/opt/homebrew/lib/%s", name);
     void *h = dlopen(p, RTLD_LAZY | RTLD_LOCAL);
     if (!h) h = dlopen(name, RTLD_LAZY | RTLD_LOCAL);

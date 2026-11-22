@@ -215,10 +215,19 @@ static void load_module_images(void) {
     for (size_t i = 0; i < g_rt_module_count; i++) {
         const RTModuleSpec *m = &g_rt_modules[i];
         void *mem = map_exact_rw(m->map_addr, (size_t)m->mem_size, m->name);
-        int fd = open(m->image_path, O_RDONLY);
+        const char *img_dir = getenv("ELF64_IMG_DIR");
+        char alt_path[1024];
+        const char *open_path = m->image_path;
+        if (img_dir && *img_dir) {
+            const char *base = strrchr(m->image_path, '/');
+            snprintf(alt_path, sizeof(alt_path), "%s/%s", img_dir, base ? base + 1 : m->image_path);
+            open_path = alt_path;
+        }
+        int fd = open(open_path, O_RDONLY);
+        if (fd < 0 && open_path != m->image_path) fd = open(m->image_path, O_RDONLY);
         if (fd < 0) {
             fprintf(stderr, "elf64-recomp: cannot open %s: %s\n",
-                    m->image_path, strerror(errno));
+                    open_path, strerror(errno));
             abort();
         }
         size_t remaining = (size_t)m->mem_size;
