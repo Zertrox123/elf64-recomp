@@ -49,6 +49,22 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 brew install sdl2 molten-vk vulkan-headers lld
 ```
 
+## Packaging a Standalone macOS `.app`
+
+To turn a recompiled build into a self-contained double-clickable Apple Silicon `.app` bundle (with bundled `.img` images, game assets, relocated SDL2/SDL3/Cairo/Pango/FreeType/Fontconfig dylibs, and ad-hoc code signing — zero Homebrew dependency at runtime):
+
+```sh
+python3 tools/package_macos_app.py \
+  --app "build/release/Portal Revolution.app" \
+  --binary build/rev_game/revolution_arm64 \
+  --prep-dir build/rev_game/prep \
+  --game-root build/rev_root \
+  --name "Portal: Revolution" \
+  --bundle-id com.elf64recomp.portal-revolution \
+  --icon build/rev_root/revolution/resource/game.icns \
+  --default-cfg-rel revolution/cfg/video.txt
+```
+
 ## Verification
 
 ```sh

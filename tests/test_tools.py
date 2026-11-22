@@ -174,5 +174,27 @@ class TestGenStatus(unittest.TestCase):
         self.assertIn("GPR", svg)
 
 
+class TestPackageMacOSApp(unittest.TestCase):
+    def test_clone_tree_deref_and_skip(self):
+        import package_macos_app
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src")
+            ext = os.path.join(d, "ext")
+            dst = os.path.join(d, "dst")
+            os.makedirs(os.path.join(src, "cfg"))
+            os.makedirs(ext)
+            with open(os.path.join(ext, "real.bin"), "wb") as f:
+                f.write(b"DATA")
+            os.symlink(os.path.join(ext, "real.bin"), os.path.join(src, "linked.bin"))
+            with open(os.path.join(src, "cfg", "video.txt"), "w") as f:
+                f.write("skipme")
+            n = package_macos_app.clone_tree_deref(src, dst, {"cfg/video.txt"})
+            self.assertEqual(n, 1)
+            out_f = os.path.join(dst, "linked.bin")
+            self.assertTrue(os.path.isfile(out_f) and not os.path.islink(out_f))
+            self.assertEqual(open(out_f, "rb").read(), b"DATA")
+            self.assertFalse(os.path.exists(os.path.join(dst, "cfg", "video.txt")))
+
+
 if __name__ == "__main__":
     unittest.main()
