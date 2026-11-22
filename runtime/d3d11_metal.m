@@ -49,6 +49,9 @@ typedef struct ComBase {
 typedef struct {
     ComBase          base;
     id<MTLBuffer>    mtl_buf;
+    id<MTLBuffer>    ring[4];
+    uint32_t         ring_idx;
+    uint32_t         ring_used;
     uint32_t         byte_width;
     uint32_t         bind_flags;
     uint32_t         usage;
@@ -201,6 +204,7 @@ struct D3D11DeviceObj {
     id<MTLDevice>      mtl_dev;
     id<MTLCommandQueue> mtl_queue;
     id<MTLSamplerState> default_sampler;
+    id<MTLDepthStencilState> default_dss;
     id<MTLBuffer>      zero_vb;
     D3D11ContextObj   *imm_ctx;
     PsoCacheEntry      pso_cache[512];
@@ -1292,9 +1296,14 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count,
 
         id<MTLRenderCommandEncoder> enc = ctx->active_enc;
         [enc setRenderPipelineState:pso];
-        if (dt && ctx->ds_state && ctx->ds_state->mtl_dss) {
-            [enc setDepthStencilState:ctx->ds_state->mtl_dss];
-            [enc setStencilReferenceValue:ctx->stencil_ref];
+        if (dt) {
+            if (ctx->ds_state && ctx->ds_state->mtl_dss) {
+                [enc setDepthStencilState:ctx->ds_state->mtl_dss];
+                [enc setStencilReferenceValue:ctx->stencil_ref];
+            } else if (ctx->dev->default_dss) {
+                [enc setDepthStencilState:ctx->dev->default_dss];
+                [enc setStencilReferenceValue:0];
+            }
         }
         if (ctx->has_blend_factor) {
             [enc setBlendColorRed:ctx->blend_factor[0] green:ctx->blend_factor[1]
@@ -1323,6 +1332,7 @@ static void ctx_draw_common(D3D11ContextObj *ctx, int indexed, uint32_t count,
             }
         } else {
             [enc setCullMode:MTLCullModeNone];
+            [enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
             [enc setScissorRect:(MTLScissorRect){0, 0, ref_w, ref_h}];
         }
 
@@ -1535,8 +1545,20 @@ static void ctx_Map(CPU64 *c, void *ud) {
     if (!res || !mapped_va) { c->rax = E_INVALIDARG_H; return; }
     if (res->kind == COM_BUFFER) {
         D3D11BufferObj *b = (D3D11BufferObj *)res;
-        /* Flush GPU before overwriting large (>4 KiB) or readback buffers in-place. */
-        if (ctx && (map_type == 1 || map_type == 3 || (map_type == 4 && b->byte_width > 4096))) {
+        if (ctx && map_type == 4 && b->byte_width > 4096) {
+            /* Rotate 4-slot ring on WRITE_DISCARD to avoid per-draw GPU stalls. */
+            if (!b->ring[0]) b->ring[0] = b->mtl_buf;
+            b->ring_idx = (b->ring_idx + 1U) & 3U;
+            if (!b->ring[b->ring_idx]) {
+                b->ring[b->ring_idx] = [ctx->dev->mtl_dev newBufferWithLength:b->byte_width
+                                                                      options:MTLResourceStorageModeShared];
+            }
+            if (++b->ring_used >= 4U) {
+                ctx_flush_gpu(ctx, 1);
+                b->ring_used = 0;
+            }
+            if (b->ring[b->ring_idx]) b->mtl_buf = b->ring[b->ring_idx];
+        } else if (ctx && (map_type == 1 || map_type == 3)) {
             ctx_flush_gpu(ctx, 1);
         }
         W64(mapped_va + 0, (uint64_t)(uintptr_t)[b->mtl_buf contents]);

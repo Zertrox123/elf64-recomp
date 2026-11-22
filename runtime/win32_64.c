@@ -845,7 +845,7 @@ static int          g_cursor_count = 0;
 void win32_set_mouse_xy(int x, int y) { g_mouse_x = x; g_mouse_y = y; }
 
 int win32_show_cursor(int show) {
-    if (show) g_cursor_count++; else g_cursor_count--;
+    g_cursor_count = show ? 0 : -1;
     if (!getenv("ELF64_HEADLESS")) {
         SDL_SetRelativeMouseMode(g_cursor_count < 0 ? SDL_TRUE : SDL_FALSE);
     }
@@ -1120,6 +1120,7 @@ static void pump_sdl_to_msgq(void) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) {
+            SDL_SetRelativeMouseMode(SDL_FALSE);
             msg_push(win32_primary_hwnd(), 0x0012 /* WM_QUIT */, 0, 0);
         } else if (ev.type == SDL_MOUSEMOTION) {
             uint64_t h = hwnd_for_sdl_id(ev.motion.windowID);
@@ -1179,6 +1180,7 @@ static void pump_sdl_to_msgq(void) {
                 msg_push(h, 0x0006 /* WM_ACTIVATE */, 1, 0);
                 msg_push(h, 0x0007 /* WM_SETFOCUS */, 0, 0);
             } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                SDL_SetRelativeMouseMode(SDL_FALSE);
                 msg_push(h, 0x001C /* WM_ACTIVATEAPP */, 0, 0);
                 msg_push(h, 0x0008 /* WM_KILLFOCUS */, 0, 0);
             }
