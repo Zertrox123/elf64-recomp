@@ -2,6 +2,7 @@
 #define ELF64_RECOMP_RUNTIME64_H
 
 #include "cpu64.h"
+#include <setjmp.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -86,6 +87,9 @@ void     rt_destroy_thread_cpu(CPU64 *c);
 void     rt_register_shim(const char *name, RTShimFn fn, void *userdata);
 RTShimFn rt_find_shim(const char *name, void **out_userdata);
 uint64_t rt_alloc_dynamic_thunk(const char *name, RTShimFn fn, void *userdata);
+int      rt_is_lifted_code(uint64_t addr);
+void     rt_setjmp_save(uint64_t jmpbuf_va, sigjmp_buf *jb, const CPU64 *c);
+int      rt_longjmp_unwind(CPU64 *c, uint64_t jmpbuf_va, uint64_t val);
 uint64_t rt_lookup_export(const char *name);
 uint64_t rt_lookup_export_in_module(uint64_t mod_base, const char *name);
 uint64_t rt_find_module_base(const char *name);

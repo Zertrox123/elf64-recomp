@@ -98,6 +98,20 @@ class TestLift64(unittest.TestCase):
         self.assertIn("xmm[1].q[0]", code)
         self.assertNotIn("c->rsi", code)
 
+    def test_cet_nop_and_msvc_setjmp(self):
+        pfx, mnem, ops = lift64.parse_insn_text("rdsspq r10")
+        ins = lift64.Insn(0x1000, 5, "rdsspq r10", pfx, mnem, ops)
+        unimpl = []
+        self.assertEqual(lift64.lift_insn(ins, {0x1000}, False, unimpl), "/* nop */")
+        self.assertEqual(unimpl, [])
+        caller = lift64.LiftedFunc(0x2000, "caller", [
+            lift64.Insn(0x2000, 5, "call 0x3000", "", "call", ["0x3000"]),
+            lift64.Insn(0x2005, 1, "ret", "", "ret", []),
+        ])
+        code = lift64.emit_function_c(caller, unimpl, {0x3000})
+        self.assertIn("sigjmp_buf _sjb_0;", code)
+        self.assertIn("rt_setjmp_save(c->rcx, &_sjb_0, c);", code)
+
 
 class TestGenVulkan64(unittest.TestCase):
     def test_vk_xml_parses_core_commands(self):

@@ -257,6 +257,22 @@ static void w_FcConfigAppFontAdd(CPU64 *c, void *ud) {
     c->rax = (uint64_t)fn((void *)(uintptr_t)c->rcx, (const unsigned char *)px);
 }
 
+typedef struct { int type; uint32_t _pad; uint64_t u; } HostFcValue;
+
+/* On Win64, 16-byte FcValue is passed by pointer in r8; on ARM64 AAPCS64 by value in x2/x3. */
+static void w_FcPatternAdd(CPU64 *c, void *ud) {
+    (void)ud;
+    ensure_dls();
+    typedef int (*Fn)(void *, const char *, HostFcValue, int);
+    Fn fn = g_dl_fc ? (Fn)dlsym(g_dl_fc, "FcPatternAdd") : NULL;
+    if (!fn || !c->r8) { c->rax = 0; return; }
+    HostFcValue v;
+    v.type = (int)R32(c->r8);
+    v._pad = 0;
+    v.u    = R64(c->r8 + 8);
+    c->rax = (uint64_t)fn((void *)(uintptr_t)c->rcx, (const char *)(uintptr_t)c->rdx, v, (int)c->r9);
+}
+
 static void w_noop_zero(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
 
 static CpSpec g_cp_specs[] = {
@@ -400,6 +416,15 @@ static CpSpec g_cp_specs[] = {
     { LIB_PANGOFT2, "pango_fc_font_unlock_face", "v_p", NULL },
     { LIB_PANGOFT2, "pango_ft2_font_map_new", "p", NULL },
     { LIB_PANGOFT2, "pango_ft2_render_transformed", "v_ppppp_d", NULL },
+    /* Fontconfig (8) */
+    { LIB_FC, "FcConfigSetCurrent", "p_p", NULL },
+    { LIB_FC, "FcConfigSubstitute", "p_ppp", NULL },
+    { LIB_FC, "FcDefaultSubstitute", "v_p", NULL },
+    { LIB_FC, "FcFontMatch", "p_ppp", NULL },
+    { LIB_FC, "FcInitLoadConfigAndFonts", "p", NULL },
+    { LIB_FC, "FcPatternCreate", "p", NULL },
+    { LIB_FC, "FcPatternDestroy", "v_p", NULL },
+    { LIB_FC, "FcPatternGetString", "p_pppp", NULL },
 };
 
 void rt_register_cairo_pango_64(void) {
@@ -408,6 +433,7 @@ void rt_register_cairo_pango_64(void) {
     }
     rt_register_shim("FcConfigAppFontAddDir", w_FcConfigAppFontAdd, (void *)"FcConfigAppFontAddDir");
     rt_register_shim("FcConfigAppFontAddFile", w_FcConfigAppFontAdd, (void *)"FcConfigAppFontAddFile");
+    rt_register_shim("FcPatternAdd", w_FcPatternAdd, NULL);
     rt_register_shim("pango_attribute_init", w_pango_attribute_init, NULL);
     /* Valve-custom hooks absent from upstream Pango/Fontconfig */
     rt_register_shim("pango_ft2_new_face_substitute", w_noop_zero, NULL);

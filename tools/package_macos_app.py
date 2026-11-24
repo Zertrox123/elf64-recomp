@@ -59,10 +59,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    char **nargv = (char **)calloc((size_t)argc + 8, sizeof(char *));
+    static const char *kDefaultArgs[] = { DEFAULT_ARGS_INIT NULL };
+    int n_def = (int)(sizeof(kDefaultArgs) / sizeof(kDefaultArgs[0])) - 1;
+    char **nargv = (char **)calloc((size_t)(argc + n_def + 8), sizeof(char *));
     if (!nargv) return 1;
     int n = 0;
     nargv[n++] = bin;
+    for (int i = 0; i < n_def; i++) nargv[n++] = (char *)kDefaultArgs[i];
     int has_user_args = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "-psn_", 5) == 0) continue;
@@ -102,6 +105,7 @@ FONTS_CONF = """<?xml version="1.0"?>
 DEFAULT_SEED_LIBS = [
     "/opt/homebrew/opt/sdl2-compat/lib/libSDL2-2.0.0.dylib",
     "/opt/homebrew/opt/sdl3/lib/libSDL3.0.dylib",
+    "/opt/homebrew/lib/libMoltenVK.dylib",
     "/opt/homebrew/lib/libglib-2.0.dylib",
     "/opt/homebrew/lib/libgobject-2.0.dylib",
     "/opt/homebrew/lib/libfreetype.dylib",
@@ -238,6 +242,7 @@ def package_app(
     icon: str | None = None,
     default_cfg_rel: str = "",
     skip_rel: Iterable[str] = (),
+    default_args: Iterable[str] = (),
 ) -> str:
     app_path = os.path.abspath(app_path)
     contents = os.path.join(app_path, "Contents")
@@ -300,6 +305,9 @@ def package_app(
 """
         )
 
+    def_args_c = "".join(
+        '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '", ' for a in default_args
+    )
     launcher_bin = os.path.join(macos, exec_name)
     with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as tf:
         tf.write(LAUNCHER_C)
@@ -310,6 +318,7 @@ def package_app(
                 "clang", "-O2", "-arch", "arm64",
                 f'-DLAUNCH_BIN_NAME="{bin_name}"',
                 f'-DDEFAULT_CFG_REL="{default_cfg_rel}"',
+                f"-DDEFAULT_ARGS_INIT={def_args_c}",
                 lc_path, "-o", launcher_bin,
             ]
         )
@@ -339,11 +348,13 @@ def main() -> int:
     ap.add_argument("--icon", default=None, help="Optional .icns file path")
     ap.add_argument("--default-cfg-rel", default="", help="Relative video config path (adds -windowed 1280x720 if absent)")
     ap.add_argument("--skip", action="append", default=[], help="Relative paths inside game-root to omit")
+    ap.add_argument("--arg", action="append", default=[], help="Default argument passed to the binary (repeatable)")
     args = ap.parse_args()
     package_app(
         args.app, args.binary, args.prep_dir, args.game_root,
         name=args.name, bundle_id=args.bundle_id, icon=args.icon,
         default_cfg_rel=args.default_cfg_rel, skip_rel=args.skip,
+        default_args=args.arg,
     )
     return 0
 

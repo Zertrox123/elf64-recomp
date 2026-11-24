@@ -30,6 +30,8 @@ def collect_implemented_shims() -> Set[str]:
     pat = re.compile(r'(?:REG|rt_register_shim)\(\s*"([^"]+)"')
     pat_tbl = re.compile(r'\{\s*LIB_[A-Z0-9_]+\s*,\s*"([^"]+)"')
     for fn in os.listdir(RUNTIME_DIR):
+        if fn in ("libc64.c", "sdl2_64.c"):
+            continue
         if fn.endswith((".c", ".m")):
             with open(os.path.join(RUNTIME_DIR, fn)) as f:
                 txt = f.read()

@@ -135,6 +135,7 @@ def build_elf64(
     link_cmd = (
         ["clang", "-o", out_bin] + objs + sdl_libs + [
             "-framework", "Metal", "-framework", "QuartzCore", "-framework", "Foundation",
+            "-framework", "CoreGraphics", "-framework", "CoreText",
             "-framework", "JavaScriptCore",
             "-lm", "-lpthread", "-ldl",
         ] + extra_ldflags

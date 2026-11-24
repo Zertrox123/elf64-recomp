@@ -24,7 +24,7 @@ test-v8:
 		runtime/win32_64.c runtime/win32_crt_extra.c runtime/cairo_pango64.c runtime/v8_jsc64.c \
 		runtime/dxbc_msl.c runtime/d3d11_metal.m \
 		-L/opt/homebrew/lib -lSDL2 -Wl,-framework,Cocoa -framework Metal -framework QuartzCore \
-		-framework Foundation -framework JavaScriptCore -lm -lpthread -ldl $(LDFLAGS) -o build/test_v8_jsc
+		-framework Foundation -framework CoreGraphics -framework CoreText -framework JavaScriptCore -lm -lpthread -ldl $(LDFLAGS) -o build/test_v8_jsc
 	./build/test_v8_jsc
 
 status:

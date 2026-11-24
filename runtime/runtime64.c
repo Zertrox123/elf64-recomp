@@ -151,6 +151,58 @@ uint64_t rt_alloc_dynamic_thunk(const char *name, RTShimFn fn, void *userdata) {
     return addr;
 }
 
+int rt_is_lifted_code(uint64_t addr) {
+    if (!addr || !g_disp_table) return 0;
+    const DispatchSlot *s = disp_lookup(addr);
+    return (s && s->kind == SLOT_LIFTED) ? 1 : 0;
+}
+
+typedef struct {
+    uint64_t    jmpbuf_va;
+    sigjmp_buf *jb;
+    uint64_t    rbx, rsp, rbp, rsi, rdi, r12, r13, r14, r15;
+    uint32_t    mxcsr;
+    Xmm128      xmm[10]; /* xmm6..xmm15 */
+} RTJmpSlot;
+
+#define RT_MAX_JMPS 64
+static __thread RTJmpSlot tls_jmps[RT_MAX_JMPS];
+static __thread int       tls_jmp_cnt = 0;
+
+void rt_setjmp_save(uint64_t jmpbuf_va, sigjmp_buf *jb, const CPU64 *c) {
+    int slot = -1;
+    for (int i = tls_jmp_cnt - 1; i >= 0; i--) {
+        if (tls_jmps[i].jmpbuf_va == jmpbuf_va) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (tls_jmp_cnt < RT_MAX_JMPS) slot = tls_jmp_cnt++;
+        else { memmove(&tls_jmps[0], &tls_jmps[1], (RT_MAX_JMPS - 1) * sizeof(RTJmpSlot)); slot = RT_MAX_JMPS - 1; }
+    }
+    RTJmpSlot *s = &tls_jmps[slot];
+    s->jmpbuf_va = jmpbuf_va;
+    s->jb = jb;
+    s->rbx = c->rbx; s->rsp = c->rsp; s->rbp = c->rbp;
+    s->rsi = c->rsi; s->rdi = c->rdi;
+    s->r12 = c->r12; s->r13 = c->r13; s->r14 = c->r14; s->r15 = c->r15;
+    s->mxcsr = c->mxcsr;
+    for (int k = 0; k < 10; k++) s->xmm[k] = c->xmm[6 + k];
+}
+
+int rt_longjmp_unwind(CPU64 *c, uint64_t jmpbuf_va, uint64_t val) {
+    for (int i = tls_jmp_cnt - 1; i >= 0; i--) {
+        if (tls_jmps[i].jmpbuf_va == jmpbuf_va && tls_jmps[i].jb) {
+            RTJmpSlot s = tls_jmps[i];
+            c->rbx = s.rbx; c->rsp = s.rsp; c->rbp = s.rbp;
+            c->rsi = s.rsi; c->rdi = s.rdi;
+            c->r12 = s.r12; c->r13 = s.r13; c->r14 = s.r14; c->r15 = s.r15;
+            c->mxcsr = s.mxcsr;
+            for (int k = 0; k < 10; k++) c->xmm[6 + k] = s.xmm[k];
+            siglongjmp(*s.jb, val ? (int)val : 1);
+        }
+    }
+    return 0;
+}
+
 uint64_t rt_lookup_export(const char *name) {
     for (size_t i = 0; i < g_rt_export_count; i++) {
         if (strcmp(g_rt_exports[i].name, name) == 0) {
@@ -386,6 +438,7 @@ void rt_init(int argc, char **argv, char **envp) {
         rt_register_win32_64();
         rt_register_win32_extra();
         rt_register_d3d11_64();
+        rt_register_vulkan64();
         rt_register_cairo_pango_64();
         rt_register_v8_jsc_64();
     } else {
@@ -400,6 +453,25 @@ void rt_init(int argc, char **argv, char **envp) {
     disp_init(g_rt_func_count + g_rt_import_count + 16384);
     for (size_t i = 0; i < g_rt_func_count; i++) {
         disp_insert(g_rt_funcs[i].addr, SLOT_LIFTED, g_rt_funcs[i].fn, NULL, NULL, NULL);
+    }
+    /* Allow shims registered under "<dll>!<export>" to override lifted DLL exports (e.g. vstdlib Coroutine_*). */
+    for (size_t i = 0; i < g_rt_export_count; i++) {
+        if (!g_rt_exports[i].addr || !g_rt_exports[i].name) continue;
+        const char *mname = NULL;
+        for (size_t m = 0; m < g_rt_module_count; m++) {
+            if (g_rt_modules[m].map_addr == g_rt_exports[i].mod_base) {
+                mname = g_rt_modules[m].name;
+                break;
+            }
+        }
+        if (!mname) continue;
+        char qual[256];
+        snprintf(qual, sizeof(qual), "%s!%s", mname, g_rt_exports[i].name);
+        void *ud = NULL;
+        RTShimFn fn = rt_find_shim(qual, &ud);
+        if (fn) {
+            disp_insert(g_rt_exports[i].addr, SLOT_SHIM, NULL, fn, ud, g_rt_exports[i].name);
+        }
     }
     for (size_t i = 0; i < g_rt_import_count; i++) {
         void *ud = NULL;
@@ -424,8 +496,14 @@ void rt_call(CPU64 *c, uint64_t target) {
     if (c->halted) return;
     const DispatchSlot *s = disp_lookup(target);
     if (!s) {
-        fprintf(stderr, "elf64-recomp: FATAL unmapped call target 0x%llx (rip=0x%llx rsp=0x%llx)\n",
-                (unsigned long long)target, (unsigned long long)c->rip, (unsigned long long)c->rsp);
+        fprintf(stderr, "elf64-recomp: FATAL unmapped call target 0x%llx (rip=0x%llx rsp=0x%llx rax=0x%llx rcx=0x%llx rdx=0x%llx rdi=0x%llx)\n",
+                (unsigned long long)target, (unsigned long long)c->rip, (unsigned long long)c->rsp,
+                (unsigned long long)c->rax, (unsigned long long)c->rcx, (unsigned long long)c->rdx, (unsigned long long)c->rdi);
+        for (int _i = 0; _i < 24; _i++) {
+            uint64_t _v = *(const uint64_t *)(uintptr_t)(c->rsp + (uint64_t)_i * 8);
+            if (_v >= 0x7000000000ULL && _v < 0x7100000000ULL)
+                fprintf(stderr, "  stack[+0x%x] = 0x%llx\n", _i * 8, (unsigned long long)_v);
+        }
         abort();
     }
     if (s->kind == SLOT_LIFTED) {

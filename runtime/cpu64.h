@@ -28,11 +28,71 @@ typedef struct CPU64 {
     uint64_t fs_base;
     uint64_t gs_base;
     Xmm128   xmm[16];
+    double   fpu[8];
+    int      fpu_top;
+    uint16_t fpu_sw;
+    uint16_t fpu_cw;
     uint32_t mxcsr;
     uint8_t  cf, zf, sf, of, pf, af, df;
     int      halted;
     int      exit_code;
 } CPU64;
+
+/* x87 FPU stack and 80-bit extended precision helpers */
+static inline double *fpu_st(CPU64 *c, int i) { return &c->fpu[(c->fpu_top + i) & 7]; }
+static inline void fpu_push(CPU64 *c, double v) { c->fpu_top = (c->fpu_top - 1) & 7; c->fpu[c->fpu_top] = v; }
+static inline double fpu_pop(CPU64 *c) { double v = c->fpu[c->fpu_top]; c->fpu_top = (c->fpu_top + 1) & 7; return v; }
+
+static inline double fpu_read80(uint64_t a) {
+    uint64_t mant; uint16_t se;
+    memcpy(&mant, (const void *)(uintptr_t)a, 8);
+    memcpy(&se, (const void *)(uintptr_t)(a + 8), 2);
+    int sign = (se >> 15) & 1;
+    int exp = se & 0x7FFF;
+    if (exp == 0 && mant == 0) return sign ? -0.0 : 0.0;
+    if (exp == 0x7FFF) return (mant & 0x7FFFFFFFFFFFFFFFULL) ? NAN : (sign ? -INFINITY : INFINITY);
+    double v = ldexp((double)mant, exp - 16383 - 63);
+    return sign ? -v : v;
+}
+
+static inline void fpu_write80(uint64_t a, double v) {
+    uint64_t mant = 0; uint16_t se = 0;
+    if (isnan(v)) {
+        mant = 0xC000000000000000ULL; se = 0x7FFFU;
+    } else {
+        uint16_t sign = signbit(v) ? 0x8000U : 0U;
+        if (isinf(v)) {
+            mant = 0x8000000000000000ULL; se = sign | 0x7FFFU;
+        } else if (v == 0.0) {
+            mant = 0; se = sign;
+        } else {
+            int e = 0;
+            double m = frexp(fabs(v), &e);
+            int exp80 = e - 1 + 16383;
+            if (exp80 <= 0) { mant = 0; se = sign; }
+            else if (exp80 >= 0x7FFF) { mant = 0x8000000000000000ULL; se = sign | 0x7FFFU; }
+            else { mant = (uint64_t)ldexp(m, 64); se = sign | (uint16_t)exp80; }
+        }
+    }
+    memcpy((void *)(uintptr_t)a, &mant, 8);
+    memcpy((void *)(uintptr_t)(a + 8), &se, 2);
+}
+
+static inline void fpu_com(CPU64 *c, double a, double b) {
+    c->fpu_sw &= ~0x4500U;
+    if (isnan(a) || isnan(b)) c->fpu_sw |= 0x4500U;
+    else if (a < b)           c->fpu_sw |= 0x0100U;
+    else if (a == b)          c->fpu_sw |= 0x4000U;
+}
+
+static inline void fpu_fxam(CPU64 *c, double v) {
+    c->fpu_sw &= ~0x4700U;
+    if (signbit(v)) c->fpu_sw |= 0x0200U;
+    if (isnan(v))        c->fpu_sw |= 0x0100U;
+    else if (isinf(v))   c->fpu_sw |= 0x0500U;
+    else if (v == 0.0)   c->fpu_sw |= 0x4000U;
+    else                 c->fpu_sw |= 0x0400U;
+}
 
 /* Unified 64-bit direct memory access (unaligned-safe; compiles to single LDR/STR). */
 static inline uint8_t  R8(uint64_t a)  { uint8_t  v; memcpy(&v, (const void *)(uintptr_t)a, 1); return v; }

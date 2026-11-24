@@ -2,6 +2,8 @@
 #include "win64_abi.h"
 #include <SDL.h>
 
+#include <CoreGraphics/CoreGraphics.h>
+#include <CoreText/CoreText.h>
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -9,13 +11,19 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <mach/mach.h>
+#include <malloc/malloc.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -24,6 +32,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <wctype.h>
 
 /* ---- Local UTF-16 helpers + Windows->POSIX path normalization ---- */
 static size_t w16_to_u8(const uint16_t *src, char *dst, size_t cap) {
@@ -234,8 +243,21 @@ static void w_ReleaseSRWLockExclusive(CPU64 *c, void *ud)    { (void)ud; pthread
 static void w_InitializeConditionVariable(CPU64 *c, void *ud){ (void)ud; get_cv(c->rcx); }
 static void w_WakeConditionVariable(CPU64 *c, void *ud)      { (void)ud; pthread_cond_signal(get_cv(c->rcx)); }
 static void w_WakeAllConditionVariable(CPU64 *c, void *ud)   { (void)ud; pthread_cond_broadcast(get_cv(c->rcx)); }
-static void w_SleepConditionVariableSRW(CPU64 *c, void *ud)  { (void)ud; pthread_cond_wait(get_cv(c->rcx), get_srw(c->rdx)); c->rax = 1; }
-static void w_SleepConditionVariableCS(CPU64 *c, void *ud)   { (void)ud; pthread_cond_wait(get_cv(c->rcx), get_srw(c->rdx)); c->rax = 1; }
+static void w_SleepConditionVariableSRW(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t ms = (uint32_t)c->r8;
+    if (ms == 0xFFFFFFFFU) {
+        c->rax = (pthread_cond_wait(get_cv(c->rcx), get_srw(c->rdx)) == 0) ? 1 : 0;
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (time_t)(ms / 1000U);
+        ts.tv_nsec += (long)(ms % 1000U) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        c->rax = (pthread_cond_timedwait(get_cv(c->rcx), get_srw(c->rdx), &ts) == 0) ? 1 : 0;
+    }
+}
+static void w_SleepConditionVariableCS(CPU64 *c, void *ud)   { w_SleepConditionVariableSRW(c, ud); }
 static void w_InitializeSListHead(CPU64 *c, void *ud)        { (void)ud; if (c->rcx) memset((void *)(uintptr_t)c->rcx, 0, 16); }
 static void w_InterlockedFlushSList(CPU64 *c, void *ud)      { (void)ud; c->rax = 0; }
 
@@ -392,7 +414,14 @@ static void w_GetModuleHandleExW(CPU64 *c, void *ud) {
     if (out_va) W64(out_va, base);
     c->rax = (base != 0) ? 1 : 0;
 }
-static void w_HeapSize(CPU64 *c, void *ud) { (void)ud; c->rax = 0; }
+static void w_HeapSize(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = c->r8 ? (uint64_t)malloc_size((const void *)(uintptr_t)c->r8) : 0;
+}
+static void w_msize(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = c->rcx ? (uint64_t)malloc_size((const void *)(uintptr_t)c->rcx) : 0;
+}
 static void w_LocalFree(CPU64 *c, void *ud){ (void)ud; free((void *)(uintptr_t)c->rcx); c->rax = 0; }
 static void w_GetLargePageMinimum(CPU64 *c, void *ud) { (void)ud; c->rax = 2 * 1024 * 1024; }
 static void w_GetVersion(CPU64 *c, void *ud) { (void)ud; c->rax = 0x4A61000AULL; /* Win10 */ }
@@ -605,6 +634,11 @@ static void w_ReadFile(CPU64 *c, void *ud) {
     }
     if (c->r9) W32(c->r9, n >= 0 ? (uint32_t)n : 0);
     c->rax = (n >= 0) ? 1 : 0;
+}
+static void w_GetOverlappedResult(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx && c->r8) W32(c->r8, (uint32_t)R64(c->rdx + 8));
+    c->rax = 1;
 }
 static void w_GetFileSizeEx(CPU64 *c, void *ud) {
     (void)ud;
@@ -1014,7 +1048,7 @@ static void w_SteamAPI_GetSteamInstallPath(CPU64 *c, void *ud) {
 static void *g_steam_dl = NULL;
 static int   g_steam_dl_tried = 0;
 static uint64_t g_steam_ctx_gen = 1;
-static uint64_t g_steam_vt[64];
+static uint64_t g_steam_vt[128];
 static int      g_steam_vt_init = 0;
 
 typedef struct {
@@ -1053,17 +1087,29 @@ static int looks_like_steam_ver(uint64_t va) {
     return (strncmp(s, "Steam", 5) == 0 || strncmp(s, "STEAM", 5) == 0);
 }
 
+static void steam_noop_cb(void) {}
+
 static void steam_vt_trampoline(CPU64 *c, void *ud) {
     size_t slot = (size_t)(uintptr_t)ud;
     SteamProxy *px = (SteamProxy *)(uintptr_t)c->rcx;
     if (!px || !px->real_obj) { c->rax = 0; return; }
+    int is_csteamid_sret =
+        ((strncasecmp(px->ver, "SteamUser", 9) == 0 && px->ver[9] >= '0' && px->ver[9] <= '9' && slot == 2) ||
+         (strncasecmp(px->ver, "SteamApps", 9) == 0 && slot == 17));
     void **rvt = *(void ***)px->real_obj;
+    /* Itanium ABI puts 2 vtable slots (D1, D0) for virtual ~ISteamHTMLSurface(); MSVC puts 1. */
+    if (strncmp(px->ver, "STEAMHTMLSURFACE", 16) == 0) {
+        if (slot == 0) { c->rax = 0; return; }
+        slot += 1;
+    }
+    /* shortcut: return NULL from ISteamNetworkingSockets::CreateFakeUDPPort (slot 46) because it returns a native ARM64 ISteamNetworkingFakeUDPPort* whose messages contain native m_pfnRelease callbacks; wrap FakeUDPPort + SteamNetworkingMessage_t if Valve SDR FakeIP is needed. */
+    if (strncmp(px->ver, "SteamNetworkingSockets", 22) == 0 && slot == 46) {
+        c->rax = 0;
+        return;
+    }
     typedef uint64_t (*Arm64Fn)(uint64_t, uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t, uint64_t);
     Arm64Fn fn = (Arm64Fn)rvt[slot];
-    int is_csteamid_sret =
-        ((strncmp(px->ver, "SteamUser", 9) == 0 && px->ver[9] >= '0' && px->ver[9] <= '9' && slot == 2) ||
-         (strncmp(px->ver, "SteamApps", 9) == 0 && slot == 17));
     if (is_csteamid_sret) {
         uint64_t id = fn((uint64_t)(uintptr_t)px->real_obj, c->r8, c->r9,
                          win64_arg_i(c, 4), win64_arg_i(c, 5), win64_arg_i(c, 6), 0, 0);
@@ -1071,7 +1117,11 @@ static void steam_vt_trampoline(CPU64 *c, void *ud) {
         c->rax = c->rdx;
         return;
     }
-    uint64_t r = fn((uint64_t)(uintptr_t)px->real_obj, c->rdx, c->r8, c->r9,
+    /* Never hand raw guest x86_64 callback pointers (e.g. SetDebugOutputFunction/SetWarningMessageHook) to native ARM64 steamclient.dylib. */
+    uint64_t a1 = rt_is_lifted_code(c->rdx) ? (uint64_t)(uintptr_t)steam_noop_cb : c->rdx;
+    uint64_t a2 = rt_is_lifted_code(c->r8)  ? (uint64_t)(uintptr_t)steam_noop_cb : c->r8;
+    uint64_t a3 = rt_is_lifted_code(c->r9)  ? (uint64_t)(uintptr_t)steam_noop_cb : c->r9;
+    uint64_t r = fn((uint64_t)(uintptr_t)px->real_obj, a1, a2, a3,
                     win64_arg_i(c, 4), win64_arg_i(c, 5), win64_arg_i(c, 6), win64_arg_i(c, 7));
     if (r && strncmp(px->ver, "SteamClient", 11) == 0) {
         const char *subver = NULL;
@@ -1086,7 +1136,7 @@ static uint64_t steam_wrap_iface(void *real_obj, const char *ver) {
     if (!real_obj) return 0;
     pthread_mutex_lock(&g_steam_mu);
     if (!g_steam_vt_init) {
-        for (size_t i = 0; i < 64; i++) {
+        for (size_t i = 0; i < 128; i++) {
             g_steam_vt[i] = rt_alloc_dynamic_thunk("ISteam::vcall", steam_vt_trampoline, (void *)(uintptr_t)i);
         }
         g_steam_vt_init = 1;
@@ -1110,9 +1160,8 @@ static uint64_t steam_wrap_iface(void *real_obj, const char *ver) {
 static void ensure_steam_appid_env(void) {
     if (getenv("SteamAppId") && getenv("SteamAppId")[0]) return;
     const char *root = getenv("ELF64_WIN_ROOT");
-    if (!root || !*root) return;
     char p[1024];
-    snprintf(p, sizeof(p), "%s/steam_appid.txt", root);
+    snprintf(p, sizeof(p), "%s/steam_appid.txt", (root && *root) ? root : ".");
     FILE *f = fopen(p, "r");
     if (!f) return;
     char buf[32] = {0};
@@ -1126,9 +1175,9 @@ static void ensure_steam_appid_env(void) {
 
 static void w_SteamAPI_InitSafe(CPU64 *c, void *ud) {
     (void)ud;
+    ensure_steam_appid_env();
     void *dl = steam_dl();
     if (!dl) { c->rax = 0; return; }
-    ensure_steam_appid_env();
     typedef bool (*Fn)(void);
     Fn fn = (Fn)dlsym(dl, "SteamAPI_InitSafe");
     bool ok = fn ? fn() : false;
@@ -1207,7 +1256,6 @@ static void w_SteamInternal_ContextInit(CPU64 *c, void *ud) {
     c->rax = ctx + 16;
 }
 static void w_CreateMutexA(CPU64 *c, void *ud)     { (void)ud; c->rax = 0x30001ULL; }
-static void w_CreateSemaphoreA(CPU64 *c, void *ud) { (void)ud; c->rax = 0x30002ULL; }
 static void w_ret_0(CPU64 *c, void *ud)  { (void)ud; c->rax = 0; }
 static void w_ret_1(CPU64 *c, void *ud)  { (void)ud; c->rax = 1; }
 static void w_ret_err2(CPU64 *c, void *ud){ (void)ud; c->rax = 2; /* ERROR_FILE_NOT_FOUND */ }
@@ -1457,6 +1505,10 @@ static void w_SetWindowPos(CPU64 *c, void *ud) {
         win32_fit_window_size(win, cx, cy);
         win32_post_size(c->rcx, cx, cy);
     }
+    if (win && !getenv("ELF64_HEADLESS")) {
+        if (flags & 0x0040U /* SWP_SHOWWINDOW */) { SDL_ShowWindow(win); SDL_RaiseWindow(win); }
+        else if (flags & 0x0080U /* SWP_HIDEWINDOW */) { SDL_HideWindow(win); }
+    }
     c->rax = 1;
 }
 static void w_MoveWindow(CPU64 *c, void *ud) {
@@ -1695,18 +1747,355 @@ static void w_GetLogicalDriveStringsA(CPU64 *c, void *ud) {
     c->rax = 4;
 }
 
-typedef struct { int w, h, bpp; void *bits; } GdiBmp;
-static GdiBmp g_gdi_bmps[128];
+typedef struct { int w, h, bpp, top_down; size_t stride; void *bits; } GdiBmp;
+typedef struct {
+    CTFontRef ct;
+    int       height, ascent, descent, leading, ave_w, max_w, weight;
+} GdiFont;
+typedef struct {
+    int      in_use;
+    uint64_t hbmp;
+    uint64_t hfont;
+    uint32_t text_color;
+    uint32_t bk_color;
+    int      bk_mode;
+    uint32_t text_align;
+    int      cur_x, cur_y;
+} GdiDC;
+typedef struct {
+    char      family[128];
+    CGFontRef cg;
+} AddedFont;
+
+#define GDI_MAX_BMPS  2048
+#define GDI_MAX_DCS   2048
+#define GDI_MAX_FONTS 2048
+
+static GdiBmp    g_gdi_bmps[GDI_MAX_BMPS];
+static GdiFont   g_gdi_fonts[GDI_MAX_FONTS];
+static GdiDC     g_gdi_dcs[GDI_MAX_DCS];
+static AddedFont g_added_fonts[128];
+static int       g_added_font_cnt = 0;
 static pthread_mutex_t g_gdi_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int gdi_strcasecmp_nospace(const char *a, const char *b) {
+    while (*a || *b) {
+        while (*a == ' ' || *a == '-' || *a == '_') a++;
+        while (*b == ' ' || *b == '-' || *b == '_') b++;
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        if (!*a) break;
+        a++; b++;
+    }
+    return 0;
+}
+
+static void gdi_register_cgfont(CGFontRef cg, const char *fallback_name) {
+    if (!cg) return;
+    CTFontRef tmp = CTFontCreateWithGraphicsFont(cg, 16.0, NULL, NULL);
+    char fam[128] = {0};
+    if (tmp) {
+        CFStringRef cfs = CTFontCopyFamilyName(tmp);
+        if (cfs) {
+            CFStringGetCString(cfs, fam, sizeof(fam), kCFStringEncodingUTF8);
+            CFRelease(cfs);
+        }
+        CFRelease(tmp);
+    }
+    if (!fam[0] && fallback_name) snprintf(fam, sizeof(fam), "%s", fallback_name);
+    pthread_mutex_lock(&g_gdi_mu);
+    if (g_added_font_cnt < 128) {
+        snprintf(g_added_fonts[g_added_font_cnt].family, sizeof(g_added_fonts[0].family), "%s", fam);
+        g_added_fonts[g_added_font_cnt].cg = CGFontRetain(cg);
+        g_added_font_cnt++;
+    }
+    pthread_mutex_unlock(&g_gdi_mu);
+}
+
+static void w_AddFontResourceA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) { c->rax = 0; return; }
+    char px[1024];
+    win_path_to_posix((const char *)(uintptr_t)c->rcx, px, sizeof(px));
+    CGDataProviderRef prov = CGDataProviderCreateWithFilename(px);
+    if (!prov) { c->rax = 0; return; }
+    CGFontRef cg = CGFontCreateWithDataProvider(prov);
+    CGDataProviderRelease(prov);
+    if (!cg) { c->rax = 0; return; }
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)px, (CFIndex)strlen(px), false);
+    if (url) {
+        CTFontManagerRegisterFontsForURL(url, kCTFontManagerScopeProcess, NULL);
+        CFRelease(url);
+    }
+    const char *base = strrchr(px, '/');
+    gdi_register_cgfont(cg, base ? base + 1 : px);
+    CGFontRelease(cg);
+    c->rax = 1;
+}
+
+static void w_AddFontMemResourceEx(CPU64 *c, void *ud) {
+    (void)ud;
+    const void *data = (const void *)(uintptr_t)c->rcx;
+    uint32_t len = (uint32_t)c->rdx;
+    uint64_t p_num = c->r9;
+    if (!data || !len) { c->rax = 0; return; }
+    void *copy = malloc(len);
+    if (!copy) { c->rax = 0; return; }
+    memcpy(copy, data, len);
+    CGDataProviderRef prov = CGDataProviderCreateWithData(NULL, copy, len, NULL);
+    CGFontRef cg = prov ? CGFontCreateWithDataProvider(prov) : NULL;
+    if (prov) CGDataProviderRelease(prov);
+    if (cg) {
+        gdi_register_cgfont(cg, "MemFont");
+        CGFontRelease(cg);
+        if (p_num) W32(p_num, 1);
+        c->rax = 0x53001ULL;
+        return;
+    }
+    free(copy);
+    c->rax = 0;
+}
+
+static void w_EnumFontFamiliesExA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t lf_va = c->rdx;
+    uint64_t proc = c->r8;
+    uint64_t lparam = c->r9;
+    if (!proc) { c->rax = 1; return; }
+    uint8_t *elf = (uint8_t *)calloc(1, 320);
+    uint8_t *ntm = (uint8_t *)calloc(1, 128);
+    if (lf_va) {
+        memcpy(elf, (const void *)(uintptr_t)lf_va, 60);
+        memcpy(elf + 60, (const void *)(uintptr_t)(lf_va + 28), 32);
+    }
+    W32((uint64_t)(uintptr_t)ntm + 0, 16);
+    W32((uint64_t)(uintptr_t)ntm + 4, 13);
+    W32((uint64_t)(uintptr_t)ntm + 8, 3);
+    W32((uint64_t)(uintptr_t)ntm + 20, 8);
+    W32((uint64_t)(uintptr_t)ntm + 24, 16);
+    W32((uint64_t)(uintptr_t)ntm + 28, 400);
+    uint64_t r = rt_invoke_win64(c, proc, (uint64_t)(uintptr_t)elf,
+                                 (uint64_t)(uintptr_t)ntm, 4 /* TRUETYPE_FONTTYPE */, lparam, 0, 0);
+    free(elf);
+    free(ntm);
+    c->rax = r;
+}
+
+static GdiDC *gdi_dc_get(uint64_t hdc) {
+    if (hdc >= 0x51000ULL && hdc < 0x51000ULL + GDI_MAX_DCS) {
+        GdiDC *dc = &g_gdi_dcs[hdc - 0x51000ULL];
+        if (dc->in_use) return dc;
+    }
+    return NULL;
+}
+static GdiBmp *gdi_bmp_get(uint64_t h) {
+    if (h >= 0x50000ULL && h < 0x50000ULL + GDI_MAX_BMPS) {
+        GdiBmp *b = &g_gdi_bmps[h - 0x50000ULL];
+        if (b->bits) return b;
+    }
+    return NULL;
+}
+static GdiFont *gdi_font_get(uint64_t h) {
+    if (h >= 0x52000ULL && h < 0x52000ULL + GDI_MAX_FONTS) {
+        GdiFont *f = &g_gdi_fonts[h - 0x52000ULL];
+        if (f->ct) return f;
+    }
+    return NULL;
+}
+
+static void w_CreateCompatibleDC(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    for (int i = 0; i < GDI_MAX_DCS; i++) {
+        if (!g_gdi_dcs[i].in_use) {
+            memset(&g_gdi_dcs[i], 0, sizeof(g_gdi_dcs[i]));
+            g_gdi_dcs[i].in_use = 1;
+            g_gdi_dcs[i].text_color = 0x00FFFFFFU;
+            g_gdi_dcs[i].bk_color = 0x00000000U;
+            pthread_mutex_unlock(&g_gdi_mu);
+            c->rax = 0x51000ULL + (uint64_t)i;
+            return;
+        }
+    }
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = 0;
+}
+
+static void w_DeleteDC(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx >= 0x51000ULL && c->rcx < 0x51000ULL + GDI_MAX_DCS) {
+        pthread_mutex_lock(&g_gdi_mu);
+        g_gdi_dcs[c->rcx - 0x51000ULL].in_use = 0;
+        pthread_mutex_unlock(&g_gdi_mu);
+    }
+    c->rax = 1;
+}
+
+static void w_CreateFontA(CPU64 *c, void *ud) {
+    (void)ud;
+    int32_t cHeight = (int32_t)c->rcx;
+    int32_t cWeight = (int32_t)win64_arg_i(c, 4);
+    uint32_t bItalic = (uint32_t)win64_arg_i(c, 5);
+    const char *face = (const char *)(uintptr_t)win64_arg_i(c, 13);
+    CGFloat pt = (cHeight < 0) ? (CGFloat)(-cHeight) : (cHeight > 0 ? (CGFloat)cHeight * 0.82 : 16.0);
+    if (pt < 4.0) pt = 4.0;
+
+    CTFontRef ct = NULL;
+    if (face && *face) {
+        pthread_mutex_lock(&g_gdi_mu);
+        for (int i = g_added_font_cnt - 1; i >= 0; i--) {
+            if (gdi_strcasecmp_nospace(g_added_fonts[i].family, face) == 0) {
+                ct = CTFontCreateWithGraphicsFont(g_added_fonts[i].cg, pt, NULL, NULL);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_gdi_mu);
+        if (!ct) {
+            const char *mapped = face;
+            if (strcasecmp(face, "Tahoma") == 0 || strcasecmp(face, "Segoe UI") == 0 ||
+                strcasecmp(face, "MS Shell Dlg") == 0 || strcasecmp(face, "MS Sans Serif") == 0)
+                mapped = "Helvetica Neue";
+            CFStringRef cfs = CFStringCreateWithCString(NULL, mapped, kCFStringEncodingUTF8);
+            if (cfs) {
+                CTFontDescriptorRef desc = CTFontDescriptorCreateWithNameAndSize(cfs, pt);
+                CFRelease(cfs);
+                if (desc) {
+                    CTFontRef cand = CTFontCreateWithFontDescriptor(desc, pt, NULL);
+                    CFRelease(desc);
+                    if (cand) ct = cand;
+                }
+            }
+        }
+    }
+    if (!ct) ct = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, pt, NULL);
+    CTFontSymbolicTraits traits = 0;
+    if (cWeight >= 600) traits |= kCTFontBoldTrait;
+    if (bItalic) traits |= kCTFontItalicTrait;
+    if (traits && ct) {
+        CTFontRef styled = CTFontCreateCopyWithSymbolicTraits(ct, pt, NULL, traits, traits);
+        if (styled) { CFRelease(ct); ct = styled; }
+    }
+
+    int asc = (int)ceil(CTFontGetAscent(ct));
+    int des = (int)ceil(CTFontGetDescent(ct));
+    int lead = (int)ceil(CTFontGetLeading(ct));
+    if (asc < 1) asc = (int)ceil(pt * 0.8);
+    if (des < 1) des = (int)ceil(pt * 0.2);
+    int h = asc + des;
+    UniChar sample = 'x';
+    CGGlyph sg = 0;
+    CGSize sadv = { pt * 0.5, 0 };
+    if (CTFontGetGlyphsForCharacters(ct, &sample, &sg, 1))
+        CTFontGetAdvancesForGlyphs(ct, kCTFontOrientationHorizontal, &sg, &sadv, 1);
+
+    pthread_mutex_lock(&g_gdi_mu);
+    for (int i = 0; i < GDI_MAX_FONTS; i++) {
+        if (!g_gdi_fonts[i].ct) {
+            g_gdi_fonts[i].ct = ct;
+            g_gdi_fonts[i].height = h;
+            g_gdi_fonts[i].ascent = asc;
+            g_gdi_fonts[i].descent = des;
+            g_gdi_fonts[i].leading = lead;
+            g_gdi_fonts[i].ave_w = (int)ceil(sadv.width);
+            g_gdi_fonts[i].max_w = (int)ceil(pt * 1.25);
+            g_gdi_fonts[i].weight = cWeight ? cWeight : 400;
+            pthread_mutex_unlock(&g_gdi_mu);
+            c->rax = 0x52000ULL + (uint64_t)i;
+            return;
+        }
+    }
+    pthread_mutex_unlock(&g_gdi_mu);
+    CFRelease(ct);
+    c->rax = 0;
+}
+
+static void w_SelectObject(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    uint64_t h = c->rdx;
+    uint64_t prev = 1;
+    if (dc) {
+        if (h >= 0x50000ULL && h < 0x50000ULL + GDI_MAX_BMPS) { prev = dc->hbmp ? dc->hbmp : 1; dc->hbmp = h; }
+        else if (h >= 0x52000ULL && h < 0x52000ULL + GDI_MAX_FONTS) { prev = dc->hfont ? dc->hfont : 1; dc->hfont = h; }
+    }
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = prev;
+}
+
+static void w_SetTextColor(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    uint32_t prev = dc ? dc->text_color : 0x00FFFFFFU;
+    if (dc) dc->text_color = (uint32_t)c->rdx;
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = prev;
+}
+static void w_GetTextColor(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    c->rax = dc ? dc->text_color : 0x00FFFFFFU;
+    pthread_mutex_unlock(&g_gdi_mu);
+}
+static void w_SetBkColor(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    uint32_t prev = dc ? dc->bk_color : 0;
+    if (dc) dc->bk_color = (uint32_t)c->rdx;
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = prev;
+}
+static void w_GetBkColor(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    c->rax = dc ? dc->bk_color : 0;
+    pthread_mutex_unlock(&g_gdi_mu);
+}
+static void w_SetBkMode(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    int prev = dc ? dc->bk_mode : 1;
+    if (dc) dc->bk_mode = (int)c->rdx;
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = (uint64_t)(uint32_t)prev;
+}
+static void w_SetTextAlign(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    uint32_t prev = dc ? dc->text_align : 0;
+    if (dc) dc->text_align = (uint32_t)c->rdx;
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = prev;
+}
+static void w_MoveToEx(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    if (dc) {
+        if (c->r9) { W32(c->r9, (uint32_t)dc->cur_x); W32(c->r9 + 4, (uint32_t)dc->cur_y); }
+        dc->cur_x = (int32_t)c->rdx;
+        dc->cur_y = (int32_t)c->r8;
+    }
+    pthread_mutex_unlock(&g_gdi_mu);
+    c->rax = 1;
+}
 
 static void w_CreateDIBSection(CPU64 *c, void *ud) {
     (void)ud;
     uint64_t bmi = c->rdx;
     uint64_t ppv = c->r9;
     int w = bmi ? (int32_t)R32(bmi + 4) : 16;
-    int h = bmi ? (int32_t)R32(bmi + 8) : 16;
+    int raw_h = bmi ? (int32_t)R32(bmi + 8) : -16;
+    int top_down = (raw_h < 0);
+    int h = top_down ? -raw_h : raw_h;
     if (w <= 0) w = 16;
-    if (h < 0) h = -h;
     if (h == 0) h = 16;
     int bpp = bmi ? (int)R16(bmi + 14) : 32;
     if (bpp < 8) bpp = 32;
@@ -1714,9 +2103,10 @@ static void w_CreateDIBSection(CPU64 *c, void *ud) {
     void *bits = calloc(1, stride * (size_t)h + 64);
     if (ppv) W64(ppv, (uint64_t)(uintptr_t)bits);
     pthread_mutex_lock(&g_gdi_mu);
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < GDI_MAX_BMPS; i++) {
         if (!g_gdi_bmps[i].bits) {
-            g_gdi_bmps[i].w = w; g_gdi_bmps[i].h = h; g_gdi_bmps[i].bpp = bpp; g_gdi_bmps[i].bits = bits;
+            g_gdi_bmps[i].w = w; g_gdi_bmps[i].h = h; g_gdi_bmps[i].bpp = bpp;
+            g_gdi_bmps[i].top_down = top_down; g_gdi_bmps[i].stride = stride; g_gdi_bmps[i].bits = bits;
             pthread_mutex_unlock(&g_gdi_mu);
             c->rax = 0x50000ULL + (uint64_t)i;
             return;
@@ -1727,13 +2117,17 @@ static void w_CreateDIBSection(CPU64 *c, void *ud) {
 }
 static void w_DeleteObject(CPU64 *c, void *ud) {
     (void)ud;
-    if (c->rcx >= 0x50000ULL && c->rcx < 0x50080ULL) {
+    pthread_mutex_lock(&g_gdi_mu);
+    if (c->rcx >= 0x50000ULL && c->rcx < 0x50000ULL + GDI_MAX_BMPS) {
         size_t idx = (size_t)(c->rcx - 0x50000ULL);
-        pthread_mutex_lock(&g_gdi_mu);
         free(g_gdi_bmps[idx].bits);
         memset(&g_gdi_bmps[idx], 0, sizeof(g_gdi_bmps[idx]));
-        pthread_mutex_unlock(&g_gdi_mu);
+    } else if (c->rcx >= 0x52000ULL && c->rcx < 0x52000ULL + GDI_MAX_FONTS) {
+        size_t idx = (size_t)(c->rcx - 0x52000ULL);
+        if (g_gdi_fonts[idx].ct) CFRelease(g_gdi_fonts[idx].ct);
+        memset(&g_gdi_fonts[idx], 0, sizeof(g_gdi_fonts[idx]));
     }
+    pthread_mutex_unlock(&g_gdi_mu);
     c->rax = 1;
 }
 static void w_GetObjectA(CPU64 *c, void *ud) {
@@ -1741,18 +2135,21 @@ static void w_GetObjectA(CPU64 *c, void *ud) {
     uint64_t h = c->rcx;
     int cb = (int)c->rdx;
     uint64_t out = c->r8;
-    if (h >= 0x50000ULL && h < 0x50080ULL && out && cb >= 32) {
-        size_t idx = (size_t)(h - 0x50000ULL);
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiBmp *b = gdi_bmp_get(h);
+    if (b && out && cb >= 32) {
         memset((void *)(uintptr_t)out, 0, (size_t)cb);
-        W32(out + 4, (uint32_t)g_gdi_bmps[idx].w);
-        W32(out + 8, (uint32_t)g_gdi_bmps[idx].h);
-        W32(out + 12, (uint32_t)(g_gdi_bmps[idx].w * (g_gdi_bmps[idx].bpp / 8)));
+        W32(out + 4, (uint32_t)b->w);
+        W32(out + 8, (uint32_t)b->h);
+        W32(out + 12, (uint32_t)b->stride);
         W16(out + 16, 1);
-        W16(out + 18, (uint16_t)g_gdi_bmps[idx].bpp);
-        W64(out + 24, (uint64_t)(uintptr_t)g_gdi_bmps[idx].bits);
+        W16(out + 18, (uint16_t)b->bpp);
+        W64(out + 24, (uint64_t)(uintptr_t)b->bits);
+        pthread_mutex_unlock(&g_gdi_mu);
         c->rax = 32;
         return;
     }
+    pthread_mutex_unlock(&g_gdi_mu);
     c->rax = 0;
 }
 static void w_GetTextMetricsA(CPU64 *c, void *ud) {
@@ -1760,14 +2157,24 @@ static void w_GetTextMetricsA(CPU64 *c, void *ud) {
     uint64_t tm = c->rdx;
     if (!tm) { c->rax = 0; return; }
     memset((void *)(uintptr_t)tm, 0, 56);
-    W32(tm + 0, 16);  /* tmHeight */
-    W32(tm + 4, 13);  /* tmAscent */
-    W32(tm + 8, 3);   /* tmDescent */
-    W32(tm + 20, 8);  /* tmAveCharWidth */
-    W32(tm + 24, 16); /* tmMaxCharWidth */
-    W32(tm + 28, 400);/* tmWeight */
-    W8(tm + 48, 32);  /* tmFirstChar */
-    W8(tm + 49, 126); /* tmLastChar */
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    GdiFont *f = dc ? gdi_font_get(dc->hfont) : NULL;
+    int h = f ? f->height : 16, asc = f ? f->ascent : 13, des = f ? f->descent : 3;
+    int lead = f ? f->leading : 0, ave = f ? f->ave_w : 8, maxw = f ? f->max_w : 16, wt = f ? f->weight : 400;
+    pthread_mutex_unlock(&g_gdi_mu);
+    W32(tm + 0, (uint32_t)h);
+    W32(tm + 4, (uint32_t)asc);
+    W32(tm + 8, (uint32_t)des);
+    W32(tm + 12, 0);
+    W32(tm + 16, (uint32_t)lead);
+    W32(tm + 20, (uint32_t)ave);
+    W32(tm + 24, (uint32_t)maxw);
+    W32(tm + 28, (uint32_t)wt);
+    W8(tm + 48, 32);
+    W8(tm + 49, 255);
+    W8(tm + 50, 32);
+    W8(tm + 51, 32);
     c->rax = 1;
 }
 static void w_GetCharABCWidths(CPU64 *c, void *ud) {
@@ -1775,32 +2182,287 @@ static void w_GetCharABCWidths(CPU64 *c, void *ud) {
     uint32_t first = (uint32_t)c->rdx, last = (uint32_t)c->r8;
     uint64_t out = c->r9;
     if (!out || last < first || (last - first) > 65536) { c->rax = 0; return; }
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    GdiFont *f = dc ? gdi_font_get(dc->hfont) : NULL;
+    CTFontRef ct = f ? (CTFontRef)CFRetain(f->ct) : NULL;
+    pthread_mutex_unlock(&g_gdi_mu);
     for (uint32_t i = 0; i <= last - first; i++) {
-        W32(out + i * 12ULL + 0, 0);
-        W32(out + i * 12ULL + 4, 8);
-        W32(out + i * 12ULL + 8, 1);
+        uint32_t ch = first + i;
+        int32_t a = 0, b = 8, cc = 1;
+        if (ct) {
+            UniChar uc = (UniChar)ch;
+            CGGlyph g = 0;
+            if (CTFontGetGlyphsForCharacters(ct, &uc, &g, 1)) {
+                CGSize adv = {0, 0};
+                CGRect bb = CGRectZero;
+                CTFontGetAdvancesForGlyphs(ct, kCTFontOrientationHorizontal, &g, &adv, 1);
+                CTFontGetBoundingRectsForGlyphs(ct, kCTFontOrientationHorizontal, &g, &bb, 1);
+                int32_t adv_i = (int32_t)llround(adv.width);
+                if (bb.size.width > 0.001) {
+                    a = (int32_t)floor(bb.origin.x);
+                    b = (int32_t)ceil(bb.origin.x + bb.size.width) - a;
+                    if (b < 1) b = 1;
+                    cc = adv_i - a - b;
+                } else {
+                    a = 0; b = 0; cc = adv_i;
+                }
+            } else {
+                a = 0; b = 0; cc = (int32_t)ceil(CTFontGetSize(ct) * 0.35);
+            }
+        }
+        W32(out + i * 12ULL + 0, (uint32_t)a);
+        W32(out + i * 12ULL + 4, (uint32_t)b);
+        W32(out + i * 12ULL + 8, (uint32_t)cc);
     }
+    if (ct) CFRelease(ct);
     c->rax = 1;
 }
 static void w_GetTextExtentPoint32A(CPU64 *c, void *ud) {
     (void)ud;
+    const char *s = (const char *)(uintptr_t)c->rdx;
     int len = (int)c->r8;
-    if (c->r9) { W32(c->r9, (uint32_t)(len > 0 ? len * 8 : 0)); W32(c->r9 + 4, 16); }
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(c->rcx);
+    GdiFont *f = dc ? gdi_font_get(dc->hfont) : NULL;
+    CTFontRef ct = f ? (CTFontRef)CFRetain(f->ct) : NULL;
+    int fh = f ? f->height : 16;
+    pthread_mutex_unlock(&g_gdi_mu);
+    double w = 0;
+    if (ct && s && len > 0) {
+        for (int i = 0; i < len; i++) {
+            UniChar uc = (UniChar)(uint8_t)s[i];
+            CGGlyph g = 0;
+            if (CTFontGetGlyphsForCharacters(ct, &uc, &g, 1)) {
+                CGSize adv = {0, 0};
+                CTFontGetAdvancesForGlyphs(ct, kCTFontOrientationHorizontal, &g, &adv, 1);
+                w += adv.width;
+            }
+        }
+    } else if (len > 0) {
+        w = len * 8.0;
+    }
+    if (ct) CFRelease(ct);
+    if (c->r9) { W32(c->r9, (uint32_t)llround(w)); W32(c->r9 + 4, (uint32_t)fh); }
     c->rax = 1;
 }
+static void gdi_ext_text_out(CPU64 *c, int is_wide) {
+    uint64_t hdc = c->rcx;
+    int32_t x = (int32_t)c->rdx;
+    int32_t y = (int32_t)c->r8;
+    uint32_t opts = (uint32_t)c->r9;
+    uint64_t rect_va = win64_arg_i(c, 4);
+    uint64_t str_va = win64_arg_i(c, 5);
+    int count = (int32_t)win64_arg_i(c, 6);
+
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(hdc);
+    GdiBmp *b = dc ? gdi_bmp_get(dc->hbmp) : NULL;
+    GdiFont *f = dc ? gdi_font_get(dc->hfont) : NULL;
+    if (!dc || !b || !b->bits || b->bpp != 32) {
+        pthread_mutex_unlock(&g_gdi_mu);
+        c->rax = 1;
+        return;
+    }
+    uint32_t ta = dc->text_align;
+    if (ta & 1) { x = dc->cur_x; y = dc->cur_y; }
+    uint32_t tc = dc->text_color, bc = dc->bk_color;
+    int bw = b->w, bh = b->h, td = b->top_down;
+    size_t stride = b->stride;
+    void *bits = b->bits;
+    CTFontRef ct = f ? (CTFontRef)CFRetain(f->ct) : NULL;
+    int asc = f ? f->ascent : 13;
+    pthread_mutex_unlock(&g_gdi_mu);
+
+    if ((opts & 2U) && rect_va) {
+        int32_t rl = (int32_t)R32(rect_va + 0), rt = (int32_t)R32(rect_va + 4);
+        int32_t rr = (int32_t)R32(rect_va + 8), rb = (int32_t)R32(rect_va + 12);
+        if (rl < 0) rl = 0; if (rt < 0) rt = 0;
+        if (rr > bw) rr = bw; if (rb > bh) rb = bh;
+        uint32_t bgra = 0xFF000000U | ((bc & 0xFFU) << 16) | (bc & 0xFF00U) | ((bc >> 16) & 0xFFU);
+        for (int py = rt; py < rb; py++) {
+            int row = td ? py : (bh - 1 - py);
+            uint32_t *dst = (uint32_t *)((uint8_t *)bits + (size_t)row * stride);
+            for (int px = rl; px < rr; px++) dst[px] = bgra;
+        }
+    }
+
+    if (ct && str_va && count > 0) {
+        if (count > 256) count = 256;
+        UniChar ucs[256];
+        CGGlyph glyphs[256];
+        for (int i = 0; i < count; i++) {
+            ucs[i] = is_wide ? R16(str_va + (uint64_t)i * 2) : (UniChar)R8(str_va + (uint64_t)i);
+        }
+        CTFontGetGlyphsForCharacters(ct, ucs, glyphs, count);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(bits, (size_t)bw, (size_t)bh, 8, stride, cs,
+                                                 kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+        CGColorSpaceRelease(cs);
+        if (ctx) {
+            if (!td) {
+                CGContextTranslateCTM(ctx, 0, (CGFloat)bh);
+                CGContextScaleCTM(ctx, 1.0, -1.0);
+            }
+            CGContextSetAllowsAntialiasing(ctx, true);
+            CGContextSetShouldAntialias(ctx, true);
+            CGContextSetAllowsFontSmoothing(ctx, false);
+            CGContextSetShouldSmoothFonts(ctx, false);
+            CGContextSetRGBFillColor(ctx, (CGFloat)(tc & 0xFFU) / 255.0,
+                                     (CGFloat)((tc >> 8) & 0xFFU) / 255.0,
+                                     (CGFloat)((tc >> 16) & 0xFFU) / 255.0, 1.0);
+            CGFloat pen_x = (CGFloat)x;
+            CGFloat base_y = (CGFloat)bh - (CGFloat)(y + asc);
+            for (int i = 0; i < count; i++) {
+                if (glyphs[i]) {
+                    CGPoint pt = CGPointMake(pen_x, base_y);
+                    CTFontDrawGlyphs(ct, &glyphs[i], &pt, 1, ctx);
+                }
+                CGSize adv = {0, 0};
+                CTFontGetAdvancesForGlyphs(ct, kCTFontOrientationHorizontal, &glyphs[i], &adv, 1);
+                pen_x += adv.width;
+            }
+            CGContextRelease(ctx);
+            if (ta & 1) {
+                pthread_mutex_lock(&g_gdi_mu);
+                GdiDC *dc2 = gdi_dc_get(hdc);
+                if (dc2) dc2->cur_x = (int32_t)llround(pen_x);
+                pthread_mutex_unlock(&g_gdi_mu);
+            }
+        }
+    }
+    if (ct) CFRelease(ct);
+    c->rax = 1;
+}
+static void w_ExtTextOutA(CPU64 *c, void *ud) { (void)ud; gdi_ext_text_out(c, 0); }
+static void w_ExtTextOutW(CPU64 *c, void *ud) { (void)ud; gdi_ext_text_out(c, 1); }
+
 static void w_GetGlyphOutlineA(CPU64 *c, void *ud) {
     (void)ud;
+    uint64_t hdc = c->rcx;
+    uint32_t uChar = (uint32_t)c->rdx;
+    uint32_t fuFormat = (uint32_t)c->r8;
     uint64_t gm = c->r9;
     uint32_t cb = (uint32_t)win64_arg_i(c, 4);
     uint64_t buf = win64_arg_i(c, 5);
+
+    pthread_mutex_lock(&g_gdi_mu);
+    GdiDC *dc = gdi_dc_get(hdc);
+    GdiFont *f = dc ? gdi_font_get(dc->hfont) : NULL;
+    CTFontRef ct = f ? (CTFontRef)CFRetain(f->ct) : NULL;
+    pthread_mutex_unlock(&g_gdi_mu);
+
+    if (!ct) {
+        if (gm) {
+            memset((void *)(uintptr_t)gm, 0, 20);
+            W32(gm + 0, 8); W32(gm + 4, 14); W32(gm + 8, 0); W32(gm + 12, 13);
+            W16(gm + 16, 9); W16(gm + 18, 0);
+        }
+        uint32_t need = 8 * 14;
+        if (buf && cb >= need) memset((void *)(uintptr_t)buf, 0, need);
+        c->rax = need;
+        return;
+    }
+
+    UniChar uc = (UniChar)(uChar & 0xFFFFU);
+    CGGlyph g = 0;
+    CTFontGetGlyphsForCharacters(ct, &uc, &g, 1);
+    CGSize adv = {0, 0};
+    CGRect bb = CGRectZero;
+    if (g) {
+        CTFontGetAdvancesForGlyphs(ct, kCTFontOrientationHorizontal, &g, &adv, 1);
+        CTFontGetBoundingRectsForGlyphs(ct, kCTFontOrientationHorizontal, &g, &bb, 1);
+    }
+    int32_t gx = (bb.size.width > 0.001) ? (int32_t)floor(bb.origin.x) : 0;
+    int32_t gy = (bb.size.height > 0.001) ? (int32_t)ceil(bb.origin.y + bb.size.height) : 0;
+    int32_t bw = (bb.size.width > 0.001) ? (int32_t)ceil(bb.origin.x + bb.size.width) - gx : 0;
+    int32_t bh = (bb.size.height > 0.001) ? gy - (int32_t)floor(bb.origin.y) : 0;
+    if (bw < 0) bw = 0;
+    if (bh < 0) bh = 0;
+
     if (gm) {
         memset((void *)(uintptr_t)gm, 0, 20);
-        W32(gm + 0, 8); W32(gm + 4, 14); W32(gm + 8, 0); W32(gm + 12, 13);
-        W16(gm + 16, 9); W16(gm + 18, 0);
+        W32(gm + 0, (uint32_t)bw);
+        W32(gm + 4, (uint32_t)bh);
+        W32(gm + 8, (uint32_t)gx);
+        W32(gm + 12, (uint32_t)gy);
+        W16(gm + 16, (uint16_t)(int16_t)llround(adv.width));
+        W16(gm + 18, 0);
     }
-    uint32_t need = 8 * 14;
-    if (buf && cb >= need) memset((void *)(uintptr_t)buf, 0, need);
+
+    uint32_t fmt = fuFormat & 0x7FU;
+    if (fmt == 0 /* GGO_METRICS */ || bw == 0 || bh == 0) {
+        CFRelease(ct);
+        c->rax = 0;
+        return;
+    }
+    uint32_t pitch = (fmt == 1 /* GGO_BITMAP */) ? (uint32_t)(((bw + 31) / 32) * 4) : (uint32_t)((bw + 3) & ~3);
+    uint32_t need = pitch * (uint32_t)bh;
+    if (!buf || cb == 0) {
+        CFRelease(ct);
+        c->rax = need;
+        return;
+    }
+    if (cb < need) {
+        CFRelease(ct);
+        c->rax = 0xFFFFFFFFULL; /* GDI_ERROR */
+        return;
+    }
+
+    uint32_t gray_pitch = (uint32_t)((bw + 3) & ~3);
+    uint8_t *tmp = (uint8_t *)calloc((size_t)gray_pitch, (size_t)bh);
+    if (tmp) {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+        CGContextRef ctx = CGBitmapContextCreate(tmp, (size_t)bw, (size_t)bh, 8, gray_pitch, cs, kCGImageAlphaNone);
+        CGColorSpaceRelease(cs);
+        if (ctx) {
+            CGContextSetAllowsAntialiasing(ctx, fmt != 1);
+            CGContextSetShouldAntialias(ctx, fmt != 1);
+            CGContextSetAllowsFontSmoothing(ctx, false);
+            CGContextSetShouldSmoothFonts(ctx, false);
+            CGContextSetGrayFillColor(ctx, 1.0, 1.0);
+            CGPoint pt = CGPointMake((CGFloat)(-gx), (CGFloat)(bh - gy));
+            CTFontDrawGlyphs(ct, &g, &pt, 1, ctx);
+            CGContextRelease(ctx);
+        }
+        uint8_t *dst = (uint8_t *)(uintptr_t)buf;
+        memset(dst, 0, need);
+        if (fmt == 1) {
+            for (int y = 0; y < bh; y++) {
+                for (int x = 0; x < bw; x++) {
+                    if (tmp[(size_t)y * gray_pitch + (size_t)x] >= 128)
+                        dst[(size_t)y * pitch + (size_t)(x >> 3)] |= (uint8_t)(0x80U >> (x & 7));
+                }
+            }
+        } else {
+            uint32_t maxv = (fmt == 4) ? 4U : (fmt == 5) ? 16U : 64U;
+            for (int y = 0; y < bh; y++) {
+                for (int x = 0; x < bw; x++) {
+                    uint32_t v = tmp[(size_t)y * gray_pitch + (size_t)x];
+                    dst[(size_t)y * pitch + (size_t)x] = (uint8_t)((v * maxv + 127U) / 255U);
+                }
+            }
+        }
+        free(tmp);
+    }
+    CFRelease(ct);
     c->rax = need;
+}
+
+static void w_RtlUnwindEx(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t exc_rec = c->r8;
+    uint64_t retval = c->r9;
+    if (exc_rec && R32(exc_rec) == 0x80000026U /* STATUS_LONGJUMP */) {
+        uint64_t jmpbuf_va = R64(exc_rec + 0x20);
+        rt_longjmp_unwind(c, jmpbuf_va, retval);
+    }
+    c->rax = 0;
+}
+static void w_longjmp(CPU64 *c, void *ud) {
+    (void)ud;
+    rt_longjmp_unwind(c, c->rcx, c->rdx);
+    c->rax = 0;
 }
 static void w_GetKeyboardLayout(CPU64 *c, void *ud) { (void)ud; c->rax = 0x04090409ULL; }
 static void w_GetKeyboardLayoutList(CPU64 *c, void *ud) {
@@ -1838,6 +2500,14 @@ static void w_SetCursorPos(CPU64 *c, void *ud) {
 static void w_ShowCursor(CPU64 *c, void *ud) {
     (void)ud;
     c->rax = (uint64_t)(int64_t)win32_show_cursor((int)c->rcx);
+}
+static uint64_t g_last_hcursor = 1;
+static void w_SetCursor(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t prev = g_last_hcursor;
+    g_last_hcursor = c->rcx;
+    win32_show_cursor(c->rcx != 0);
+    c->rax = prev;
 }
 static void w_GetRawInputData(CPU64 *c, void *ud) {
     (void)ud;
@@ -1930,7 +2600,7 @@ typedef struct {
 } XA2SourceVoice;
 
 static uint64_t g_vt_mm_enum[8], g_vt_mm_coll[8], g_vt_mm_dev[8], g_vt_prop_store[8];
-static uint64_t g_vt_xa2[16], g_vt_xa2_master[24], g_vt_xa2_source[32];
+static uint64_t g_vt_xa2[16], g_vt_xa2_27[16], g_vt_xa2_master[24], g_vt_xa2_27_master[24], g_vt_xa2_source[32];
 static int      g_audio_vt_ready = 0;
 static AudioComObj g_mm_enum_obj, g_mm_coll_obj, g_mm_dev_obj, g_prop_store_obj;
 static XA2SourceVoice *g_active_xa2_voice = NULL;
@@ -2042,16 +2712,48 @@ void win32_poll_audio_callbacks(CPU64 *c) {
 }
 
 static void xa2_CreateMasteringVoice(CPU64 *c, void *ud) {
-    (void)ud;
+    int is_27 = (ud != NULL);
     uint64_t pp = c->rdx;
     uint32_t ch = (uint32_t)c->r8;
     uint32_t hz = (uint32_t)c->r9;
     XA2MasterVoice *mv = (XA2MasterVoice *)calloc(1, sizeof(XA2MasterVoice));
-    mv->lpVtbl = g_vt_xa2_master;
+    mv->lpVtbl = is_27 ? g_vt_xa2_27_master : g_vt_xa2_master;
     mv->channels = ch ? ch : 2;
     mv->sample_rate = hz ? hz : 44100;
     if (pp) W64(pp, (uint64_t)(uintptr_t)mv);
     c->rax = 0;
+}
+static void xa27_GetDeviceCount(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W32(c->rdx, 1);
+    c->rax = 0;
+}
+static void xa27_GetDeviceDetails(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t out = c->r8;
+    if (!out) { c->rax = 0x80070057ULL; return; }
+    memset((void *)(uintptr_t)out, 0, 0x430);
+    const char *id = "default";
+    const char *nm = "Apple Silicon Audio";
+    for (int i = 0; id[i]; i++) W16(out + (uint64_t)i * 2ULL, (uint8_t)id[i]);
+    for (int i = 0; nm[i]; i++) W16(out + 0x200ULL + (uint64_t)i * 2ULL, (uint8_t)nm[i]);
+    W32(out + 0x400, 0x0FU);   /* GlobalDefaultDevice */
+    W16(out + 0x404, 1);       /* WAVE_FORMAT_PCM */
+    W16(out + 0x406, 2);       /* nChannels = 2 */
+    W32(out + 0x408, 44100);   /* nSamplesPerSec */
+    W32(out + 0x40C, 176400);  /* nAvgBytesPerSec */
+    W16(out + 0x410, 4);       /* nBlockAlign */
+    W16(out + 0x412, 16);      /* wBitsPerSample */
+    c->rax = 0;
+}
+static void xa27m_GetVoiceDetails(CPU64 *c, void *ud) {
+    (void)ud;
+    XA2MasterVoice *mv = (XA2MasterVoice *)(uintptr_t)c->rcx;
+    if (c->rdx && mv) {
+        W32(c->rdx + 0, 0);
+        W32(c->rdx + 4, mv->channels);
+        W32(c->rdx + 8, mv->sample_rate);
+    }
 }
 static void xa2_CreateSourceVoice(CPU64 *c, void *ud) {
     (void)ud;
@@ -2214,11 +2916,11 @@ static void init_audio_vtables(void) {
     uint64_t t_ok   = rt_alloc_dynamic_thunk("Audio::OK", ac_ok, NULL);
     uint64_t t_void = rt_alloc_dynamic_thunk("Audio::Void", ac_void, NULL);
     for (int i = 0; i < 8; i++)  { g_vt_mm_enum[i] = t_ok; g_vt_mm_coll[i] = t_ok; g_vt_mm_dev[i] = t_ok; g_vt_prop_store[i] = t_ok; }
-    for (int i = 0; i < 16; i++) g_vt_xa2[i] = t_ok;
-    for (int i = 0; i < 24; i++) g_vt_xa2_master[i] = t_ok;
+    for (int i = 0; i < 16; i++) { g_vt_xa2[i] = t_ok; g_vt_xa2_27[i] = t_ok; }
+    for (int i = 0; i < 24; i++) { g_vt_xa2_master[i] = t_ok; g_vt_xa2_27_master[i] = t_ok; }
     for (int i = 0; i < 32; i++) g_vt_xa2_source[i] = t_ok;
     #define IUNK(vt) do { (vt)[0]=t_qi; (vt)[1]=t_add; (vt)[2]=t_rel; } while(0)
-    IUNK(g_vt_mm_enum); IUNK(g_vt_mm_coll); IUNK(g_vt_mm_dev); IUNK(g_vt_prop_store); IUNK(g_vt_xa2);
+    IUNK(g_vt_mm_enum); IUNK(g_vt_mm_coll); IUNK(g_vt_mm_dev); IUNK(g_vt_prop_store); IUNK(g_vt_xa2); IUNK(g_vt_xa2_27);
     #undef IUNK
     g_vt_mm_enum[3] = rt_alloc_dynamic_thunk("IMMDeviceEnumerator::EnumAudioEndpoints", mme_EnumAudioEndpoints, NULL);
     g_vt_mm_enum[4] = rt_alloc_dynamic_thunk("IMMDeviceEnumerator::GetDefaultAudioEndpoint", mme_GetDefaultAudioEndpoint, NULL);
@@ -2241,9 +2943,21 @@ static void init_audio_vtables(void) {
     g_vt_xa2[11] = rt_alloc_dynamic_thunk("IXAudio2::GetPerformanceData", xa2_GetPerfData, NULL);
     g_vt_xa2[12] = t_void;
 
+    g_vt_xa2_27[3]  = rt_alloc_dynamic_thunk("IXAudio2_27::GetDeviceCount", xa27_GetDeviceCount, NULL);
+    g_vt_xa2_27[4]  = rt_alloc_dynamic_thunk("IXAudio2_27::GetDeviceDetails", xa27_GetDeviceDetails, NULL);
+    g_vt_xa2_27[7]  = t_void;
+    g_vt_xa2_27[8]  = g_vt_xa2[5];
+    g_vt_xa2_27[10] = rt_alloc_dynamic_thunk("IXAudio2_27::CreateMasteringVoice", xa2_CreateMasteringVoice, (void *)1);
+    g_vt_xa2_27[12] = t_void;
+    g_vt_xa2_27[14] = g_vt_xa2[11];
+    g_vt_xa2_27[15] = t_void;
+
     g_vt_xa2_master[0]  = rt_alloc_dynamic_thunk("IXAudio2MasteringVoice::GetVoiceDetails", xa2m_GetVoiceDetails, NULL);
     g_vt_xa2_master[18] = t_void;
     g_vt_xa2_master[19] = rt_alloc_dynamic_thunk("IXAudio2MasteringVoice::GetChannelMask", xa2m_GetChannelMask, NULL);
+
+    g_vt_xa2_27_master[0]  = rt_alloc_dynamic_thunk("IXAudio2MasteringVoice27::GetVoiceDetails", xa27m_GetVoiceDetails, NULL);
+    g_vt_xa2_27_master[18] = t_void;
 
     g_vt_xa2_source[0]  = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::GetVoiceDetails", xa2s_GetVoiceDetails, NULL);
     g_vt_xa2_source[12] = rt_alloc_dynamic_thunk("IXAudio2SourceVoice::SetVolume", xa2s_SetVolume, NULL);
@@ -2287,9 +3001,22 @@ static void w_CoCreateInstance(CPU64 *c, void *ud) {
     static const uint8_t k_mmdev[16] = {
         0x95,0x03,0xDE,0xBC, 0x2F,0xE5, 0x7C,0x46, 0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E
     };
+    /* CLSID_XAudio2 (2.7) = {5A508685-A254-4FBA-9B82-9A24B00306AF} */
+    static const uint8_t k_xa2_27[16] = {
+        0x85,0x86,0x50,0x5A, 0x54,0xA2, 0xBA,0x4F, 0x9B,0x82,0x9A,0x24,0xB0,0x03,0x06,0xAF
+    };
     if (clsid_va && memcmp((const void *)(uintptr_t)clsid_va, k_mmdev, 16) == 0) {
         init_audio_vtables();
         if (ppv) W64(ppv, (uint64_t)(uintptr_t)&g_mm_enum_obj);
+        c->rax = 0; /* S_OK */
+        return;
+    }
+    if (clsid_va && memcmp((const void *)(uintptr_t)clsid_va, k_xa2_27, 16) == 0) {
+        init_audio_vtables();
+        AudioComObj *xa = (AudioComObj *)calloc(1, sizeof(AudioComObj));
+        xa->lpVtbl = g_vt_xa2_27;
+        if (ppv) W64(ppv, (uint64_t)(uintptr_t)xa);
+        if (getenv("ELF64_IO_LOG")) fprintf(stderr, "[audio] CoCreateInstance(CLSID_XAudio2_27) -> %p\n", (void *)xa);
         c->rax = 0; /* S_OK */
         return;
     }
@@ -2469,6 +3196,897 @@ static void w_GetWindowInfo(CPU64 *c, void *ud) {
     c->rax = 1;
 }
 
+/* ---- Team Fortress 2 / Source 1 x64: MSVCRT, SDL2, Kernel32, User32, Winsock1 ---- */
+static uint8_t g_win_iob[3 * 48];
+static void w_iob_func(CPU64 *c, void *ud) {
+    (void)ud;
+    W32((uint64_t)(uintptr_t)&g_win_iob[0 * 48 + 24], 0);
+    W32((uint64_t)(uintptr_t)&g_win_iob[1 * 48 + 24], 1);
+    W32((uint64_t)(uintptr_t)&g_win_iob[2 * 48 + 24], 2);
+    c->rax = (uint64_t)(uintptr_t)g_win_iob;
+}
+static FILE *win_file_ptr(uint64_t va) {
+    if (!va) return NULL;
+    uint64_t base = (uint64_t)(uintptr_t)g_win_iob;
+    if (va == base + 0 * 48) return stdin;
+    if (va == base + 1 * 48) return stdout;
+    if (va == base + 2 * 48) return stderr;
+    return (FILE *)(uintptr_t)va;
+}
+static void w_lc_codepage_func(CPU64 *c, void *ud) { (void)ud; c->rax = 65001; }
+static void w_mb_cur_max_func(CPU64 *c, void *ud)  { (void)ud; c->rax = 4; }
+static void w_aligned_malloc(CPU64 *c, void *ud) {
+    (void)ud;
+    size_t sz = c->rcx ? (size_t)c->rcx : 16;
+    size_t al = (c->rdx >= 16 && (c->rdx & (c->rdx - 1)) == 0) ? (size_t)c->rdx : 16;
+    void *p = NULL;
+    if (posix_memalign(&p, al, sz) != 0) p = NULL;
+    c->rax = (uint64_t)(uintptr_t)p;
+}
+static void w_aligned_free(CPU64 *c, void *ud) { (void)ud; if (c->rcx) free((void *)(uintptr_t)c->rcx); }
+static void w_errno_ptr(CPU64 *c, void *ud)    { (void)ud; c->rax = (uint64_t)(uintptr_t)&errno; }
+static void w_fdopen(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)(uintptr_t)fdopen((int)c->rcx, c->rdx ? (const char *)(uintptr_t)c->rdx : "r");
+}
+static void w_fileno(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    c->rax = f ? (uint64_t)(uint32_t)fileno(f) : (uint64_t)-1LL;
+}
+static void w_filelengthi64(CPU64 *c, void *ud) {
+    (void)ud;
+    struct stat st;
+    c->rax = (fstat((int)c->rcx, &st) == 0) ? (uint64_t)st.st_size : (uint64_t)-1LL;
+}
+static void w_fstat64(CPU64 *c, void *ud) {
+    (void)ud;
+    struct stat st;
+    if (!c->rdx || fstat((int)c->rcx, &st) != 0) { c->rax = (uint64_t)-1LL; return; }
+    memset((void *)(uintptr_t)c->rdx, 0, 56);
+    W16(c->rdx + 6, (uint16_t)st.st_mode);
+    W16(c->rdx + 8, 1);
+    W64(c->rdx + 24, (uint64_t)st.st_size);
+    W64(c->rdx + 32, (uint64_t)st.st_atimespec.tv_sec);
+    W64(c->rdx + 40, (uint64_t)st.st_mtimespec.tv_sec);
+    W64(c->rdx + 48, (uint64_t)st.st_ctimespec.tv_sec);
+    c->rax = 0;
+}
+static void w_gmtime64(CPU64 *c, void *ud) {
+    (void)ud;
+    static int32_t win_tm[9];
+    time_t t = c->rcx ? (time_t)R64(c->rcx) : time(NULL);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    win_tm[0] = tm.tm_sec; win_tm[1] = tm.tm_min; win_tm[2] = tm.tm_hour;
+    win_tm[3] = tm.tm_mday; win_tm[4] = tm.tm_mon; win_tm[5] = tm.tm_year;
+    win_tm[6] = tm.tm_wday; win_tm[7] = tm.tm_yday; win_tm[8] = tm.tm_isdst;
+    c->rax = (uint64_t)(uintptr_t)win_tm;
+}
+static void w_initterm(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t cur = c->rcx, end = c->rdx;
+    for (; cur < end; cur += 8) {
+        uint64_t fn = R64(cur);
+        if (fn > 0x10000ULL) rt_invoke_win64(c, fn, 0, 0, 0, 0, 0, 0);
+    }
+    c->rax = 0;
+}
+static void w_lseeki64(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)lseek((int)c->rcx, (off_t)c->rdx, (int)c->r8);
+}
+static void w_crt_read(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)read((int)c->rcx, (void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8);
+}
+static void w_crt_write(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)write((int)c->rcx, (const void *)(uintptr_t)c->rdx, (size_t)(uint32_t)c->r8);
+}
+static void w_strdup(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = c->rcx ? (uint64_t)(uintptr_t)strdup((const char *)(uintptr_t)c->rcx) : 0;
+}
+static void w_ultoa(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t v = (uint32_t)c->rcx;
+    char *dst = (char *)(uintptr_t)c->rdx;
+    int radix = (int)c->r8;
+    if (dst) {
+        if (radix == 16) snprintf(dst, 32, "%x", v);
+        else snprintf(dst, 32, "%u", v);
+    }
+    c->rax = c->rdx;
+}
+static void w_wcslen(CPU64 *c, void *ud) {
+    (void)ud;
+    const uint16_t *s = (const uint16_t *)(uintptr_t)c->rcx;
+    size_t n = 0;
+    if (s) while (s[n]) n++;
+    c->rax = n;
+}
+static void w_wcscmp(CPU64 *c, void *ud) {
+    (void)ud;
+    const uint16_t *a = (const uint16_t *)(uintptr_t)c->rcx;
+    const uint16_t *b = (const uint16_t *)(uintptr_t)c->rdx;
+    if (!a || !b) { c->rax = a ? 1 : (b ? (uint64_t)-1LL : 0); return; }
+    while (*a && *a == *b) { a++; b++; }
+    c->rax = (uint64_t)(int64_t)((int)*a - (int)*b);
+}
+static void w_wcsicmp(CPU64 *c, void *ud) {
+    (void)ud;
+    const uint16_t *a = (const uint16_t *)(uintptr_t)c->rcx;
+    const uint16_t *b = (const uint16_t *)(uintptr_t)c->rdx;
+    if (!a || !b) { c->rax = a ? 1 : (b ? (uint64_t)-1LL : 0); return; }
+    while (*a && towlower(*a) == towlower(*b)) { a++; b++; }
+    c->rax = (uint64_t)(int64_t)((int)towlower(*a) - (int)towlower(*b));
+}
+static void w_wcsxfrm(CPU64 *c, void *ud) {
+    (void)ud;
+    uint16_t *dst = (uint16_t *)(uintptr_t)c->rcx;
+    const uint16_t *src = (const uint16_t *)(uintptr_t)c->rdx;
+    size_t cap = (size_t)c->r8, n = 0;
+    if (src) while (src[n]) { if (dst && n + 1 < cap) dst[n] = src[n]; n++; }
+    if (dst && cap) dst[n < cap ? n : cap - 1] = 0;
+    c->rax = n;
+}
+static void w_wcsftime(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx && c->rdx) W16(c->rcx, 0);
+    c->rax = 0;
+}
+static void w_wfopen(CPU64 *c, void *ud) {
+    (void)ud;
+    char u8[1024], px[1024], mode[32], cmode[16];
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, u8, sizeof(u8));
+    win_path_to_posix(u8, px, sizeof(px));
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rdx, mode, sizeof(mode));
+    size_t j = 0;
+    for (size_t i = 0; mode[i] && j + 1 < sizeof(cmode); i++) {
+        char ch = mode[i];
+        if (ch == 'r' || ch == 'w' || ch == 'a' || ch == '+' || ch == 'b') cmode[j++] = ch;
+    }
+    if (!j) cmode[j++] = 'r';
+    cmode[j] = '\0';
+    c->rax = (uint64_t)(uintptr_t)fopen(px, cmode);
+}
+static void w_atof(CPU64 *c, void *ud) {
+    (void)ud;
+    c->xmm[0].df[0] = c->rcx ? atof((const char *)(uintptr_t)c->rcx) : 0.0;
+}
+static void w_ferror(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    c->rax = f ? (uint64_t)(uint32_t)ferror(f) : 0;
+}
+static void w_fgetpos(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    if (!f || !c->rdx) { c->rax = (uint64_t)-1LL; return; }
+    W64(c->rdx, (uint64_t)ftello(f));
+    c->rax = 0;
+}
+static void w_fsetpos(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    if (!f || !c->rdx) { c->rax = (uint64_t)-1LL; return; }
+    c->rax = (uint64_t)(int64_t)fseeko(f, (off_t)R64(c->rdx), SEEK_SET);
+}
+static void w_fputc(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rdx);
+    c->rax = f ? (uint64_t)(int64_t)fputc((int)c->rcx, f) : (uint64_t)-1LL;
+}
+static void w_getc(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    c->rax = f ? (uint64_t)(int64_t)getc(f) : (uint64_t)-1LL;
+}
+static void w_ungetc(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rdx);
+    c->rax = f ? (uint64_t)(int64_t)ungetc((int)c->rcx, f) : (uint64_t)-1LL;
+}
+static void w_setvbuf(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    if (!f) { c->rax = (uint64_t)-1LL; return; }
+    int mode = (c->r8 == 4 /* _IONBF */) ? _IONBF : ((c->r8 == 64) ? _IOLBF : _IOFBF);
+    c->rax = (uint64_t)(int64_t)setvbuf(f, (char *)(uintptr_t)c->rdx, mode, (size_t)c->r9);
+}
+static void w_vfprintf(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    const char *fmt = (const char *)(uintptr_t)c->rdx;
+    if (!f || !fmt) { c->rax = 0; return; }
+    c->rax = (uint64_t)(int64_t)fputs(fmt, f);
+}
+static void w_remove(CPU64 *c, void *ud) {
+    (void)ud;
+    char px[1024];
+    win_path_to_posix((const char *)(uintptr_t)c->rcx, px, sizeof(px));
+    c->rax = (uint64_t)(int64_t)remove(px);
+}
+static void w_setlocale(CPU64 *c, void *ud) {
+    (void)ud;
+    static const char *c_loc = "C";
+    c->rax = (uint64_t)(uintptr_t)c_loc;
+}
+static void w_localeconv(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)(uintptr_t)localeconv();
+}
+static void w_strerror(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)(uintptr_t)strerror((int)c->rcx);
+}
+static void w_strcoll(CPU64 *c, void *ud) {
+    (void)ud;
+    const char *a = (const char *)(uintptr_t)c->rcx;
+    const char *b = (const char *)(uintptr_t)c->rdx;
+    c->rax = (a && b) ? (uint64_t)(int64_t)strcmp(a, b) : 0;
+}
+static void w_strxfrm(CPU64 *c, void *ud) {
+    (void)ud;
+    char *dst = (char *)(uintptr_t)c->rcx;
+    const char *src = (const char *)(uintptr_t)c->rdx;
+    size_t cap = (size_t)c->r8;
+    size_t n = src ? strlen(src) : 0;
+    if (dst && cap) {
+        size_t cp = (n < cap - 1) ? n : cap - 1;
+        if (src) memcpy(dst, src, cp);
+        dst[cp] = '\0';
+    }
+    c->rax = n;
+}
+static void w_strftime(CPU64 *c, void *ud) {
+    (void)ud;
+    char *s = (char *)(uintptr_t)c->rcx;
+    size_t mx = (size_t)c->rdx;
+    const char *fmt = (const char *)(uintptr_t)c->r8;
+    if (!s || !mx || !fmt || !c->r9) { c->rax = 0; return; }
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_sec   = (int)R32(c->r9 + 0);
+    tm.tm_min   = (int)R32(c->r9 + 4);
+    tm.tm_hour  = (int)R32(c->r9 + 8);
+    tm.tm_mday  = (int)R32(c->r9 + 12);
+    tm.tm_mon   = (int)R32(c->r9 + 16);
+    tm.tm_year  = (int)R32(c->r9 + 20);
+    tm.tm_wday  = (int)R32(c->r9 + 24);
+    tm.tm_yday  = (int)R32(c->r9 + 28);
+    tm.tm_isdst = (int)R32(c->r9 + 32);
+    c->rax = strftime(s, mx, fmt, &tm);
+}
+static void w_towlower(CPU64 *c, void *ud) { (void)ud; c->rax = (uint16_t)towlower((wint_t)(uint16_t)c->rcx); }
+static void w_towupper(CPU64 *c, void *ud) { (void)ud; c->rax = (uint16_t)towupper((wint_t)(uint16_t)c->rcx); }
+static void w_iswctype(CPU64 *c, void *ud) {
+    (void)ud;
+    uint16_t wc = (uint16_t)c->rcx;
+    uint16_t mask = (uint16_t)c->rdx;
+    int r = 0;
+    if ((mask & 0x0103) && iswalpha(wc)) r |= 1;
+    if ((mask & 0x0004) && iswdigit(wc)) r |= 4;
+    if ((mask & 0x0008) && iswspace(wc)) r |= 8;
+    if ((mask & 0x0010) && iswpunct(wc)) r |= 16;
+    if ((mask & 0x0020) && iswcntrl(wc)) r |= 32;
+    if ((mask & 0x0080) && iswxdigit(wc)) r |= 128;
+    c->rax = (uint64_t)r;
+}
+
+/* Kernel32 extras for TF2 */
+static void w_CopyFileA(CPU64 *c, void *ud) {
+    (void)ud;
+    char sp[1024], dp[1024];
+    win_path_to_posix((const char *)(uintptr_t)c->rcx, sp, sizeof(sp));
+    win_path_to_posix((const char *)(uintptr_t)c->rdx, dp, sizeof(dp));
+    int sfd = open(sp, O_RDONLY);
+    if (sfd < 0) { c->rax = 0; return; }
+    int dfd = open(dp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dfd < 0) { close(sfd); c->rax = 0; return; }
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(sfd, buf, sizeof(buf))) > 0) (void)write(dfd, buf, (size_t)n);
+    close(dfd); close(sfd);
+    c->rax = 1;
+}
+static void w_MoveFileExA(CPU64 *c, void *ud) {
+    (void)ud;
+    char sp[1024], dp[1024];
+    win_path_to_posix((const char *)(uintptr_t)c->rcx, sp, sizeof(sp));
+    win_path_to_posix((const char *)(uintptr_t)c->rdx, dp, sizeof(dp));
+    c->rax = (rename(sp, dp) == 0) ? 1 : 0;
+}
+static void w_SetCurrentDirectoryA(CPU64 *c, void *ud) {
+    (void)ud;
+    char px[1024];
+    win_path_to_posix((const char *)(uintptr_t)c->rcx, px, sizeof(px));
+    c->rax = (chdir(px) == 0) ? 1 : 0;
+}
+static void w_GetFullPathNameA(CPU64 *c, void *ud) {
+    (void)ud;
+    const char *src = (const char *)(uintptr_t)c->rcx;
+    uint32_t cap = (uint32_t)c->rdx;
+    char *dst = (char *)(uintptr_t)c->r8;
+    char px[1024], full[1024], win[1024];
+    win_path_to_posix(src, px, sizeof(px));
+    if (px[0] == '/') snprintf(full, sizeof(full), "%s", px);
+    else {
+        char cwd[512];
+        if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "/tmp");
+        snprintf(full, sizeof(full), "%s/%s", cwd, px);
+    }
+    size_t n = posix_to_win_path(full, win, sizeof(win));
+    if (dst && cap > n) {
+        memcpy(dst, win, n + 1);
+        if (c->r9) {
+            char *sl = strrchr(dst, '\\');
+            W64(c->r9, (uint64_t)(uintptr_t)(sl ? sl + 1 : dst));
+        }
+        c->rax = n;
+    } else c->rax = n + 1;
+}
+static void w_GetWindowsDirectoryA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx && c->rdx >= 11) memcpy((void *)(uintptr_t)c->rcx, "C:\\Windows", 11);
+    c->rax = 10;
+}
+static void w_GetEnvironmentVariableW(CPU64 *c, void *ud) {
+    (void)ud;
+    char name[256];
+    w16_to_u8((const uint16_t *)(uintptr_t)c->rcx, name, sizeof(name));
+    const char *val = getenv(name);
+    if (!val) { c->rax = 0; return; }
+    size_t len = strlen(val);
+    if (c->rdx && c->r8 > len) {
+        u8_to_w16(val, (uint16_t *)(uintptr_t)c->rdx, (size_t)c->r8);
+        c->rax = len;
+    } else c->rax = len + 1;
+}
+static void w_GetModuleHandleExA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint32_t flags = (uint32_t)c->rcx;
+    uint64_t base = 0;
+    if (flags & 4 /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */) {
+        for (size_t i = 0; i < g_rt_module_count; i++) {
+            if (c->rdx >= g_rt_modules[i].map_addr && c->rdx < g_rt_modules[i].map_addr + g_rt_modules[i].mem_size) {
+                base = g_rt_modules[i].map_addr;
+                break;
+            }
+        }
+        if (!base && g_rt_module_count) base = g_rt_modules[0].map_addr;
+    } else {
+        const char *name = (const char *)(uintptr_t)c->rdx;
+        base = rt_find_module_base(name);
+        if (!base && name) base = 0x7090000000ULL;
+    }
+    if (c->r8) W64(c->r8, base);
+    c->rax = base ? 1 : 0;
+}
+static void w_GetLogicalProcessorInformation(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rdx) { c->rax = 0; return; }
+    uint32_t cap = R32(c->rdx);
+    W32(c->rdx, 32);
+    if (!c->rcx || cap < 32) { c->rax = 0; return; }
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 4;
+    if (n > 63) n = 63;
+    memset((void *)(uintptr_t)c->rcx, 0, 32);
+    W64(c->rcx + 0, (1ULL << n) - 1ULL);
+    W32(c->rcx + 8, 0 /* RelationProcessorCore */);
+    c->rax = 1;
+}
+static void w_GlobalMemoryStatus(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx) return;
+    uint64_t phys = 16ULL * 1024 * 1024 * 1024;
+    memset((void *)(uintptr_t)c->rcx, 0, 56);
+    W32(c->rcx + 0, 56);
+    W32(c->rcx + 4, 25);
+    W64(c->rcx + 8, phys);
+    W64(c->rcx + 16, phys * 3 / 4);
+    W64(c->rcx + 24, phys);
+    W64(c->rcx + 32, phys * 3 / 4);
+    W64(c->rcx + 40, 0x7FFFFFFFFFFFULL);
+    W64(c->rcx + 48, 0x7FFFFFFFFFFFULL);
+}
+static void w_GetTempFileNameA(CPU64 *c, void *ud) {
+    (void)ud;
+    static uint32_t seq = 1;
+    if (c->r9) snprintf((char *)(uintptr_t)c->r9, 260, "C:\\tmp\\tf2_%u.tmp", seq++);
+    c->rax = seq;
+}
+static void w_FileTimeToLocalFileTime(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx && c->rdx) W64(c->rdx, R64(c->rcx));
+    c->rax = 1;
+}
+static void w_FileTimeToDosDateTime(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rdx) W16(c->rdx, 0x5421);
+    if (c->r8)  W16(c->r8, 0x6000);
+    c->rax = 1;
+}
+static void w_GetDateFormatA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t out = win64_arg_i(c, 4);
+    int cap = (int)win64_arg_i(c, 5);
+    if (out && cap >= 11) memcpy((void *)(uintptr_t)out, "2026-11-22", 11);
+    c->rax = 11;
+}
+static void w_GetTimeFormatA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t out = win64_arg_i(c, 4);
+    int cap = (int)win64_arg_i(c, 5);
+    if (out && cap >= 9) memcpy((void *)(uintptr_t)out, "12:00:00", 9);
+    c->rax = 9;
+}
+static void w_lstrcpyA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx && c->rdx) strcpy((char *)(uintptr_t)c->rcx, (const char *)(uintptr_t)c->rdx);
+    c->rax = c->rcx;
+}
+static void w_lstrcatA(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx && c->rdx) strcat((char *)(uintptr_t)c->rcx, (const char *)(uintptr_t)c->rdx);
+    c->rax = c->rcx;
+}
+
+/* User32 extras for TF2 & DXVK */
+static void w_SetRect(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) {
+        W32(c->rcx + 0, (uint32_t)c->rdx);
+        W32(c->rcx + 4, (uint32_t)c->r8);
+        W32(c->rcx + 8, (uint32_t)c->r9);
+        W32(c->rcx + 12, (uint32_t)win64_arg_i(c, 4));
+    }
+    c->rax = 1;
+}
+static void w_OffsetRect(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx) {
+        int32_t dx = (int32_t)c->rdx, dy = (int32_t)c->r8;
+        W32(c->rcx + 0, (uint32_t)((int32_t)R32(c->rcx + 0) + dx));
+        W32(c->rcx + 4, (uint32_t)((int32_t)R32(c->rcx + 4) + dy));
+        W32(c->rcx + 8, (uint32_t)((int32_t)R32(c->rcx + 8) + dx));
+        W32(c->rcx + 12, (uint32_t)((int32_t)R32(c->rcx + 12) + dy));
+    }
+    c->rax = 1;
+}
+static void w_MonitorFromPoint(CPU64 *c, void *ud) { (void)ud; c->rax = 0x60001ULL; }
+static void w_EnumDisplayMonitors(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t fn = c->r8, data = c->r9;
+    if (fn > 0x10000ULL) {
+        int dw = 1920, dh = 1080;
+        win32_desktop_size(&dw, &dh);
+        int32_t rc[4] = { 0, 0, dw, dh };
+        rt_invoke_win64(c, fn, 0x60001ULL, 0, (uint64_t)(uintptr_t)rc, data, 0, 0);
+    }
+    c->rax = 1;
+}
+static void w_GetMonitorInfoW(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rdx) { c->rax = 0; return; }
+    uint32_t cb = R32(c->rdx);
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    W32(c->rdx + 4, 0);  W32(c->rdx + 8, 0);  W32(c->rdx + 12, (uint32_t)dw); W32(c->rdx + 16, (uint32_t)dh);
+    W32(c->rdx + 20, 0); W32(c->rdx + 24, 0); W32(c->rdx + 28, (uint32_t)dw); W32(c->rdx + 32, (uint32_t)dh);
+    W32(c->rdx + 36, 1 /* MONITORINFOF_PRIMARY */);
+    if (cb >= 104) u8_to_w16("\\\\.\\DISPLAY1", (uint16_t *)(uintptr_t)(c->rdx + 40), 32);
+    c->rax = 1;
+}
+static void w_EnumDisplayDevicesA(CPU64 *c, void *ud) {
+    (void)ud;
+    if ((uint32_t)c->rdx != 0 || !c->r8) { c->rax = 0; return; }
+    uint32_t cb = R32(c->r8);
+    memset((void *)(uintptr_t)c->r8, 0, cb ? cb : 424);
+    W32(c->r8 + 0, cb ? cb : 424);
+    snprintf((char *)(uintptr_t)(c->r8 + 4), 32, "\\\\.\\DISPLAY1");
+    snprintf((char *)(uintptr_t)(c->r8 + 36), 128, "Apple Silicon GPU");
+    W32(c->r8 + 164, 0x5 /* DISPLAY_DEVICE_ACTIVE | DISPLAY_DEVICE_PRIMARY_DEVICE */);
+    c->rax = 1;
+}
+static void w_EnumDisplaySettingsW(CPU64 *c, void *ud) {
+    (void)ud;
+    int idx = (int)c->rdx;
+    uint64_t dm = c->r8;
+    int dw = 1920, dh = 1080;
+    win32_desktop_size(&dw, &dh);
+    static const int modes[][2] = {
+        {1920, 1080}, {1600, 900}, {1366, 768}, {1280, 720},
+        {1440, 900},  {1280, 800}, {1024, 768}, {800, 600}
+    };
+    int w = dw, h = dh;
+    if (idx >= 0) {
+        if (idx >= 8) { c->rax = 0; return; }
+        w = (idx == 0) ? dw : modes[idx][0];
+        h = (idx == 0) ? dh : modes[idx][1];
+    }
+    if (dm) {
+        memset((void *)(uintptr_t)dm, 0, 220);
+        W16(dm + 68, 220);
+        W32(dm + 72, 0x5C0000);
+        W32(dm + 168, 32);
+        W32(dm + 172, (uint32_t)w);
+        W32(dm + 176, (uint32_t)h);
+        W32(dm + 184, 60);
+    }
+    c->rax = 1;
+}
+static void w_ret_err87(CPU64 *c, void *ud) { (void)ud; c->rax = 87; /* ERROR_INVALID_PARAMETER */ }
+static void w_AllocateLocallyUniqueId(CPU64 *c, void *ud) {
+    (void)ud;
+    static uint64_t seq = 0x1000;
+    if (c->rcx) W64(c->rcx, ++seq);
+    c->rax = 1;
+}
+static void w_RegCreateKeyExA(CPU64 *c, void *ud) {
+    (void)ud;
+    uint64_t phk  = win64_arg_i(c, 7);
+    uint64_t disp = win64_arg_i(c, 8);
+    if (phk)  W64(phk, 0x70001ULL);
+    if (disp) W32(disp, 1 /* REG_CREATED_NEW_KEY */);
+    c->rax = 0; /* ERROR_SUCCESS */
+}
+
+/* Winsock1 extras (connect, ioctlsocket, gethostbyname) */
+static void w_wsa_connect(CPU64 *c, void *ud) {
+    (void)ud;
+    struct sockaddr_storage ss;
+    int len = (int)c->r8;
+    win_to_bsd_sa((const uint8_t *)(uintptr_t)c->rdx, len, &ss);
+    int r = connect((int)c->rcx, (struct sockaddr *)&ss, (socklen_t)len);
+    if (r < 0) g_wsa_err = posix_to_wsa_err(errno);
+    c->rax = (uint64_t)(int64_t)r;
+}
+static void w_wsa_ioctlsocket(CPU64 *c, void *ud) {
+    (void)ud;
+    int fd = (int)c->rcx;
+    uint32_t cmd = (uint32_t)c->rdx;
+    uint32_t arg = c->r8 ? R32(c->r8) : 0;
+    if (cmd == 0x8004667EU /* FIONBIO */) {
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(fd, F_SETFL, arg ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+        c->rax = 0;
+    } else if (cmd == 0x4004667FU /* FIONREAD */) {
+        int n = 0;
+        ioctl(fd, FIONREAD, &n);
+        if (c->r8) W32(c->r8, (uint32_t)n);
+        c->rax = 0;
+    } else c->rax = 0;
+}
+static void w_wsa_gethostbyname(CPU64 *c, void *ud) {
+    (void)ud;
+    g_wsa_err = 11001;
+    c->rax = 0;
+}
+
+/* SDL2.dll Win64 wrappers for launcher.dll / inputsystem.dll */
+static void w_SDL_SetHint(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)SDL_SetHint((const char *)(uintptr_t)c->rcx, (const char *)(uintptr_t)c->rdx);
+}
+static void w_SDL_WasInit(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)SDL_WasInit((Uint32)c->rcx);
+}
+static void w_SDL_setenv(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)SDL_setenv((const char *)(uintptr_t)c->rcx, (const char *)(uintptr_t)c->rdx, (int)c->r8);
+}
+static void w_SDL_GetError(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (uint64_t)(uintptr_t)SDL_GetError();
+}
+
+/* Additional Win64 MSVCRT stdio/string functions */
+static void w_fopen(CPU64 *c, void *ud) {
+    (void)ud;
+    if (!c->rcx || !c->rdx) { c->rax = 0; return; }
+    char px[1024], cmode[16];
+    win_path_to_posix((const char *)(uintptr_t)c->rcx, px, sizeof(px));
+    const char *mode = (const char *)(uintptr_t)c->rdx;
+    size_t j = 0;
+    for (size_t i = 0; mode[i] && j + 1 < sizeof(cmode); i++) {
+        char ch = mode[i];
+        if (ch == 'r' || ch == 'w' || ch == 'a' || ch == '+' || ch == 'b') cmode[j++] = ch;
+    }
+    if (!j) cmode[j++] = 'r';
+    cmode[j] = '\0';
+    c->rax = (uint64_t)(uintptr_t)fopen(px, cmode);
+}
+static void w_fclose(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    if (!f || f == stdin || f == stdout || f == stderr) { c->rax = 0; return; }
+    c->rax = (uint64_t)(int64_t)fclose(f);
+}
+static void w_fflush(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    c->rax = (uint64_t)(int64_t)fflush(f);
+}
+static void w_fread(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->r9);
+    c->rax = (f && c->rcx) ? (uint64_t)fread((void *)(uintptr_t)c->rcx, (size_t)c->rdx, (size_t)c->r8, f) : 0;
+}
+static void w_fwrite(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->r9);
+    c->rax = (f && c->rcx) ? (uint64_t)fwrite((const void *)(uintptr_t)c->rcx, (size_t)c->rdx, (size_t)c->r8, f) : 0;
+}
+static void w_ftell(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    c->rax = f ? (uint64_t)(int64_t)ftell(f) : (uint64_t)-1LL;
+}
+static void w_fputs(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rdx);
+    c->rax = (f && c->rcx) ? (uint64_t)(int64_t)fputs((const char *)(uintptr_t)c->rcx, f) : (uint64_t)-1LL;
+}
+static void w_fprintf(CPU64 *c, void *ud) {
+    (void)ud;
+    FILE *f = win_file_ptr(c->rcx);
+    const char *fmt = (const char *)(uintptr_t)c->rdx;
+    if (!f || !fmt) { c->rax = 0; return; }
+    char buf[2048];
+    int slot = 2;
+    size_t pos = 0;
+    while (*fmt && pos < sizeof(buf) - 64) {
+        if (*fmt != '%') { buf[pos++] = *fmt++; continue; }
+        fmt++;
+        if (*fmt == '%') { buf[pos++] = '%'; fmt++; continue; }
+        while (*fmt && (*fmt == '-' || *fmt == '+' || *fmt == '0' || *fmt == '#' || *fmt == '.' || (*fmt >= '0' && *fmt <= '9'))) fmt++;
+        if (*fmt == 'l') { fmt++; if (*fmt == 'l') fmt++; }
+        else if (*fmt == 'z' || *fmt == 'h' || *fmt == 'I') fmt++;
+        char conv = *fmt ? *fmt++ : 0;
+        uint64_t v = win64_arg_i(c, slot++);
+        if (conv == 's') {
+            const char *s = (const char *)(uintptr_t)v;
+            if (!s) s = "(null)";
+            while (*s && pos < sizeof(buf) - 2) buf[pos++] = *s++;
+        } else if (conv == 'c') {
+            buf[pos++] = (char)v;
+        } else if (conv == 'x' || conv == 'X' || conv == 'p') {
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, (conv == 'X') ? "%llX" : "%llx", (unsigned long long)v);
+        } else if (conv == 'u') {
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%llu", (unsigned long long)v);
+        } else {
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%lld", (long long)v);
+        }
+    }
+    buf[pos] = '\0';
+    fwrite(buf, 1, pos, f);
+    c->rax = pos;
+}
+static void w_getenv(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = c->rcx ? (uint64_t)(uintptr_t)getenv((const char *)(uintptr_t)c->rcx) : 0;
+}
+static void w_memchr(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = c->rcx ? (uint64_t)(uintptr_t)memchr((const void *)(uintptr_t)c->rcx, (int)c->rdx, (size_t)c->r8) : 0;
+}
+static void w_strchr(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = c->rcx ? (uint64_t)(uintptr_t)strchr((const char *)(uintptr_t)c->rcx, (int)c->rdx) : 0;
+}
+static void w_strrchr(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = c->rcx ? (uint64_t)(uintptr_t)strrchr((const char *)(uintptr_t)c->rcx, (int)c->rdx) : 0;
+}
+static void w_strstr(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = (c->rcx && c->rdx) ? (uint64_t)(uintptr_t)strstr((const char *)(uintptr_t)c->rcx, (const char *)(uintptr_t)c->rdx) : 0;
+}
+static void w_strncpy(CPU64 *c, void *ud) {
+    (void)ud;
+    if (c->rcx && c->rdx) strncpy((char *)(uintptr_t)c->rcx, (const char *)(uintptr_t)c->rdx, (size_t)c->r8);
+    c->rax = c->rcx;
+}
+static void w_strtol(CPU64 *c, void *ud) {
+    (void)ud;
+    char *endp = NULL;
+    long v = c->rcx ? strtol((const char *)(uintptr_t)c->rcx, &endp, (int)c->r8) : 0;
+    if (c->rdx) W64(c->rdx, (uint64_t)(uintptr_t)endp);
+    c->rax = (uint64_t)(int64_t)(int32_t)v;
+}
+static void w_strtoul(CPU64 *c, void *ud) {
+    (void)ud;
+    char *endp = NULL;
+    unsigned long v = c->rcx ? strtoul((const char *)(uintptr_t)c->rcx, &endp, (int)c->r8) : 0;
+    if (c->rdx) W64(c->rdx, (uint64_t)(uintptr_t)endp);
+    c->rax = (uint64_t)(uint32_t)v;
+}
+
+/* ---- Source Engine vstdlib.dll Coroutine_* host-thread implementation ----
+ * vstdlib.dll implements cooperative coroutines via raw guest stack copying and
+ * custom inline longjmp into the middle of lifted functions, which cannot work
+ * when lifted C frames live on the host ARM64 stack. Replace with 1:1 pthread
+ * + condvar lockstep handoff so each coroutine has real host + guest stacks. */
+#define VSTD_MAX_COROS 1024
+extern __thread uint32_t g_win32_tid_override;
+extern uint32_t win32_current_tid(void);
+typedef struct VstdCoro {
+    int32_t         id;
+    int             in_use;
+    uint64_t        fn;
+    uint64_t        param;
+    uint32_t        owner_tid;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    pthread_t       th;
+    int             started;
+    int             running;
+    int             done;
+    int             cancel;
+    int             active;
+    sigjmp_buf      cancel_jb;
+} VstdCoro;
+
+static pthread_mutex_t g_coro_mu = PTHREAD_MUTEX_INITIALIZER;
+static VstdCoro       *g_coros[VSTD_MAX_COROS];
+static __thread VstdCoro *tls_cur_coro = NULL;
+
+static VstdCoro *coro_lookup(int32_t id) {
+    if (id <= 0 || id >= VSTD_MAX_COROS) return NULL;
+    pthread_mutex_lock(&g_coro_mu);
+    VstdCoro *co = g_coros[id];
+    if (co && !co->in_use) co = NULL;
+    pthread_mutex_unlock(&g_coro_mu);
+    return co;
+}
+
+static void *coro_thread_main(void *arg) {
+    VstdCoro *co = (VstdCoro *)arg;
+    CPU64 cpu;
+    rt_init_thread_cpu(&cpu, 2 * 1024 * 1024);
+    tls_cur_coro = co;
+    g_win32_tid_override = co->owner_tid;
+    if (cpu.gs_base) W32(cpu.gs_base + 0x48, co->owner_tid);
+    if (sigsetjmp(co->cancel_jb, 0) == 0) {
+        rt_invoke_win64(&cpu, co->fn, co->param, 0, 0, 0, 0, 0);
+    }
+    g_win32_tid_override = 0;
+    tls_cur_coro = NULL;
+    rt_destroy_thread_cpu(&cpu);
+    pthread_mutex_lock(&co->mu);
+    co->done = 1;
+    co->active = 0;
+    co->running = 0;
+    pthread_cond_signal(&co->cv);
+    pthread_mutex_unlock(&co->mu);
+    return NULL;
+}
+
+static void w_Coroutine_Create(CPU64 *c, void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_coro_mu);
+    int32_t slot = 0;
+    for (int32_t i = 1; i < VSTD_MAX_COROS; i++) {
+        if (!g_coros[i] || !g_coros[i]->in_use) { slot = i; break; }
+    }
+    if (!slot) { pthread_mutex_unlock(&g_coro_mu); c->rax = 0; return; }
+    VstdCoro *co = g_coros[slot];
+    if (!co) {
+        co = (VstdCoro *)calloc(1, sizeof(VstdCoro));
+        pthread_mutex_init(&co->mu, NULL);
+        pthread_cond_init(&co->cv, NULL);
+        g_coros[slot] = co;
+    }
+    co->id = slot;
+    co->in_use = 1;
+    co->fn = c->rcx;
+    co->param = c->rdx;
+    co->started = 0;
+    co->running = 0;
+    co->done = 0;
+    co->cancel = 0;
+    co->active = 1;
+    pthread_mutex_unlock(&g_coro_mu);
+    c->rax = (uint64_t)(uint32_t)slot;
+}
+
+static void w_Coroutine_Continue(CPU64 *c, void *ud) {
+    (void)ud;
+    int32_t id = (int32_t)c->rcx;
+    VstdCoro *co = coro_lookup(id);
+    if (!co) { c->rax = 0; return; }
+    pthread_mutex_lock(&co->mu);
+    if (!co->active || co->done) {
+        pthread_mutex_unlock(&co->mu);
+        c->rax = 0;
+        return;
+    }
+    co->owner_tid = win32_current_tid();
+    co->running = 1;
+    if (!co->started) {
+        co->started = 1;
+        if (pthread_create(&co->th, NULL, coro_thread_main, co) != 0) {
+            co->started = 0; co->running = 0; co->done = 1; co->active = 0;
+            pthread_mutex_unlock(&co->mu);
+            c->rax = 0;
+            return;
+        }
+    } else {
+        pthread_cond_signal(&co->cv);
+    }
+    while (co->running && !co->done) {
+        pthread_cond_wait(&co->cv, &co->mu);
+    }
+    int still_active = (!co->done && co->active);
+    int need_join = (co->done && co->started);
+    if (need_join) co->started = 0;
+    pthread_mutex_unlock(&co->mu);
+    if (need_join) {
+        pthread_join(co->th, NULL);
+        pthread_mutex_lock(&g_coro_mu);
+        co->in_use = 0;
+        pthread_mutex_unlock(&g_coro_mu);
+    }
+    c->rax = (uint64_t)(still_active ? 1 : 0);
+}
+
+static void w_Coroutine_YieldToMain(CPU64 *c, void *ud) {
+    (void)ud; (void)c;
+    VstdCoro *co = tls_cur_coro;
+    if (!co) return;
+    pthread_mutex_lock(&co->mu);
+    co->running = 0;
+    pthread_cond_signal(&co->cv);
+    while (!co->running && !co->cancel) {
+        pthread_cond_wait(&co->cv, &co->mu);
+    }
+    int do_cancel = co->cancel;
+    uint32_t otid = co->owner_tid;
+    pthread_mutex_unlock(&co->mu);
+    if (do_cancel) siglongjmp(co->cancel_jb, 1);
+    g_win32_tid_override = otid;
+    if (c && c->gs_base) W32(c->gs_base + 0x48, otid);
+}
+
+static void w_Coroutine_Cancel(CPU64 *c, void *ud) {
+    (void)ud;
+    int32_t id = (int32_t)c->rcx;
+    VstdCoro *co = coro_lookup(id);
+    if (!co) return;
+    pthread_mutex_lock(&co->mu);
+    co->cancel = 1;
+    co->active = 0;
+    int need_join = (co->started && co != tls_cur_coro);
+    if (need_join) {
+        co->started = 0;
+        pthread_cond_signal(&co->cv);
+    } else if (!co->started) {
+        co->done = 1;
+    }
+    pthread_mutex_unlock(&co->mu);
+    if (need_join) pthread_join(co->th, NULL);
+    if (co != tls_cur_coro) {
+        pthread_mutex_lock(&g_coro_mu);
+        co->in_use = 0;
+        pthread_mutex_unlock(&g_coro_mu);
+    }
+}
+
+static void w_Coroutine_IsActive(CPU64 *c, void *ud) {
+    (void)ud;
+    VstdCoro *co = coro_lookup((int32_t)c->rcx);
+    c->rax = (co && co->active && !co->done) ? 1 : 0;
+}
+static void w_Coroutine_GetCurrentlyActive(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = tls_cur_coro ? (uint64_t)(uint32_t)tls_cur_coro->id : 0;
+}
+static void w_Coroutine_GetStackDepth(CPU64 *c, void *ud) { (void)ud; c->rax = 1024; }
+
 void rt_register_win32_extra(void) {
     #define REG(name, fn) rt_register_shim(name, fn, NULL)
     /* Time */
@@ -2495,7 +4113,6 @@ void rt_register_win32_extra(void) {
     REG("InitOnceComplete", w_InitOnceComplete);
     REG("InitOnceExecuteOnce", w_InitOnceExecuteOnce);
     REG("CreateMutexA", w_CreateMutexA); REG("ReleaseMutex", w_ret_1);
-    REG("CreateSemaphoreA", w_CreateSemaphoreA); REG("ReleaseSemaphore", w_ret_1);
     REG("OpenEventA", w_ret_0);
     /* Process / Env / CRT */
     REG("GetCommandLineA", w_GetCommandLineA); REG("GetCommandLineW", w_GetCommandLineW);
@@ -2513,7 +4130,7 @@ void rt_register_win32_extra(void) {
     REG("GetACP", w_GetACP); REG("GetOEMCP", w_GetOEMCP);
     REG("IsValidCodePage", w_IsValidCodePage); REG("IsValidLocale", w_ret_1); REG("GetCPInfo", w_GetCPInfo);
     REG("GetFileType", w_GetFileType); REG("GetModuleHandleExW", w_GetModuleHandleExW);
-    REG("HeapSize", w_HeapSize); REG("LocalFree", w_LocalFree);
+    REG("HeapSize", w_HeapSize); REG("_msize", w_msize); REG("LocalFree", w_LocalFree);
     REG("GetLargePageMinimum", w_GetLargePageMinimum);
     REG("GetVersion", w_GetVersion); REG("GetVersionExA", w_GetVersionExA);
     REG("GlobalMemoryStatusEx", w_GlobalMemoryStatusEx);
@@ -2531,7 +4148,7 @@ void rt_register_win32_extra(void) {
     REG("RtlCaptureStackBackTrace", w_RtlCaptureStackBackTrace);
     REG("RtlLookupFunctionEntry", w_RtlLookupFunctionEntry);
     REG("RtlCaptureContext", w_RtlCaptureContext); REG("RtlPcToFileHeader", w_RtlPcToFileHeader);
-    REG("RtlUnwind", w_ret_0); REG("RtlUnwindEx", w_ret_0); REG("RtlVirtualUnwind", w_ret_0);
+    REG("RtlUnwind", w_RtlUnwindEx); REG("RtlUnwindEx", w_RtlUnwindEx); REG("RtlVirtualUnwind", w_ret_0);
     REG("TerminateProcess", w_TerminateProcess); REG("ExitThread", w_ExitThread);
     REG("FreeLibraryAndExitThread", w_ExitThread);
     /* Filesystem / Console */
@@ -2569,13 +4186,13 @@ void rt_register_win32_extra(void) {
     REG("FormatMessageA", w_ret_0); REG("FormatMessageW", w_ret_0);
     REG("CreateFileMappingA", w_ret_0); REG("MapViewOfFile", w_ret_0); REG("UnmapViewOfFile", w_ret_1);
     REG("ConnectNamedPipe", w_ret_0); REG("CreateNamedPipeA", w_ret_inv);
-    REG("DeviceIoControl", w_ret_0); REG("GetOverlappedResult", w_ret_0);
+    REG("DeviceIoControl", w_ret_0); REG("GetOverlappedResult", w_GetOverlappedResult);
     REG("PeekNamedPipe", w_ret_0); REG("InterlockedPushEntrySList", w_ret_0);
     REG("RaiseException", w_RaiseException);
     REG("CryptAcquireContextA", w_CryptAcquireContextA); REG("CryptAcquireContextW", w_CryptAcquireContextA);
     REG("CryptGenRandom", w_CryptGenRandom); REG("CryptReleaseContext", w_CryptReleaseContext);
     REG("SHGetFileInfoW", w_ret_0);
-    REG("SteamAPI_InitSafe", w_SteamAPI_InitSafe); REG("SteamAPI_GetHSteamUser", w_SteamAPI_GetHSteamUser);
+    REG("SteamAPI_Init", w_SteamAPI_InitSafe); REG("SteamAPI_InitSafe", w_SteamAPI_InitSafe); REG("SteamAPI_GetHSteamUser", w_SteamAPI_GetHSteamUser);
     REG("SteamInternal_ContextInit", w_SteamInternal_ContextInit);
     REG("SteamInternal_FindOrCreateUserInterface", w_SteamInternal_FindOrCreateUserInterface);
     REG("GetStringTypeW", w_GetStringTypeW); REG("LCMapStringEx", w_LCMapStringEx);
@@ -2684,25 +4301,25 @@ void rt_register_win32_extra(void) {
     REG("GlobalAlloc", w_GlobalAlloc); REG("GlobalLock", w_GlobalLock);
     REG("GlobalUnlock", w_GlobalUnlock); REG("GlobalSize", w_GlobalSize);
     REG("GlobalFree", w_GlobalFree); REG("GetLogicalDriveStringsA", w_GetLogicalDriveStringsA);
-    REG("RegCreateKeyExA", w_ret_err2); REG("RegEnumKeyExA", w_ret_err2);
-    REG("RegQueryInfoKeyA", w_ret_err2); REG("RegSetValueExA", w_ret_err2);
+    REG("RegCreateKeyExA", w_RegCreateKeyExA); REG("RegEnumKeyExA", w_ret_err2);
+    REG("RegQueryInfoKeyA", w_ret_err2); REG("RegSetValueExA", w_ret_0);
     REG("SHDeleteKeyA", w_ret_err2);
     REG("CreateDIBSection", w_CreateDIBSection); REG("DeleteObject", w_DeleteObject);
     REG("GetObjectA", w_GetObjectA); REG("GetTextMetricsA", w_GetTextMetricsA);
     REG("GetCharABCWidthsA", w_GetCharABCWidths); REG("GetCharABCWidthsW", w_GetCharABCWidths);
-    REG("GetTextExtentPoint32A", w_GetTextExtentPoint32A); REG("GetGlyphOutlineA", w_GetGlyphOutlineA);
-    REG("CreateCompatibleDC", w_ret_1); REG("DeleteDC", w_ret_1);
+    REG("GetTextExtentPoint32A", w_GetTextExtentPoint32A); REG("GetGlyphOutlineA", w_GetGlyphOutlineA); REG("GetGlyphOutlineW", w_GetGlyphOutlineA);
+    REG("CreateCompatibleDC", w_CreateCompatibleDC); REG("DeleteDC", w_DeleteDC);
     REG("CreateBitmap", w_ret_1); REG("CreateCompatibleBitmap", w_ret_1);
-    REG("CreateFontA", w_ret_1); REG("CreatePen", w_ret_1);
+    REG("CreateFontA", w_CreateFontA); REG("CreatePen", w_ret_1);
     REG("CreateRectRgn", w_ret_1); REG("CreateSolidBrush", w_ret_1);
-    REG("SelectObject", w_ret_1); REG("AddFontMemResourceEx", w_ret_1);
+    REG("SelectObject", w_SelectObject); REG("AddFontMemResourceEx", w_AddFontMemResourceEx);
     REG("RemoveFontMemResourceEx", w_ret_1); REG("RemoveFontResourceA", w_ret_1);
     REG("BitBlt", w_ret_1); REG("StretchBlt", w_ret_1); REG("GetDIBits", w_ret_0);
-    REG("ExtTextOutA", w_ret_1); REG("ExtTextOutW", w_ret_1);
-    REG("GetBkColor", w_ret_0); REG("SetBkColor", w_ret_0); REG("SetBkMode", w_ret_1);
-    REG("GetTextColor", w_ret_0); REG("SetTextColor", w_ret_0); REG("SetTextAlign", w_ret_0);
+    REG("ExtTextOutA", w_ExtTextOutA); REG("ExtTextOutW", w_ExtTextOutW);
+    REG("GetBkColor", w_GetBkColor); REG("SetBkColor", w_SetBkColor); REG("SetBkMode", w_SetBkMode);
+    REG("GetTextColor", w_GetTextColor); REG("SetTextColor", w_SetTextColor); REG("SetTextAlign", w_SetTextAlign);
     REG("SetMapMode", w_ret_1); REG("SetRectRgn", w_ret_1); REG("SetViewportOrgEx", w_ret_1);
-    REG("MoveToEx", w_ret_1); REG("Polygon", w_ret_1); REG("Polyline", w_ret_1);
+    REG("MoveToEx", w_MoveToEx); REG("Polygon", w_ret_1); REG("Polyline", w_ret_1);
     REG("GetWindowLongPtrA", w_GetWindowLongPtr); REG("SetWindowLongPtrA", w_SetWindowLongPtr);
     REG("GetKeyboardLayout", w_GetKeyboardLayout); REG("GetKeyboardLayoutList", w_GetKeyboardLayoutList);
     REG("ActivateKeyboardLayout", w_GetKeyboardLayout); REG("LoadKeyboardLayoutA", w_GetKeyboardLayout);
@@ -2715,7 +4332,7 @@ void rt_register_win32_extra(void) {
     REG("GetForegroundWindow", w_GetForegroundWindow); REG("SetActiveWindow", w_GetForegroundWindow);
     REG("GetParent", w_ret_0); REG("WindowFromPoint", w_GetForegroundWindow);
     REG("IsWindowEnabled", w_ret_1); REG("ValidateRect", w_ret_1); REG("FlashWindow", w_ret_1);
-    REG("SetWindowTextW", w_ret_1); REG("SetCapture", w_ret_0); REG("SetCursor", w_ret_1);
+    REG("SetWindowTextW", w_ret_1); REG("SetCapture", w_ret_0); REG("SetCursor", w_SetCursor);
     REG("SetTimer", w_ret_1); REG("GetMessageA", w_ret_0); REG("GetGUIThreadInfo", w_ret_0);
     REG("SystemParametersInfoA", w_ret_0); REG("RegisterRawInputDevices", w_ret_1); REG("GetRawInputData", w_GetRawInputData);
     REG("CopyIcon", w_ret_1); REG("CreateIconIndirect", w_ret_1); REG("DestroyCursor", w_ret_1);
@@ -2734,6 +4351,7 @@ void rt_register_win32_extra(void) {
     REG("waveOutGetPosition", w_waveOutGetPosition); REG("PlaySoundA", w_ret_1);
     REG("joyGetNumDevs", w_ret_0); REG("joyGetDevCapsA", w_ret_err2); REG("joyGetPosEx", w_ret_err2);
     REG("dsound.dll!#2", w_ret_0); REG("dsound.dll!#9", w_ret_0);
+    REG("DirectSoundEnumerateA", w_ret_0); REG("DirectSoundCreate", w_ret_inv); REG("DirectSoundCaptureCreate", w_ret_inv);
     REG("CoInitializeEx", w_ret_0); REG("OleInitialize", w_ret_0);
     REG("CoCreateInstance", w_CoCreateInstance);
     REG("CoTaskMemAlloc", w_CoTaskMemAlloc); REG("CoTaskMemRealloc", w_CoTaskMemRealloc);
@@ -2796,5 +4414,238 @@ void rt_register_win32_extra(void) {
     REG("AcceptEx", w_ret_0); REG("GetAcceptExSockaddrs", w_ret_0);
     REG("timeEndPeriod", w_ret_0); REG("VideoPlaybackRunFrame", w_ret_0);
     REG("GetDlgItem", w_ret_0); REG("AssocQueryStringA", w_ret_err2);
+    /* Team Fortress 2 / Source 1 x64: MSVCRT, SDL2, Kernel32, User32, Winsock1, Steam, HarfBuzz, FBX */
+    REG("___lc_codepage_func", w_lc_codepage_func); REG("___mb_cur_max_func", w_mb_cur_max_func);
+    REG("__iob_func", w_iob_func); REG("__setusermatherr", w_ret_0);
+    REG("_aligned_malloc", w_aligned_malloc); REG("_aligned_free", w_aligned_free);
+    REG("_amsg_exit", w_TerminateProcess); REG("_assert", w_ret_0);
+    REG("_endthreadex", w_ExitThread); REG("_errno", w_errno_ptr);
+    REG("_fdopen", w_fdopen); REG("_filelengthi64", w_filelengthi64);
+    REG("_fileno", w_fileno); REG("_fstat64", w_fstat64);
+    REG("_gmtime64", w_gmtime64); REG("_initterm", w_initterm);
+    REG("_lock", w_ret_0); REG("_unlock", w_ret_0);
+    REG("_lseeki64", w_lseeki64); REG("_read", w_crt_read); REG("_write", w_crt_write);
+    REG("_setjmp", w_ret_0); REG("longjmp", w_longjmp);
+    REG("_strdup", w_strdup); REG("_ultoa", w_ultoa);
+    REG("_wcsicmp", w_wcsicmp); REG("_wfopen", w_wfopen);
+    REG("atof", w_atof); REG("ferror", w_ferror);
+    REG("fgetpos", w_fgetpos); REG("fsetpos", w_fsetpos);
+    REG("fputc", w_fputc); REG("putc", w_fputc); REG("putwc", w_fputc);
+    REG("getc", w_getc); REG("getwc", w_getc);
+    REG("ungetc", w_ungetc); REG("ungetwc", w_ungetc);
+    REG("iswctype", w_iswctype); REG("towlower", w_towlower); REG("towupper", w_towupper);
+    REG("localeconv", w_localeconv); REG("setlocale", w_setlocale);
+    REG("remove", w_remove); REG("setvbuf", w_setvbuf); REG("signal", w_ret_0);
+    REG("strcoll", w_strcoll); REG("strerror", w_strerror);
+    REG("strftime", w_strftime); REG("strxfrm", w_strxfrm);
+    REG("vfprintf", w_vfprintf);
+    REG("wcscmp", w_wcscmp); REG("wcscoll", w_wcscmp);
+    REG("wcsftime", w_wcsftime); REG("wcslen", w_wcslen); REG("wcsxfrm", w_wcsxfrm);
+    REG("abort", w_TerminateProcess);
+    REG("fopen", w_fopen); REG("fclose", w_fclose); REG("fflush", w_fflush);
+    REG("fread", w_fread); REG("fwrite", w_fwrite); REG("ftell", w_ftell);
+    REG("fputs", w_fputs); REG("fprintf", w_fprintf);
+    REG("getenv", w_getenv); REG("memchr", w_memchr);
+    REG("strchr", w_strchr); REG("strrchr", w_strrchr); REG("strstr", w_strstr);
+    REG("strcpy", w_lstrcpyA); REG("strcat", w_lstrcatA); REG("strncpy", w_strncpy);
+    REG("strtol", w_strtol); REG("strtoul", w_strtoul);
+    REG("SDL_GetError", w_SDL_GetError); REG("SDL_InitSubSystem", w_ret_0); REG("SDL_PollEvent", w_ret_0);
+    /* Kernel32 TF2 */
+    REG("AddVectoredExceptionHandler", w_ret_1); REG("RemoveVectoredExceptionHandler", w_ret_1);
+    REG("__C_specific_handler", w_ret_0);
+    REG("CopyFileA", w_CopyFileA); REG("MoveFileExA", w_MoveFileExA);
+    REG("SetCurrentDirectoryA", w_SetCurrentDirectoryA);
+    REG("GetFullPathNameA", w_GetFullPathNameA); REG("GetWindowsDirectoryA", w_GetWindowsDirectoryA);
+    REG("GetEnvironmentVariableW", w_GetEnvironmentVariableW);
+    REG("GetModuleHandleExA", w_GetModuleHandleExA);
+    REG("GetLogicalProcessorInformation", w_GetLogicalProcessorInformation);
+    REG("GlobalMemoryStatus", w_GlobalMemoryStatus);
+    REG("GetTempFileNameA", w_GetTempFileNameA);
+    REG("FileTimeToLocalFileTime", w_FileTimeToLocalFileTime);
+    REG("FileTimeToDosDateTime", w_FileTimeToDosDateTime);
+    REG("GetConsoleCP", w_GetACP);
+    REG("GetDateFormatA", w_GetDateFormatA); REG("GetTimeFormatA", w_GetTimeFormatA);
+    REG("GetHandleInformation", w_ret_1); REG("SetHandleInformation", w_ret_1);
+    REG("HeapValidate", w_ret_1); REG("HeapWalk", w_ret_0);
+    REG("IsDBCSLeadByteEx", w_ret_0); REG("OpenFileMappingW", w_ret_0);
+    REG("Process32First", w_ret_0); REG("Process32Next", w_ret_0);
+    REG("ReadConsoleInputW", w_ret_0); REG("WinExec", w_ret_0);
+    REG("lstrcpyA", w_lstrcpyA); REG("lstrcatA", w_lstrcatA);
+    /* User32 / GDI32 / Advapi32 / OLE TF2 */
+    REG("ChangeDisplaySettingsExW", w_ret_0);
+    REG("DisplayConfigGetDeviceInfo", w_ret_err87);
+    REG("GetDisplayConfigBufferSizes", w_ret_err87);
+    REG("QueryDisplayConfig", w_ret_err87);
+    REG("EnumChildWindows", w_ret_1);
+    REG("EnumDisplayDevicesA", w_EnumDisplayDevicesA);
+    REG("EnumDisplayMonitors", w_EnumDisplayMonitors);
+    REG("EnumDisplaySettingsW", w_EnumDisplaySettingsW);
+    REG("GetMonitorInfoW", w_GetMonitorInfoW);
+    REG("MonitorFromPoint", w_MonitorFromPoint);
+    REG("FillRect", w_ret_1); REG("FlashWindowEx", w_ret_1); REG("UpdateWindow", w_ret_1);
+    REG("GetActiveWindow", w_GetForegroundWindow);
+    REG("GetDCEx", w_ret_1);
+    REG("GetWindowLongW", w_GetWindowLongPtr); REG("SetWindowLongW", w_SetWindowLongPtr);
+    REG("IsWindow", w_ret_1); REG("IsWindowUnicode", w_ret_0);
+    REG("LoadStringA", w_ret_0); REG("MsgWaitForMultipleObjects", w_ret_0);
+    REG("OffsetRect", w_OffsetRect); REG("SetRect", w_SetRect);
+    REG("PostMessageA", w_ret_1); REG("PostMessageW", w_ret_1);
+    REG("SetProcessDPIAware", w_ret_1);
+    REG("AddFontResourceA", w_AddFontResourceA); REG("EnumFontFamiliesExA", w_EnumFontFamiliesExA); REG("GetStockObject", w_ret_1);
+    REG("oleaut32.dll!#2", w_SysAllocString);
+    REG("oleaut32.dll!#6", w_SysFreeString);
+    REG("oleaut32.dll!#8", w_SysStringLen);
+    REG("AllocateLocallyUniqueId", w_AllocateLocallyUniqueId);
+    REG("RegNotifyChangeKeyValue", w_ret_err2); REG("RegOpenKeyA", w_ret_err2);
+    REG("CoSetProxyBlanket", w_ret_0);
+    /* Winsock1 (wsock32.dll) ordinals */
+    REG("wsock32.dll!#4", w_wsa_connect); REG("wsock32.dll!#7", w_wsa_getsockopt);
+    REG("wsock32.dll!#10", w_wsa_inet_addr); REG("wsock32.dll!#12", w_wsa_ioctlsocket);
+    REG("wsock32.dll!#14", w_wsa_ntohl); REG("wsock32.dll!#15", w_wsa_ntohs);
+    REG("wsock32.dll!#20", w_wsa_sendto); REG("wsock32.dll!#21", w_wsa_setsockopt);
+    REG("wsock32.dll!#52", w_wsa_gethostbyname); REG("wsock32.dll!#57", w_wsa_gethostname);
+    REG("wsock32.dll!#111", w_wsa_GetLastError);
+    /* SteamAPI TF2 */
+    REG("SteamAPI_IsSteamRunning", w_ret_1);
+    REG("SteamAPI_SetBreakpadAppID", w_ret_0); REG("SteamAPI_SetMiniDumpComment", w_ret_0);
+    REG("SteamAPI_UseBreakpadCrashHandler", w_ret_0); REG("SteamAPI_WriteMiniDump", w_ret_0);
+    REG("SteamGameServer_BSecure", w_ret_0); REG("SteamGameServer_GetIPCCallCount", w_ret_0);
+    /* SDL2.dll TF2 */
+    REG("SDL_AddEventWatch", w_ret_0); REG("SDL_DelEventWatch", w_ret_0);
+    REG("SDL_GameControllerClose", w_ret_0); REG("SDL_GameControllerGetJoystick", w_ret_0);
+    REG("SDL_GameControllerOpen", w_ret_0); REG("SDL_HapticClose", w_ret_0);
+    REG("SDL_HapticOpenFromJoystick", w_ret_0); REG("SDL_HapticRumbleInit", w_ret_0);
+    REG("SDL_HapticRumblePlay", w_ret_0); REG("SDL_HapticRumbleStop", w_ret_0);
+    REG("SDL_IsGameController", w_ret_0); REG("SDL_JoystickClose", w_ret_0);
+    REG("SDL_JoystickGetDeviceGUID", w_ret_0); REG("SDL_JoystickGetGUIDString", w_ret_0);
+    REG("SDL_JoystickInstanceID", w_ret_0); REG("SDL_JoystickNameForIndex", w_ret_0);
+    REG("SDL_JoystickOpen", w_ret_0); REG("SDL_NumJoysticks", w_ret_0);
+    REG("SDL_PumpEvents", w_ret_0); REG("SDL_QuitSubSystem", w_ret_0);
+    REG("SDL_SetHint", w_SDL_SetHint); REG("SDL_WasInit", w_SDL_WasInit);
+    REG("SDL_setenv", w_SDL_setenv);
+    /* HarfBuzz optional auto-hinter hooks in libfreetype-6.dll */
+    REG("hb_blob_create", w_ret_0); REG("hb_blob_destroy", w_ret_0);
+    REG("hb_buffer_add_utf8", w_ret_0); REG("hb_buffer_clear_contents", w_ret_0);
+    REG("hb_buffer_create", w_ret_0); REG("hb_buffer_destroy", w_ret_0);
+    REG("hb_buffer_get_glyph_infos", w_ret_0); REG("hb_buffer_get_glyph_positions", w_ret_0);
+    REG("hb_buffer_get_length", w_ret_0); REG("hb_buffer_guess_segment_properties", w_ret_0);
+    REG("hb_face_create", w_ret_0); REG("hb_face_create_for_tables", w_ret_0);
+    REG("hb_face_destroy", w_ret_0); REG("hb_face_set_index", w_ret_0);
+    REG("hb_face_set_upem", w_ret_0); REG("hb_font_create", w_ret_0);
+    REG("hb_font_destroy", w_ret_0); REG("hb_font_get_face", w_ret_0);
+    REG("hb_font_set_scale", w_ret_0); REG("hb_ot_layout_collect_lookups", w_ret_0);
+    REG("hb_ot_layout_lookup_collect_glyphs", w_ret_0);
+    REG("hb_ot_layout_lookup_would_substitute", w_ret_0);
+    REG("hb_ot_tags_from_script_and_language", w_ret_0);
+    REG("hb_set_create", w_ret_0); REG("hb_set_destroy", w_ret_0);
+    REG("hb_set_is_empty", w_ret_1); REG("hb_set_next", w_ret_0);
+    REG("hb_set_subtract", w_ret_0); REG("hb_shape", w_ret_0);
+    /* Autodesk FBX SDK authoring tool stubs in client.dll */
+    REG("??0FbxProperty@fbxsdk@@QEAA@AEBVFbxPropertyHandle@1@@Z", w_ret_0);
+    REG("??0FbxStatus@fbxsdk@@QEAA@AEBV01@@Z", w_ret_0);
+    REG("??0FbxString@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??0FbxVector2@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??0FbxVector4@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??1FbxCriteria@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??1FbxProperty@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??1FbxPropertyHandle@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??1FbxQuaternion@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??1FbxString@fbxsdk@@QEAA@XZ", w_ret_0);
+    REG("??AFbxQuaternion@fbxsdk@@QEBAAEBNH@Z", w_ret_0);
+    REG("??YFbxString@fbxsdk@@QEAAAEBV01@PEBD@Z", w_ret_0);
+    REG("?Buffer@FbxString@fbxsdk@@QEAAPEADXZ", w_ret_0);
+    REG("?ClassId@FbxAnimLayer@fbxsdk@@2VFbxClassId@2@A", w_ret_0);
+    REG("?ClassId@FbxAnimStack@fbxsdk@@2VFbxClassId@2@A", w_ret_0);
+    REG("?ClassId@FbxBlendShape@fbxsdk@@2VFbxClassId@2@A", w_ret_0);
+    REG("?ClassId@FbxFileTexture@fbxsdk@@2VFbxClassId@2@A", w_ret_0);
+    REG("?ClassId@FbxLayeredTexture@fbxsdk@@2VFbxClassId@2@A", w_ret_0);
+    REG("?ClassId@FbxSkin@fbxsdk@@2VFbxClassId@2@A", w_ret_0);
+    REG("?ClassId@FbxTexture@fbxsdk@@2VFbxClassId@2@A", w_ret_0);
+    REG("?Create@FbxIOSettings@fbxsdk@@SAPEAV12@PEAVFbxManager@2@PEBD@Z", w_ret_0);
+    REG("?Create@FbxImporter@fbxsdk@@SAPEAV12@PEAVFbxManager@2@PEBD@Z", w_ret_0);
+    REG("?Create@FbxManager@fbxsdk@@SAPEAV12@XZ", w_ret_0);
+    REG("?Create@FbxScene@fbxsdk@@SAPEAV12@PEAVFbxManager@2@PEBD@Z", w_ret_0);
+    REG("?Destroy@FbxObject@fbxsdk@@QEAAX_N@Z", w_ret_0);
+    REG("?EvaluateGlobalTransform@FbxNode@fbxsdk@@QEAAAEAVFbxAMatrix@2@VFbxTime@2@W4EPivotSet@12@_N2@Z", w_ret_0);
+    REG("?FbxFree@fbxsdk@@YAXPEAX@Z", w_ret_0);
+    REG("?FillAnimStackNameArray@FbxDocument@fbxsdk@@QEAAXAEAV?$FbxArray@PEAVFbxString@fbxsdk@@$0BA@@2@@Z", w_ret_0);
+    REG("?Find@FbxPropertyHandle@fbxsdk@@QEBA?AV12@PEBD_N@Z", w_ret_0);
+    REG("?GetActiveAnimStackName@FbxImporter@fbxsdk@@QEAA?AVFbxString@2@XZ", w_ret_0);
+    REG("?GetAnimStackCount@FbxImporter@fbxsdk@@QEAAHXZ", w_ret_0);
+    REG("?GetAt@FbxLayerElementArray@fbxsdk@@QEBA_NHPEAPEAXW4EFbxType@2@@Z", w_ret_0);
+    REG("?GetBlendShapeChannel@FbxBlendShape@fbxsdk@@QEAAPEAVFbxBlendShapeChannel@2@H@Z", w_ret_0);
+    REG("?GetBlendShapeChannelCount@FbxBlendShape@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetChild@FbxNode@fbxsdk@@QEAAPEAV12@H@Z", w_ret_0);
+    REG("?GetChildCount@FbxNode@fbxsdk@@QEBAH_N@Z", w_ret_0);
+    REG("?GetCluster@FbxSkin@fbxsdk@@QEAAPEAVFbxCluster@2@H@Z", w_ret_0);
+    REG("?GetClusterCount@FbxSkin@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetControlPointIndices@FbxCluster@fbxsdk@@QEBAPEAHXZ", w_ret_0);
+    REG("?GetControlPointIndices@FbxShape@fbxsdk@@QEBAPEAHXZ", w_ret_0);
+    REG("?GetControlPointIndicesCount@FbxCluster@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetControlPointIndicesCount@FbxShape@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetControlPointWeights@FbxCluster@fbxsdk@@QEBAPEANXZ", w_ret_0);
+    REG("?GetCount@FbxLayerElementArray@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetDeformer@FbxGeometry@fbxsdk@@QEBAPEAVFbxDeformer@2@HW4EDeformerType@32@PEAVFbxStatus@2@@Z", w_ret_0);
+    REG("?GetDeformerCount@FbxGeometry@fbxsdk@@QEBAHW4EDeformerType@FbxDeformer@2@@Z", w_ret_0);
+    REG("?GetDirectArray@?$FbxLayerElementTemplate@VFbxVector2@fbxsdk@@@fbxsdk@@QEBAAEAV?$FbxLayerElementArrayTemplate@VFbxVector2@fbxsdk@@@2@XZ", w_ret_0);
+    REG("?GetDirectArray@?$FbxLayerElementTemplate@VFbxVector4@fbxsdk@@@fbxsdk@@QEBAAEAV?$FbxLayerElementArrayTemplate@VFbxVector4@fbxsdk@@@2@XZ", w_ret_0);
+    REG("?GetDuration@FbxTimeSpan@fbxsdk@@QEBA?AVFbxTime@2@XZ", w_ret_0);
+    REG("?GetElementMaterial@FbxGeometryBase@fbxsdk@@QEAAPEAVFbxLayerElementMaterial@2@H@Z", w_ret_0);
+    REG("?GetElementMaterialCount@FbxGeometryBase@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetElementNormal@FbxGeometryBase@fbxsdk@@QEAAPEAVFbxLayerElementNormal@2@H@Z", w_ret_0);
+    REG("?GetElementNormalCount@FbxGeometryBase@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetElementUV@FbxGeometryBase@fbxsdk@@QEAAPEAVFbxLayerElementUV@2@HW4EType@FbxLayerElement@2@@Z", w_ret_0);
+    REG("?GetElementUVCount@FbxGeometryBase@fbxsdk@@QEBAHW4EType@FbxLayerElement@2@@Z", w_ret_0);
+    REG("?GetErrorString@FbxStatus@fbxsdk@@QEBAPEBDXZ", w_ret_0);
+    REG("?GetFileFormatVersion@FbxManager@fbxsdk@@SAXAEAH00@Z", w_ret_0);
+    REG("?GetFileName@FbxFileTexture@fbxsdk@@QEBAPEBDXZ", w_ret_0);
+    REG("?GetFileVersion@FbxImporter@fbxsdk@@QEAAXAEAH00@Z", w_ret_0);
+    REG("?GetFrameCount@FbxTime@fbxsdk@@QEBA_JW4EMode@12@@Z", w_ret_0);
+    REG("?GetFrameRate@FbxImporter@fbxsdk@@QEAA_NAEAW4EMode@FbxTime@2@@Z", w_ret_0);
+    REG("?GetFrameRate@FbxTime@fbxsdk@@SANW4EMode@12@@Z", w_ret_0);
+    REG("?GetLink@FbxCluster@fbxsdk@@QEAAPEAVFbxNode@2@XZ", w_ret_0);
+    REG("?GetLinkMode@FbxCluster@fbxsdk@@QEBA?AW4ELinkMode@12@XZ", w_ret_0);
+    REG("?GetMaterial@FbxNode@fbxsdk@@QEBAPEAVFbxSurfaceMaterial@2@H@Z", w_ret_0);
+    REG("?GetMaterialCount@FbxNode@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetName@FbxObject@fbxsdk@@QEBAPEBDXZ", w_ret_0);
+    REG("?GetNameOnly@FbxObject@fbxsdk@@QEBA?AVFbxString@2@XZ", w_ret_0);
+    REG("?GetNode@FbxNodeAttribute@fbxsdk@@QEBAPEAVFbxNode@2@H@Z", w_ret_0);
+    REG("?GetNodeAttribute@FbxNode@fbxsdk@@QEAAPEAVFbxNodeAttribute@2@XZ", w_ret_0);
+    REG("?GetPolygonCount@FbxMesh@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetPolygonSize@FbxMesh@fbxsdk@@QEBAHH@Z", w_ret_0);
+    REG("?GetPolygonVertex@FbxMesh@fbxsdk@@QEBAHHH@Z", w_ret_0);
+    REG("?GetQ@FbxAMatrix@fbxsdk@@QEBA?AVFbxQuaternion@2@XZ", w_ret_0);
+    REG("?GetRootNode@FbxScene@fbxsdk@@QEBAPEAVFbxNode@2@XZ", w_ret_0);
+    REG("?GetSecondDouble@FbxTime@fbxsdk@@QEBANXZ", w_ret_0);
+    REG("?GetSrcObject@FbxProperty@fbxsdk@@QEBAPEAVFbxObject@2@AEBVFbxCriteria@2@H@Z", w_ret_0);
+    REG("?GetSrcObjectCount@FbxProperty@fbxsdk@@QEBAHAEBVFbxCriteria@2@@Z", w_ret_0);
+    REG("?GetT@FbxAMatrix@fbxsdk@@QEBA?AVFbxVector4@2@XZ", w_ret_0);
+    REG("?GetTakeInfo@FbxDocument@fbxsdk@@QEBAPEAVFbxTakeInfo@2@AEBVFbxString@2@@Z", w_ret_0);
+    REG("?GetTakeInfo@FbxImporter@fbxsdk@@QEAAPEAVFbxTakeInfo@2@H@Z", w_ret_0);
+    REG("?GetTargetShape@FbxBlendShapeChannel@fbxsdk@@QEAAPEAVFbxShape@2@H@Z", w_ret_0);
+    REG("?GetTargetShapeCount@FbxBlendShapeChannel@fbxsdk@@QEBAHXZ", w_ret_0);
+    REG("?GetTextureUVIndex@FbxMesh@fbxsdk@@QEAAHHHW4EType@FbxLayerElement@2@@Z", w_ret_0);
+    REG("?GetVersion@FbxManager@fbxsdk@@SAPEBD_N@Z", w_ret_0);
+    REG("?Import@FbxImporter@fbxsdk@@QEAA_NPEAVFbxDocument@2@_N@Z", w_ret_0);
+    REG("?Is@FbxClassId@fbxsdk@@QEBA_NAEBV12@@Z", w_ret_0);
+    REG("?IsFBX@FbxImporter@fbxsdk@@QEAA_NXZ", w_ret_0);
+    REG("?ObjectType@FbxCriteria@fbxsdk@@SA?AV12@AEBVFbxClassId@2@@Z", w_ret_0);
+    REG("?ParseForGlobalSettings@FbxImporter@fbxsdk@@QEAAX_N@Z", w_ret_0);
+    REG("?SetBoolProp@FbxIOSettings@fbxsdk@@QEAAXPEBD_N@Z", w_ret_0);
+    REG("?SetCurrentAnimationStack@FbxScene@fbxsdk@@QEAAXPEAVFbxAnimStack@2@@Z", w_ret_0);
+    REG("?SetFrame@FbxTime@fbxsdk@@QEAAX_JW4EMode@12@@Z", w_ret_0);
+    REG("?sDiffuse@FbxSurfaceMaterial@fbxsdk@@2PEBDEB", w_ret_0);
+    /* Source Engine vstdlib.dll Coroutine_* overrides */
+    REG("vstdlib.dll!Coroutine_Create", w_Coroutine_Create);
+    REG("vstdlib.dll!Coroutine_Continue", w_Coroutine_Continue);
+    REG("vstdlib.dll!Coroutine_YieldToMain", w_Coroutine_YieldToMain);
+    REG("vstdlib.dll!Coroutine_Cancel", w_Coroutine_Cancel);
+    REG("vstdlib.dll!Coroutine_IsActive", w_Coroutine_IsActive);
+    REG("vstdlib.dll!Coroutine_GetCurrentlyActive", w_Coroutine_GetCurrentlyActive);
+    REG("vstdlib.dll!Coroutine_GetStackDepth", w_Coroutine_GetStackDepth);
+    REG("vstdlib.dll!Coroutine_ReleaseThreadMemory", w_ret_0);
+    REG("vstdlib.dll!Coroutine_ValidateGlobals", w_ret_0);
+    REG("vstdlib.dll!Coroutine_DebugBreak", w_ret_0);
+    REG("vstdlib.dll!Coroutine_DebugAssert", w_ret_0);
     #undef REG
 }

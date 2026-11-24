@@ -225,6 +225,19 @@ def disassemble_module(
             t = parse_imm(insn.ops[0])
             if t is not None and lo_code <= t < hi_code:
                 want_roots.add(t)
+        elif insn.mnemonic == "jmp" and insn.size == 5 and len(insn.ops) == 1:
+            t = parse_imm(insn.ops[0])
+            if t is not None and lo_code <= t < hi_code and (t & 0xF) == 0:
+                want_roots.add(t)
+        elif insn.mnemonic == "lea" and len(insn.ops) == 2 and "[rip" in insn.ops[1]:
+            m_rip = re.search(r"\[rip\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)\]", insn.ops[1])
+            if m_rip:
+                disp = int(m_rip.group(2), 0)
+                if m_rip.group(1) == "-":
+                    disp = -disp
+                t = insn.next_addr + disp
+                if lo_code <= t < hi_code and (t & 0xF) == 0:
+                    want_roots.add(t)
     missing_roots = sorted(r for r in want_roots if r not in addr_to_idx)
     if missing_roots:
         resynced_ranges: List[Tuple[int, int]] = []
@@ -338,12 +351,16 @@ def disassemble_module(
                 t = insn.next_addr + disp
                 if t in addr_to_idx:
                     prev_idx = addr_to_idx[t] - 1
-                    if prev_idx < 0 or all_insns[prev_idx].mnemonic in ("ret", "jmp", "int3", "nop", "ud2"):
+                    if (
+                        prev_idx < 0
+                        or all_insns[prev_idx].mnemonic in ("ret", "jmp", "int3", "nop", "ud2")
+                        or ((t & 0xF) == 0 and all_insns[prev_idx].mnemonic == "add" and "al" in all_insns[prev_idx].text)
+                    ):
                         root_set.add(t)
 
-    # Close over cross-chunk direct jmp/jcc targets so split MSVC .pdata blocks never miss a root.
+    # Close over cross-chunk direct jmp/jcc targets so split .pdata / .text.unlikely blocks never miss a root.
     funcs = build_funcs(root_set)
-    for _ in range(4):
+    while True:
         added = False
         for fn in funcs:
             local = {ins.addr for ins in fn.insns}
@@ -594,7 +611,13 @@ def lift_sse(insn: Insn) -> Optional[str]:
         dst, src = ops
         if dst in REG_INFO and REG_INFO[dst][2] == "xmm":
             dr = f"c->{REG_INFO[dst][0]}"
+            if src.startswith("mm") and src[2:].isdigit():
+                return f"memset(&{dr}, 0, 16);"
             return f"memset(&{dr}, 0, 16); {dr}.d[0] = (uint32_t)({read_op(src, 32, nr)});"
+        if src.startswith("mm") and src[2:].isdigit():
+            return f"{write_op(dst, 32, '0U', nr)};"
+        if dst.startswith("mm") and dst[2:].isdigit():
+            return "/* movd mm, src nop */"
         return f"{write_op(dst, 32, f'c->{REG_INFO[src][0]}.d[0]', nr)};"
 
     if m == "movq":
@@ -1072,6 +1095,18 @@ def lift_sse(insn: Insn) -> Optional[str]:
         s = f"c->{REG_INFO[ops[1]][0]}"
         idx = parse_imm(ops[2]) & 3
         return f"{write_op(ops[0], 32, f'{s}.d[{idx}]', nr)};"
+    if m in ("pavgb", "pavgw"):
+        fld, cnt, ct = ("b", 16, "uint8_t") if m == "pavgb" else ("w", 8, "uint16_t")
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; for (int _i=0; _i<{cnt}; _i++) {d}.{fld}[_i] = ({ct})(((uint32_t){d}.{fld}[_i] + (uint32_t)_s.{fld}[_i] + 1U) >> 1); }}"
+    if m == "psadbw":
+        d = f"c->{REG_INFO[ops[0]][0]}"
+        return (
+            f"{{ Xmm128 _s = {read_xmm128(ops[1], nr)}; uint16_t _s0 = 0, _s1 = 0; "
+            f"for (int _i=0; _i<8; _i++) {{ int _d0 = (int){d}.b[_i] - (int)_s.b[_i]; _s0 += (uint16_t)(_d0 < 0 ? -_d0 : _d0); "
+            f"int _d1 = (int){d}.b[_i+8] - (int)_s.b[_i+8]; _s1 += (uint16_t)(_d1 < 0 ? -_d1 : _d1); }} "
+            f"{d}.q[0] = _s0; {d}.q[1] = _s1; }}"
+        )
     if m == "pcmpistri":
         imm = parse_imm(ops[2])
         return f"f_pcmpistri(c, c->{REG_INFO[ops[0]][0]}, {read_xmm128(ops[1], nr)}, 0x{imm & 0xFF:x}U);"
@@ -1084,18 +1119,200 @@ def lift_sse(insn: Insn) -> Optional[str]:
     return None
 
 
+def _parse_fpu_st(op: str) -> Optional[int]:
+    op = op.strip().lower()
+    if op == "st":
+        return 0
+    if op.startswith("st(") and op.endswith(")") and op[3:-1].isdigit():
+        return int(op[3:-1])
+    return None
+
+
+def _read_fpu_mem(op: str, nr: int) -> Optional[str]:
+    mm = parse_mem(op, nr)
+    if mm is None:
+        return None
+    w, addr = mm
+    if w == 80 or "tbyte" in op:
+        return f"fpu_read80({addr})"
+    if w == 64 or "qword" in op:
+        return f"({{ uint64_t _u = R64({addr}); double _d; memcpy(&_d, &_u, 8); _d; }})"
+    return f"({{ uint32_t _u = R32({addr}); float _f; memcpy(&_f, &_u, 4); (double)_f; }})"
+
+
+def lift_x87(insn: Insn) -> Optional[str]:
+    m, ops, nr = insn.mnemonic, insn.ops, insn.next_addr
+
+    if m == "fldz":
+        return "fpu_push(c, 0.0);"
+    if m == "fld1":
+        return "fpu_push(c, 1.0);"
+    if m == "fldpi":
+        return "fpu_push(c, 3.14159265358979323846);"
+    if m == "fldl2e":
+        return "fpu_push(c, 1.44269504088896340736);"
+    if m == "fldl2t":
+        return "fpu_push(c, 3.32192809488736234787);"
+    if m == "fldlg2":
+        return "fpu_push(c, 0.30102999566398119521);"
+    if m == "fldln2":
+        return "fpu_push(c, 0.69314718055994530942);"
+
+    if m == "fild":
+        mm = parse_mem(ops[0], nr)
+        if mm is not None:
+            w, addr = mm
+            w = w or 32
+            return f"fpu_push(c, (double)(int{w}_t)R{w}({addr}));"
+        return None
+
+    if m in ("fist", "fistp", "fisttp"):
+        mm = parse_mem(ops[0], nr)
+        if mm is not None:
+            w, addr = mm
+            w = w or 32
+            pop_s = " fpu_pop(c);" if m != "fist" else ""
+            conv = "(int64_t)trunc(*fpu_st(c, 0))" if m == "fisttp" else "(int64_t)llrint(*fpu_st(c, 0))"
+            return f"{{ int{w}_t _iv = (int{w}_t)({conv}); W{w}({addr}, (uint{w}_t)_iv);{pop_s} }}"
+        return None
+
+    if m == "fld":
+        st = _parse_fpu_st(ops[0])
+        if st is not None:
+            return f"fpu_push(c, *fpu_st(c, {st}));"
+        me = _read_fpu_mem(ops[0], nr)
+        if me is not None:
+            return f"fpu_push(c, {me});"
+        return None
+
+    if m in ("fst", "fstp"):
+        pop_s = " fpu_pop(c);" if m == "fstp" else ""
+        st = _parse_fpu_st(ops[0])
+        if st is not None:
+            if st == 0 and m == "fstp":
+                return "fpu_pop(c);"
+            return f"*fpu_st(c, {st}) = *fpu_st(c, 0);{pop_s}"
+        mm = parse_mem(ops[0], nr)
+        if mm is not None:
+            w, addr = mm
+            if w == 80 or "tbyte" in ops[0]:
+                return f"fpu_write80({addr}, *fpu_st(c, 0));{pop_s}"
+            if w == 64 or "qword" in ops[0]:
+                return f"{{ double _d = *fpu_st(c, 0); uint64_t _u; memcpy(&_u, &_d, 8); W64({addr}, _u);{pop_s} }}"
+            return f"{{ float _f = (float)*fpu_st(c, 0); uint32_t _u; memcpy(&_u, &_f, 4); W32({addr}, _u);{pop_s} }}"
+        return None
+
+    if m == "fxch":
+        idx = _parse_fpu_st(ops[0]) if ops else 1
+        if idx is None:
+            idx = 1
+        return f"{{ double _t = *fpu_st(c, 0); *fpu_st(c, 0) = *fpu_st(c, {idx}); *fpu_st(c, {idx}) = _t; }}"
+
+    if m == "fabs":
+        return "*fpu_st(c, 0) = fabs(*fpu_st(c, 0));"
+    if m == "fchs":
+        return "*fpu_st(c, 0) = -(*fpu_st(c, 0));"
+    if m == "fsqrt":
+        return "*fpu_st(c, 0) = sqrt(*fpu_st(c, 0));"
+    if m == "fcos":
+        return "*fpu_st(c, 0) = cos(*fpu_st(c, 0)); c->fpu_sw &= ~0x0400U;"
+    if m == "fsin":
+        return "*fpu_st(c, 0) = sin(*fpu_st(c, 0)); c->fpu_sw &= ~0x0400U;"
+    if m == "frndint":
+        return "*fpu_st(c, 0) = rint(*fpu_st(c, 0));"
+    if m == "fscale":
+        return "*fpu_st(c, 0) = ldexp(*fpu_st(c, 0), (int)trunc(*fpu_st(c, 1)));"
+    if m == "f2xm1":
+        return "*fpu_st(c, 0) = exp2(*fpu_st(c, 0)) - 1.0;"
+    if m == "fyl2x":
+        return "{ double _x = fpu_pop(c); *fpu_st(c, 0) *= log2(_x); }"
+    if m == "fyl2xp1":
+        return "{ double _x = fpu_pop(c); *fpu_st(c, 0) *= log2(_x + 1.0); }"
+    if m == "fprem1":
+        return "{ double _d = *fpu_st(c, 1); *fpu_st(c, 0) = remainder(*fpu_st(c, 0), _d); c->fpu_sw &= ~0x4700U; }"
+    if m == "fprem":
+        return "{ double _d = *fpu_st(c, 1); *fpu_st(c, 0) = fmod(*fpu_st(c, 0), _d); c->fpu_sw &= ~0x4700U; }"
+    if m == "fxam":
+        return "fpu_fxam(c, *fpu_st(c, 0));"
+
+    if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp", "fmul", "fmulp", "fdiv", "fdivp", "fdivr", "fdivrp"):
+        is_pop = m.endswith("p")
+        base_m = m[:-1] if is_pop else m
+        op_c = {"fadd": "+", "fsub": "-", "fsubr": "r-", "fmul": "*", "fdiv": "/", "fdivr": "r/"}[base_m]
+        if not ops:
+            dst_i, src_e = 1, "*fpu_st(c, 0)"
+        elif len(ops) == 1:
+            st = _parse_fpu_st(ops[0])
+            if st is not None:
+                dst_i, src_e = (st, "*fpu_st(c, 0)") if is_pop else (0, f"*fpu_st(c, {st})")
+            else:
+                me = _read_fpu_mem(ops[0], nr)
+                if me is None:
+                    return None
+                dst_i, src_e = 0, me
+        else:
+            d_st = _parse_fpu_st(ops[0])
+            s_st = _parse_fpu_st(ops[1])
+            if d_st is None or s_st is None:
+                return None
+            dst_i, src_e = d_st, f"*fpu_st(c, {s_st})"
+        pop_s = " fpu_pop(c);" if is_pop else ""
+        if op_c == "r-":
+            return f"{{ double _a = *fpu_st(c, {dst_i}), _b = {src_e}; *fpu_st(c, {dst_i}) = _b - _a;{pop_s} }}"
+        if op_c == "r/":
+            return f"{{ double _a = *fpu_st(c, {dst_i}), _b = {src_e}; *fpu_st(c, {dst_i}) = _b / _a;{pop_s} }}"
+        return f"{{ double _a = *fpu_st(c, {dst_i}), _b = {src_e}; *fpu_st(c, {dst_i}) = _a {op_c} _b;{pop_s} }}"
+
+    if m in ("fcom", "fcomp", "fucom", "fucomp"):
+        is_pop = m.endswith("p")
+        pop_s = " fpu_pop(c);" if is_pop else ""
+        if not ops:
+            rhs = "*fpu_st(c, 1)"
+        else:
+            st = _parse_fpu_st(ops[0])
+            rhs = f"*fpu_st(c, {st})" if st is not None else _read_fpu_mem(ops[0], nr)
+            if rhs is None:
+                return None
+        return f"fpu_com(c, *fpu_st(c, 0), {rhs});{pop_s}"
+
+    if m in ("fcomi", "fcomip", "fucomi", "fucompi"):
+        is_pop = m.endswith("pi") or m.endswith("ip")
+        pop_s = " fpu_pop(c);" if is_pop else ""
+        st = _parse_fpu_st(ops[-1]) if ops else 1
+        if st is None:
+            st = 1
+        return f"f_ucomi_d(c, *fpu_st(c, 0), *fpu_st(c, {st}));{pop_s}"
+
+    if m == "fldenv":
+        mm = parse_mem(ops[0], nr)
+        if mm is not None:
+            return f"c->fpu_cw = R16({mm[1]}); c->fpu_sw = R16(({mm[1]}) + 4);"
+    if m in ("fnstenv", "fstenv"):
+        mm = parse_mem(ops[0], nr)
+        if mm is not None:
+            return f"memset((void *)(uintptr_t)({mm[1]}), 0, 28); W16({mm[1]}, c->fpu_cw ? c->fpu_cw : 0x037FU); W16(({mm[1]}) + 4, c->fpu_sw);"
+    return None
+
+
 def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List[str]) -> str:
     m, ops, pfx, nr = insn.mnemonic, insn.ops, insn.prefix, insn.next_addr
 
-    if m in ("nop", "endbr64", "endbr32", "pause", "mfence", "lfence", "sfence",
+    if m in ("nop", "endbr64", "endbr32", "rdsspq", "rdsspd", "incsspq", "incsspd",
+             "pause", "mfence", "lfence", "sfence",
              "prefetcht0", "prefetcht1", "prefetcht2", "prefetchnta", "prefetchw",
-             "prefetchit0", "prefetchit1", "vzeroupper",
+             "prefetchit0", "prefetchit1", "vzeroupper", "<unknown>",
              "fldcw", "fnclex", "fclex", "fninit", "finit", "fwait", "wait", "emms"):
         return "/* nop */"
     if m in ("fnstcw", "fstcw"):
-        return f"{write_op(ops[0], 16, '0x037FU', nr)};"
+        return f"{write_op(ops[0], 16, 'c->fpu_cw ? c->fpu_cw : 0x037FU', nr)};"
     if m in ("fnstsw", "fstsw"):
-        return f"{write_op(ops[0], 16, '0U', nr)};"
+        return f"{write_op(ops[0], 16, 'c->fpu_sw', nr)};"
+    if m in ("rdrand", "rdseed"):
+        w = op_width(ops[0], nr) or 32
+        return (
+            f"{{ uint64_t _rn = 0; arc4random_buf(&_rn, sizeof(_rn)); "
+            f"{write_op(ops[0], w, '_rn', nr)}; c->cf = 1; c->of = c->sf = c->zf = c->af = c->pf = 0; }}"
+        )
     if m == "xgetbv":
         return "SET32(c->rax, 0x3U); SET32(c->rdx, 0U);"
     if m == "int":
@@ -1504,11 +1721,25 @@ def lift_insn(insn: Insn, local_addrs: Set[int], has_ind_jmp: bool, unimpl: List
     if sse_code is not None:
         return sse_code
 
+    # x87 FPU
+    fpu_code = lift_x87(insn)
+    if fpu_code is not None:
+        return fpu_code
+
     unimpl.append(f"0x{insn.addr:x}: {insn.text}")
     return f'fprintf(stderr, "elf64-recomp: UNIMPLEMENTED x86_64 insn at 0x{insn.addr:x}: {insn.text.replace(chr(34), chr(39))}\\n"); abort();'
 
 
-def emit_function_c(func: LiftedFunc, unimpl: List[str]) -> str:
+def _is_msvc_setjmp(func: LiftedFunc) -> bool:
+    if len(func.insns) < 12:
+        return False
+    t0, t1, t2 = func.insns[0].text, func.insns[1].text, func.insns[2].text
+    return ("[rcx]" in t0 and "rdx" in t0 and
+            "[rcx + 8]" in t1 and "rbx" in t1 and
+            "[rcx + 0x18]" in t2 and "rbp" in t2)
+
+
+def emit_function_c(func: LiftedFunc, unimpl: List[str], setjmp_addrs: Optional[Set[int]] = None) -> str:
     local_addrs = {ins.addr for ins in func.insns}
     # Determine whether this function has an intra-function indirect jump (switch table).
     has_ind_jmp = any(
@@ -1527,14 +1758,34 @@ def emit_function_c(func: LiftedFunc, unimpl: List[str]) -> str:
                 if t is not None and t in local_addrs:
                     labels.add(t)
 
+    # Identify calls to statically linked MSVC _setjmp so sigsetjmp lives in this host frame.
+    sj_sites: Dict[int, int] = {}
+    if setjmp_addrs:
+        for ins in func.insns:
+            if ins.mnemonic == "call" and ins.ops:
+                t = parse_imm(ins.ops[0])
+                if t is not None and t in setjmp_addrs:
+                    sj_sites[ins.addr] = len(sj_sites)
+
     # Avoid O(N^2) LLVM optimizer blowup on huge intra-function switch tables.
     opt_attr = "__attribute__((optnone)) " if (has_ind_jmp and len(labels) > 250) else ""
     lines = [f"/* {func.name} @ 0x{func.addr:x} */", f"{opt_attr}void fn_{func.addr:x}(CPU64 *c) {{"]
     if has_ind_jmp:
         lines.append("    uint64_t _ind_target = 0;")
+    for idx in range(len(sj_sites)):
+        lines.append(f"    sigjmp_buf _sjb_{idx};")
     for ins in func.insns:
         if ins.addr in labels:
             lines.append(f"L_{ins.addr:x}:;")
+        if ins.addr in sj_sites:
+            idx = sj_sites[ins.addr]
+            lines.append(
+                f"    {{ int _jr = sigsetjmp(_sjb_{idx}, 0); "
+                f"if (_jr == 0) {{ rt_setjmp_save(c->rcx, &_sjb_{idx}, c); "
+                f"W64(c->rcx, c->rdx ? c->rdx : 1ULL); c->rax = 0; }} "
+                f"else {{ c->rax = (uint64_t)_jr; }} }}"
+            )
+            continue
         try:
             stmt = lift_insn(ins, local_addrs, has_ind_jmp, unimpl)
         except (KeyError, ValueError):
@@ -1599,6 +1850,7 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
         mfuncs.sort(key=lambda fn: fn.addr)
         if not mfuncs:
             continue
+        mod_setjmps = {fn.addr for fn in mfuncs if _is_msvc_setjmp(fn)}
         safe = re.sub(r"[^a-zA-Z0-9_]", "_", mod["name"])
         mshards = max(1, min(shards, (len(mfuncs) + 1999) // 2000))
         buckets: List[List[LiftedFunc]] = [[] for _ in range(mshards)]
@@ -1609,7 +1861,7 @@ def lift_layout(layout_path: str, out_dir: str, shards: int = 8, strict: bool = 
             with open(cpath, "w") as f:
                 f.write(header)
                 for fn in bucket:
-                    f.write(emit_function_c(fn, unimpl))
+                    f.write(emit_function_c(fn, unimpl, mod_setjmps))
                     f.write("\n\n")
             shard_files.append(os.path.abspath(cpath))
 

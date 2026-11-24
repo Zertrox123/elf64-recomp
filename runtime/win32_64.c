@@ -121,6 +121,7 @@ typedef enum {
     WH_THREAD = 1,
     WH_EVENT = 2,
     WH_FILE = 3,
+    WH_SEMAPHORE = 4,
 } WinHandleKind;
 
 typedef struct {
@@ -131,17 +132,19 @@ typedef struct {
     int           ev_signaled;
     int           ev_manual;
     int           fd;
+    int32_t       sem_count;
+    int32_t       sem_max;
 } WinHandleObj;
 
 static pthread_mutex_t g_wh_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_wh_cv = PTHREAD_COND_INITIALIZER;
-static WinHandleObj   *g_wh_slots[1024];
-static uint32_t        g_wh_next = 0x100;
+static WinHandleObj   *g_wh_slots[8192];
+static uint32_t        g_wh_next = 0;
 
 static uint64_t wh_alloc(WinHandleObj *obj) {
     pthread_mutex_lock(&g_wh_mu);
-    for (uint32_t i = 0; i < 1024; i++) {
-        uint32_t idx = (g_wh_next + i) & 1023;
+    for (uint32_t i = 0; i < 8192; i++) {
+        uint32_t idx = (g_wh_next + i) & 8191;
         if (!g_wh_slots[idx]) {
             g_wh_slots[idx] = obj;
             g_wh_next = idx + 1;
@@ -154,7 +157,7 @@ static uint64_t wh_alloc(WinHandleObj *obj) {
 }
 
 static WinHandleObj *wh_get(uint64_t h) {
-    if (h < 0x100 || h >= 0x100 + 1024) return NULL;
+    if (h < 0x100 || h >= 0x100 + 8192) return NULL;
     return g_wh_slots[h - 0x100];
 }
 
@@ -322,8 +325,9 @@ static int is_host_system_dll(const char *name) {
     static const char *const sys[] = {
         "kernel32", "kernelbase", "ntdll", "user32", "gdi32", "advapi32",
         "ole32", "oleaut32", "shell32", "shlwapi", "version", "winmm",
-        "bcrypt", "ws2_32", "dbghelp", "winhttp", "wininet", "d3d11", "dxgi",
-        "imm32", "dsound", "rpcrt4", "iphlpapi",
+        "bcrypt", "ws2_32", "wsock32", "dbghelp", "winhttp", "wininet", "d3d11", "dxgi",
+        "imm32", "dsound", "rpcrt4", "iphlpapi", "vulkan-1", "sdl2",
+        "libfreetype-6", "libfontconfig-1", "libfbxsdk",
         "ucrtbase", "msvcrt", "vcruntime140", "steam_api64", NULL
     };
     if (strncasecmp(base, "api-ms-win-", 11) == 0) return 1;
@@ -340,6 +344,9 @@ static void w_GetModuleHandleA(CPU64 *c, void *ud) {
     const char *name = (const char *)(uintptr_t)c->rcx;
     uint64_t base = rt_find_module_base(name);
     if (!base && name && strstr(name, "client_legacyui")) base = rt_find_module_base("client.dll");
+    if (!base && name && strstr(name, "d3d9")) base = rt_find_module_base("dxvk_d3d9.dll");
+    if (name && strstr(name, "shaderapidx9") && rt_find_module_base("shaderapivk.dll"))
+        base = rt_find_module_base("shaderapivk.dll");
     if (!base && name && is_host_system_dll(name)) base = 0x7090000000ULL;
     if (!base && name && getenv("ELF64_TRACE")) {
         fprintf(stderr, "[win32] LoadLibrary/GetModuleHandle('%s') -> NULL (not loaded)\n", name);
@@ -351,6 +358,9 @@ static void w_GetModuleHandleW(CPU64 *c, void *ud) {
     char buf[260];
     utf16_to_utf8((const uint16_t *)(uintptr_t)c->rcx, buf, sizeof(buf));
     uint64_t base = rt_find_module_base(c->rcx ? buf : NULL);
+    if (!base && c->rcx && strstr(buf, "d3d9")) base = rt_find_module_base("dxvk_d3d9.dll");
+    if (c->rcx && strstr(buf, "shaderapidx9") && rt_find_module_base("shaderapivk.dll"))
+        base = rt_find_module_base("shaderapivk.dll");
     if (!base && c->rcx && is_host_system_dll(buf)) base = 0x7090000000ULL;
     if (!base && c->rcx && getenv("ELF64_TRACE")) {
         fprintf(stderr, "[win32] LoadLibraryW/GetModuleHandleW('%s') -> NULL (not loaded)\n", buf);
@@ -395,13 +405,27 @@ static void format_win_module_path(uint64_t hmod, char *out, size_t cap) {
         }
     }
     const char *root = getenv("ELF64_WIN_ROOT");
-    char raw[1024];
-    if (root && *root) {
-        snprintf(raw, sizeof(raw), "C:%s\\bin\\win64\\%s", root, mname);
-    } else {
-        char cwd[512];
+    char cwd[512];
+    if (!root || !*root) {
         if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "/tmp");
-        snprintf(raw, sizeof(raw), "C:%s\\bin\\win64\\%s", cwd, mname);
+        root = cwd;
+    }
+    char probe[1024], raw[1024];
+    snprintf(probe, sizeof(probe), "%s/%s", root, mname);
+    if (access(probe, F_OK) == 0) {
+        snprintf(raw, sizeof(raw), "C:%s\\%s", root, mname);
+    } else {
+        snprintf(probe, sizeof(probe), "%s/bin/x64/%s", root, mname);
+        if (access(probe, F_OK) == 0) {
+            snprintf(raw, sizeof(raw), "C:%s\\bin\\x64\\%s", root, mname);
+        } else {
+            snprintf(probe, sizeof(probe), "%s/tf/bin/x64/%s", root, mname);
+            if (access(probe, F_OK) == 0) {
+                snprintf(raw, sizeof(raw), "C:%s\\tf\\bin\\x64\\%s", root, mname);
+            } else {
+                snprintf(raw, sizeof(raw), "C:%s\\bin\\win64\\%s", root, mname);
+            }
+        }
     }
     size_t j = 0;
     for (size_t i = 0; raw[i] && j + 1 < cap; i++) {
@@ -454,11 +478,16 @@ static void w_Sleep(CPU64 *c, void *ud) {
     usleep((useconds_t)c->rcx * 1000U);
     win32_poll_audio_callbacks(c);
 }
-static void w_GetCurrentThreadId(CPU64 *c, void *ud) {
-    (void)ud;
+__thread uint32_t g_win32_tid_override = 0;
+uint32_t win32_current_tid(void) {
+    if (g_win32_tid_override) return g_win32_tid_override;
     uint64_t tid = 0;
     pthread_threadid_np(NULL, &tid);
-    c->rax = (uint32_t)tid;
+    return (uint32_t)tid;
+}
+static void w_GetCurrentThreadId(CPU64 *c, void *ud) {
+    (void)ud;
+    c->rax = win32_current_tid();
 }
 static void w_GetCurrentProcessId(CPU64 *c, void *ud) { (void)ud; c->rax = (uint32_t)getpid(); }
 static void w_GetSystemInfo(CPU64 *c, void *ud) {
@@ -480,11 +509,16 @@ static void w_LeaveCriticalSection(CPU64 *c, void *ud)    { (void)ud; pthread_mu
 static void w_DeleteCriticalSection(CPU64 *c, void *ud)   { (void)ud; (void)c; }
 
 /* Threads & Events */
-typedef struct { uint64_t fn; uint64_t param; WinHandleObj *ho; } WinThreadStart;
+typedef struct { uint64_t fn; uint64_t param; uint64_t tid_out; WinHandleObj *ho; } WinThreadStart;
 
 static void *win_thread_tramp(void *p) {
     WinThreadStart st = *(WinThreadStart *)p;
     free(p);
+    if (st.tid_out) {
+        uint64_t tid = 0;
+        pthread_threadid_np(NULL, &tid);
+        W32(st.tid_out, (uint32_t)tid);
+    }
     CPU64 cpu;
     rt_init_thread_cpu(&cpu, 4 * 1024 * 1024);
     uint64_t r = rt_invoke_win64(&cpu, st.fn, st.param, 0, 0, 0, 0, 0);
@@ -500,16 +534,21 @@ static void w_CreateThread(CPU64 *c, void *ud) {
     (void)ud;
     WinHandleObj *ho = (WinHandleObj *)calloc(1, sizeof(WinHandleObj));
     ho->kind = WH_THREAD;
+    uint64_t tid_out = win64_arg_i(c, 5);
     WinThreadStart *st = (WinThreadStart *)malloc(sizeof(WinThreadStart));
     st->fn = c->r8;
     st->param = c->r9;
+    st->tid_out = tid_out;
     st->ho = ho;
     uint64_t handle = wh_alloc(ho);
     if (!handle || pthread_create(&ho->tid, NULL, win_thread_tramp, st) != 0) {
         free(st); free(ho); c->rax = 0; return;
     }
-    uint64_t tid_out = win64_arg_i(c, 5);
-    if (tid_out) W32(tid_out, (uint32_t)(uintptr_t)ho->tid);
+    if (tid_out) {
+        uint64_t tid = 0;
+        pthread_threadid_np(ho->tid, &tid);
+        W32(tid_out, (uint32_t)tid);
+    }
     c->rax = handle;
 }
 
@@ -540,12 +579,37 @@ static void w_ResetEvent(CPU64 *c, void *ud) {
     pthread_mutex_unlock(&g_wh_mu);
     c->rax = 1;
 }
+static void w_CreateSemaphoreA(CPU64 *c, void *ud) {
+    (void)ud;
+    WinHandleObj *ho = (WinHandleObj *)calloc(1, sizeof(WinHandleObj));
+    ho->kind = WH_SEMAPHORE;
+    ho->sem_count = (int32_t)c->rdx;
+    ho->sem_max = ((int32_t)c->r8 > 0) ? (int32_t)c->r8 : 0x7fffffff;
+    c->rax = wh_alloc(ho);
+}
+static void w_ReleaseSemaphore(CPU64 *c, void *ud) {
+    (void)ud;
+    int32_t rel = (int32_t)c->rdx;
+    pthread_mutex_lock(&g_wh_mu);
+    WinHandleObj *ho = wh_get(c->rcx);
+    if (!ho || ho->kind != WH_SEMAPHORE || rel <= 0 || (int64_t)ho->sem_count + rel > ho->sem_max) {
+        pthread_mutex_unlock(&g_wh_mu);
+        c->rax = 0;
+        return;
+    }
+    if (c->r8) W32(c->r8, (uint32_t)ho->sem_count);
+    ho->sem_count += rel;
+    pthread_cond_broadcast(&g_wh_cv);
+    pthread_mutex_unlock(&g_wh_mu);
+    c->rax = 1;
+}
 
 static int wh_is_signaled_locked(uint64_t h) {
-    if (h >= 0x30000ULL && h < 0x40000ULL) return 1; /* mutex/semaphore */
+    if (h >= 0x30000ULL && h < 0x40000ULL) return 1; /* mutex */
     WinHandleObj *ho = wh_get(h);
     if (!ho) return 1;
     if (ho->kind == WH_EVENT) return ho->ev_signaled;
+    if (ho->kind == WH_SEMAPHORE) return ho->sem_count > 0;
     if (ho->kind == WH_THREAD) return ho->finished;
     return 1;
 }
@@ -554,6 +618,7 @@ static void wh_consume_locked(uint64_t h) {
     WinHandleObj *ho = wh_get(h);
     if (!ho) return;
     if (ho->kind == WH_EVENT && !ho->ev_manual) ho->ev_signaled = 0;
+    else if (ho->kind == WH_SEMAPHORE && ho->sem_count > 0) ho->sem_count--;
 }
 
 static uint32_t wait_handles_impl(const uint64_t *handles, uint32_t count, int wait_all, uint32_t ms) {
@@ -938,6 +1003,10 @@ uint32_t win32_set_hwnd_style(uint64_t hwnd, uint32_t style) {
     o->borderless = (style & 0x00C00000U) == 0;
     if (o->sdl && !getenv("ELF64_HEADLESS")) {
         win32_fit_window_size(o->sdl, o->w, o->h);
+        if (style & 0x10000000U /* WS_VISIBLE */) {
+            SDL_ShowWindow(o->sdl);
+            SDL_RaiseWindow(o->sdl);
+        }
     }
     return prev;
 }
@@ -999,7 +1068,8 @@ void win32_set_mouse_xy(int x, int y) { g_mouse_x = x; g_mouse_y = y; }
 int win32_show_cursor(int show) {
     g_cursor_count = show ? 0 : -1;
     if (!getenv("ELF64_HEADLESS")) {
-        SDL_SetRelativeMouseMode(g_cursor_count < 0 ? SDL_TRUE : SDL_FALSE);
+        SDL_bool want = g_cursor_count < 0 ? SDL_TRUE : SDL_FALSE;
+        if (SDL_GetRelativeMouseMode() != want) SDL_SetRelativeMouseMode(want);
     }
     return g_cursor_count;
 }
@@ -1182,35 +1252,43 @@ static uint64_t lookup_class_wndproc(const char *cname) {
 
 static void create_window_common(CPU64 *c, const char *cls_name, const char *title) {
     uint32_t style = (uint32_t)c->r9;
-    int w = (int)win64_arg_i(c, 6);
-    int h = (int)win64_arg_i(c, 7);
-    if (w <= 0 || w > 8192) w = 1280;
-    if (h <= 0 || h > 8192) h = 720;
-    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
-    if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
+    int raw_w = (int)win64_arg_i(c, 6);
+    int raw_h = (int)win64_arg_i(c, 7);
+    uint64_t parent = win64_arg_i(c, 8);
+    int is_helper = (g_primary_hwnd != 0) &&
+                    ((raw_w <= 1 && raw_h <= 1) || (style & 0x48000000U /* WS_CHILD | WS_DISABLED */) ||
+                     parent != 0 || (cls_name && strcasecmp(cls_name, "shaderdx8") == 0));
+    int w = (raw_w > 0 && raw_w <= 8192) ? raw_w : (is_helper ? 1 : 1280);
+    int h = (raw_h > 0 && raw_h <= 8192) ? raw_h : (is_helper ? 1 : 720);
+    SDL_Window *win = NULL;
     int borderless = (style & 0x00C00000U) == 0;
-    uint32_t flags = SDL_WINDOW_METAL | ((style & 0x10000000U) ? 0 : SDL_WINDOW_HIDDEN)
-                   | (borderless ? SDL_WINDOW_BORDERLESS : 0);
-    SDL_Window *win = SDL_CreateWindow((title && *title) ? title : "elf64-recomp",
-                                       SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                       w, h, flags);
-    if (!win) { c->rax = 0; return; }
+    if (!is_helper) {
+        SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+        if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Init(SDL_INIT_VIDEO);
+        uint32_t flags = SDL_WINDOW_METAL | ((style & 0x10000000U) ? 0 : SDL_WINDOW_HIDDEN)
+                       | (borderless ? SDL_WINDOW_BORDERLESS : 0);
+        win = SDL_CreateWindow((title && *title) ? title : "elf64-recomp",
+                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               w, h, flags);
+        if (!win) { c->rax = 0; return; }
+    }
     WinHwndObj *o = (WinHwndObj *)calloc(1, sizeof(WinHwndObj));
     o->sdl = win; o->w = w; o->h = h; o->borderless = borderless; o->style = style; o->wndproc = lookup_class_wndproc(cls_name);
     for (int i = 0; i < 64; i++) {
         if (!g_hwnds[i]) {
             g_hwnds[i] = o;
             uint64_t hwnd = (uint64_t)(0x1000 + i);
-            if (w >= 320 && h >= 200) g_primary_hwnd = hwnd;
+            if (!is_helper && w >= 320 && h >= 200) g_primary_hwnd = hwnd;
             if (io_log_enabled())
-                fprintf(stderr, "[io] CreateWindow hwnd=0x%llx cls='%s' title='%s' %dx%d wp=0x%llx\n",
+                fprintf(stderr, "[io] CreateWindow hwnd=0x%llx cls='%s' title='%s' %dx%d helper=%d wp=0x%llx\n",
                         (unsigned long long)hwnd, cls_name ? cls_name : "", title ? title : "",
-                        w, h, (unsigned long long)o->wndproc);
+                        w, h, is_helper, (unsigned long long)o->wndproc);
             c->rax = hwnd;
             return;
         }
     }
-    SDL_DestroyWindow(win); free(o); c->rax = 0;
+    if (win) SDL_DestroyWindow(win);
+    free(o); c->rax = 0;
 }
 static void w_CreateWindowExA(CPU64 *c, void *ud) {
     (void)ud;
@@ -1230,6 +1308,7 @@ static void w_ShowWindow(CPU64 *c, void *ud) {
     if (w) {
         if (c->rdx && !getenv("ELF64_HEADLESS")) {
             SDL_ShowWindow(w);
+            SDL_RaiseWindow(w);
             g_primary_hwnd = c->rcx;
             msg_push(c->rcx, 0x001C /* WM_ACTIVATEAPP */, 1, 0);
             msg_push(c->rcx, 0x0006 /* WM_ACTIVATE */, 1, 0);
@@ -1431,8 +1510,11 @@ void rt_register_win32_64(void) {
     REG("TryEnterCriticalSection", w_TryEnterCriticalSection);
     REG("LeaveCriticalSection", w_LeaveCriticalSection);
     REG("DeleteCriticalSection", w_DeleteCriticalSection);
-    REG("CreateThread", w_CreateThread); REG("CreateEventA", w_CreateEventA); REG("CreateEventW", w_CreateEventA);
+    REG("CreateThread", w_CreateThread); REG("_beginthreadex", w_CreateThread);
+    REG("CreateEventA", w_CreateEventA); REG("CreateEventW", w_CreateEventA);
     REG("SetEvent", w_SetEvent); REG("ResetEvent", w_ResetEvent);
+    REG("CreateSemaphoreA", w_CreateSemaphoreA); REG("CreateSemaphoreW", w_CreateSemaphoreA);
+    REG("ReleaseSemaphore", w_ReleaseSemaphore);
     REG("WaitForSingleObject", w_WaitForSingleObject);
     REG("WaitForSingleObjectEx", w_WaitForSingleObject);
     REG("WaitForMultipleObjects", w_WaitForMultipleObjects);

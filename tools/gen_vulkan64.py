@@ -137,7 +137,8 @@ def emit_trampoline(sig: str, ret: str, params: List[str]) -> str:
     gp = 0
     fp = 0
     stack_slot = 0
-    call_args = []
+    sysv_args = []
+    win64_args = []
     for i, k in enumerate(params):
         if k in ("p", "u"):
             if gp < 6:
@@ -146,7 +147,8 @@ def emit_trampoline(sig: str, ret: str, params: List[str]) -> str:
             else:
                 expr = f"R64(c->rsp + 8ULL + {stack_slot * 8}ULL)"
                 stack_slot += 1
-            call_args.append(f"({CTYPE[k]})({expr})")
+            sysv_args.append(f"({CTYPE[k]})({expr})")
+            win64_args.append(f"({CTYPE[k]})(win64_arg_i(c, {i}))")
         elif k == "f":
             if fp < 8:
                 expr = f"sysv_arg_f(c, {fp})"
@@ -154,7 +156,11 @@ def emit_trampoline(sig: str, ret: str, params: List[str]) -> str:
             else:
                 expr = f"({{ uint32_t _u = R32(c->rsp + 8ULL + {stack_slot * 8}ULL); float _f; memcpy(&_f, &_u, 4); _f; }})"
                 stack_slot += 1
-            call_args.append(expr)
+            sysv_args.append(expr)
+            if i < 4:
+                win64_args.append(f"win64_arg_f(c, {i})")
+            else:
+                win64_args.append(f"({{ uint32_t _u = R32(c->rsp + 8ULL + {i * 8}ULL); float _f; memcpy(&_f, &_u, 4); _f; }})")
         elif k == "d":
             if fp < 8:
                 expr = f"sysv_arg_d(c, {fp})"
@@ -162,19 +168,28 @@ def emit_trampoline(sig: str, ret: str, params: List[str]) -> str:
             else:
                 expr = f"({{ uint64_t _u = R64(c->rsp + 8ULL + {stack_slot * 8}ULL); double _d; memcpy(&_d, &_u, 8); _d; }})"
                 stack_slot += 1
-            call_args.append(expr)
+            sysv_args.append(expr)
+            if i < 4:
+                win64_args.append(f"win64_arg_d(c, {i})")
+            else:
+                win64_args.append(f"({{ uint64_t _u = R64(c->rsp + 8ULL + {i * 8}ULL); double _d; memcpy(&_d, &_u, 8); _d; }})")
 
-    args_str = ", ".join(call_args)
+    s_str = ", ".join(sysv_args)
+    w_str = ", ".join(win64_args)
+    if not params:
+        call_e = "fn()"
+    else:
+        call_e = f"(g_rt_is_win64 ? fn({w_str}) : fn({s_str}))"
     if ret == "v":
-        lines.append(f"    fn({args_str});")
+        lines.append(f"    {call_e};")
     elif ret == "u":
-        lines.append(f"    c->rax = (uint64_t)(uint32_t)fn({args_str});")
+        lines.append(f"    c->rax = (uint64_t)(uint32_t){call_e};")
     elif ret == "p":
-        lines.append(f"    c->rax = (uint64_t)fn({args_str});")
+        lines.append(f"    c->rax = (uint64_t){call_e};")
     elif ret == "f":
-        lines.append(f"    c->xmm[0].f[0] = fn({args_str});")
+        lines.append(f"    c->xmm[0].f[0] = {call_e};")
     elif ret == "d":
-        lines.append(f"    c->xmm[0].df[0] = fn({args_str});")
+        lines.append(f"    c->xmm[0].df[0] = {call_e};")
     lines.append("}")
     return "\n".join(lines)
 
