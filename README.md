@@ -18,7 +18,7 @@ Static **x86_64 -> C -> ARM64 macOS** recompiler targeting Windows PE32+ (Win64 
 
 ![Steam on macOS showing the 32-bit incompatibility warning for Team Fortress 2 alongside live playtime tracked natively via x64-mac-recomp](docs/tf2_steam_macos.jpg)
 
-<sub>Steam flags **Team Fortress 2** as incompatible on modern macOS because the legacy macOS build was 32-bit — `x64-mac-recomp` statically recompiles the official 64-bit Windows build (`tf_win64.exe` + 31 DLLs) straight to native ARM64 macOS with live Steam playtime, Cloud, and Game Coordinator via `libsteam_api.dylib`, official TF2 fonts via CoreText/CoreGraphics GDI, and XAudio2 -> CoreAudio sound.</sub>
+<sub>Steam flags **Team Fortress 2** as incompatible on modern macOS because the legacy macOS build was 32-bit — `x64-mac-recomp` statically recompiles the official 64-bit Windows build (`tf_win64.exe` + 31 DLLs) straight to native ARM64 macOS with live Steam playtime, Cloud, and Game Coordinator via `libsteam_api.dylib`, official TF2 fonts via CoreText/CoreGraphics GDI, and XAudio2 -> CoreAudio sound. Runs in `-insecure` mode (no VAC): Training, bots, LAN, and non-VAC community servers only (no Valve Casual/Competitive).</sub>
 
 ## Portal Revolution
 

@@ -166,7 +166,7 @@ python3 "$REPO_ROOT/tools/package_macos_app.py" \
     --bundle-id "com.elf64recomp.tf2" \
     --skip tf/console.log \
     --skip tf_win64_d3d9.log \
-    --arg=-game --arg=tf --arg=-steam --arg=-sw --arg=-w --arg=1280 --arg=-h --arg=720 --arg=-dxlevel --arg=95 --arg=-novid \
+    --arg=-game --arg=tf --arg=-steam --arg=-insecure --arg=-sw --arg=-w --arg=1280 --arg=-h --arg=720 --arg=-dxlevel --arg=95 --arg=-novid \
     "${ICON_ARG[@]}"
 
 echo ""
